@@ -171,31 +171,49 @@ cp dist/claude-voice.vsix dist/claude-mobile.vsix dist/stage/vsix/
 cp pwa/manifest.webmanifest pwa/sw.js dist/stage/chat-service/public/
 mkdir -p dist/stage/chat-service/public/pwa-icons
 cp pwa-icons/*.png dist/stage/chat-service/public/pwa-icons/
-tar -czf dist/payload.tar.gz -C dist/stage chat-service pwa vsix
+# COPYFILE_DISABLE stops macOS tar from emitting AppleDouble `._*` companions for
+# every file carrying an extended attribute (macOS adds com.apple.provenance to
+# downloaded and newly written files). Those stubs land on the instance, show up
+# as phantom files in the editor, and left a non-empty directory behind that
+# broke the vsix cleanup below.
+COPYFILE_DISABLE=1 tar -czf dist/payload.tar.gz -C dist/stage chat-service pwa vsix
 
-PAYLOAD_B64="$(base64 < dist/payload.tar.gz | tr -d '\n')"
+# Staged through S3 rather than inlined into the SSM command.
+#
+# SSM caps a parameter value at ~100 KB, and base64 inflates by a third, so the
+# inline route hit a hard wall the moment the chat service grew — which it did,
+# the first time authentication was added. The transfer bucket already exists for
+# migrate.sh and the instance role can already read it, so this has no
+# infrastructure cost and no size cliff to trip over again.
+TRANSFER_BUCKET="$(read_output TransferBucketName)"
+[ -n "$TRANSFER_BUCKET" ] || { echo "No TransferBucketName in stack outputs." >&2; exit 1; }
 
-# SSM caps a single parameter value; if we outgrow it, route via S3 instead.
-if [ "${#PAYLOAD_B64}" -gt 90000 ]; then
-  echo "Payload too large for inline SSM transfer. Switch to S3 staging." >&2
-  exit 1
-fi
+PAYLOAD_KEY="payload/$(date +%Y%m%d-%H%M%S)-$$.tar.gz"
+step "Staging payload via s3://$TRANSFER_BUCKET/$PAYLOAD_KEY"
+aws s3 cp dist/payload.tar.gz "s3://$TRANSFER_BUCKET/$PAYLOAD_KEY" \
+  "${AWS_ARGS[@]}" --only-show-errors
 
 CMD_ID="$(aws ssm send-command \
   --instance-ids "$INSTANCE_ID" \
   --document-name AWS-RunShellScript \
   --comment "claude-web payload" \
-  --cli-input-json "$(python3 - "$PAYLOAD_B64" <<'PY'
+  --cli-input-json "$(python3 - "$TRANSFER_BUCKET" "$PAYLOAD_KEY" "$REGION" <<'PY'
 import json, sys
-payload = sys.argv[1]
+bucket, key, region = sys.argv[1], sys.argv[2], sys.argv[3]
 cmds = [
   "set -euxo pipefail",
   "mkdir -p /opt/claude-web && cd /opt/claude-web",
-  f"echo '{payload}' | base64 -d | tar -xzf -",
-  "mv -f /opt/claude-web/vsix/*.vsix /opt/claude-web/ && rmdir /opt/claude-web/vsix",
-  # macOS tar writes ._* AppleDouble stubs; delete them before anything reads
-  # the tree (they also appear as phantom files in the editor).
+  f"aws s3 cp s3://{bucket}/{key} /tmp/payload.tar.gz --region {region}",
+  "tar -xzf /tmp/payload.tar.gz -C /opt/claude-web",
+  "rm -f /tmp/payload.tar.gz",
+  # Delete AppleDouble stubs FIRST. They are prevented at the tar end now, but
+  # this must still run before anything else walks the tree: when it ran after
+  # the vsix move below, a leftover `._claude-voice.vsix` made the directory
+  # non-empty and `rmdir` failed the whole deploy.
   "find /opt/claude-web -name '._*' -delete || true",
+  # `rm -rf` rather than `rmdir`: this directory is ours and disposable, and
+  # failing the deploy over an unexpected file in it buys nothing.
+  "mv -f /opt/claude-web/vsix/*.vsix /opt/claude-web/ && rm -rf /opt/claude-web/vsix",
   # Fail loudly: a silent npm failure leaves the service dead with a confusing
   # 'CHDIR' error, which has happened more than once.
   "cd /opt/claude-web/chat-service && npm install --omit=dev",
