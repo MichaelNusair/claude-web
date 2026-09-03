@@ -153,6 +153,18 @@ GB root ~$3, plus Bedrock token usage. Stopping the instance when idle cuts the
 compute portion; the workspace volume is retained on stack deletion, so projects
 and history survive a stop or a teardown.
 
+## The landing page
+
+[`landing/`](landing/) is the static marketing site — the page at
+<https://claude.strikelabs.tech>. It deploys as its own stack (private S3 behind
+CloudFront) with no shared resources and no route to the workspace, so public
+traffic never touches the machine holding your GitHub token. Optional; skip it
+entirely if you're self-hosting for yourself.
+
+```bash
+./deploy-landing.sh    # independent of ./deploy.sh
+```
+
 ## Working on it
 
 `AGENTS.md` (and `CLAUDE.md`) orient both people and AI agents: repo map, the

@@ -78,5 +78,26 @@
 
   "$comment_git": "Author on commits Claude makes in the workspace.",
   "gitUserName": "Your Name",
-  "gitUserEmail": "you@example.com"
+  "gitUserEmail": "you@example.com",
+
+  "$comment_landing": [
+    "Optional public marketing site (the landing/ directory), served from a",
+    "private S3 bucket behind CloudFront. Entirely separate from the workspace:",
+    "its own stack, its own hostname, no shared resources, and no route to the",
+    "instance. Leave domainName empty and none of it is created.",
+    "",
+    "It must NOT be the same hostname as domainName above — one DNS record",
+    "cannot point at both CloudFront and the load balancer.",
+    "",
+    "certificateArn must live in us-east-1, the only region CloudFront reads",
+    "certificates from. Leave it empty to have one created there for you; a",
+    "wildcard covering your zone can be reused if it is already in us-east-1.",
+    "",
+    "Deploy with ./deploy-landing.sh, which is independent of ./deploy.sh."
+  ],
+  "landing": {
+    "domainName": "",
+    "certificateArn": "",
+    "stackName": "ClaudeWebLandingStack"
+  }
 }

@@ -32,6 +32,8 @@ const exported = {
   CFG_PERMISSION_MODE: config.permissionMode,
   CFG_ADMIN: config.instanceAdminAccess,
   CFG_INSTANCE_TYPE: config.instanceType,
+  CFG_LANDING_DOMAIN: config.landing.domainName,
+  CFG_LANDING_STACK: config.landing.stackName,
 };
 
 for (const [key, value] of Object.entries(exported)) {

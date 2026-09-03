@@ -75,13 +75,30 @@ infra/                   AWS CDK (JavaScript, not TypeScript).
   lib/stack.js           The whole stack. No account-specific values.
   userdata/bootstrap.sh  Instance provisioning. Idempotent; re-run on deploy.
 
+  lib/landing-stack.js   Optional marketing site: S3 + CloudFront. Separate stack.
+
+landing/                 The public marketing page. Static, no build step.
 pwa/                     Assets copied into chat-service/public/ by deploy.sh.
                          THIS IS THE SOURCE OF TRUTH for manifest + sw.js.
 voice-extension/         VS Code dictation extension (for the editor surface).
 mobile-extension/        Strips VS Code chrome for phone use.
 deploy.sh                The whole deploy. Read it before changing the pipeline.
+deploy-landing.sh        The landing site only. Independent of deploy.sh.
 migrate.sh               Brings local repos + Claude session history up.
 ```
+
+### Two stacks, deliberately
+
+`ClaudeWebStack` is the workspace — a machine that runs shell commands.
+`ClaudeWebLandingStack` is a public static page. They share no resources, and the
+landing side has no route to the instance. Keep it that way: do not "simplify" by
+serving the marketing page off the workspace's nginx, which would put public
+traffic on the box that holds the GitHub token.
+
+Both manage a Route53 record, so **they must never be configured with the same
+hostname** — `config.js` rejects that rather than letting CloudFormation find out.
+When moving a hostname from one to the other, deploy the stack that is *giving it
+up* first.
 
 ## Common requests, and how to handle them
 
@@ -184,6 +201,15 @@ Things that have burned people, in this codebase specifically:
   Adding a `$VAR` inside one silently writes a literal `$VAR`.
 - **`session-manager.js` mangles the *resolved* path** for transcript lookup, so
   symlinks matter. This is why `migrate.sh` rewrites paths.
+- **The landing page's copy button must show exactly what it copies.** When the
+  clipboard API is unavailable the script selects the visible `<code>` node
+  instead, so an abbreviated label hands the visitor a broken command.
+  `deploy-landing.sh` checks this and refuses to deploy on a mismatch.
+- **Headless Chrome with `--window-size` alone does not apply the viewport meta**,
+  so it lays a responsive page out at desktop width and crops it. That looks
+  exactly like a mobile overflow bug and isn't one. Use
+  `Emulation.setDeviceMetricsOverride` with `mobile: true`, and confirm with
+  `documentElement.scrollWidth` rather than by eye.
 - **The CLI's flags are process arguments**, so model, permission mode and effort
   are fixed for the life of a conversation. Settings changes apply to new chats
   only. This is not a bug to fix.

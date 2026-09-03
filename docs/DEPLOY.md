@@ -190,6 +190,61 @@ Note that the ALB authenticates *anyone* your provider will authenticate. With
 Google that is every Google account in existence unless you restrict it — use a
 Cognito user pool, or a Google Workspace-restricted client, if that matters.
 
+## Optional: the landing page
+
+The repository includes a static marketing site in [`landing/`](../landing/) — the
+page at <https://claude.strikelabs.tech>. You almost certainly don't need this if
+you are self-hosting for yourself, but it's here and deployable.
+
+It is a deliberately separate stack: its own hostname, a private S3 bucket behind
+CloudFront, and no shared resources with the workspace. The public thing has no
+route to the private thing, and deploying either cannot disturb the other.
+
+```json
+{
+  "landing": {
+    "domainName": "claude.example.com",
+    "certificateArn": ""
+  }
+}
+```
+
+```bash
+./deploy-landing.sh
+```
+
+Three things worth knowing:
+
+- **It must be a different hostname from `domainName`.** One DNS record cannot
+  point at both CloudFront and a load balancer, and the config refuses the
+  overlap rather than letting CloudFormation discover it.
+- **The certificate must be in us-east-1**, the only region CloudFront reads them
+  from, whatever region the rest of your deployment uses. Leave `certificateArn`
+  empty and one is created there; a wildcard already in us-east-1 can be reused.
+- **A new CloudFront distribution takes ~15 minutes** to reach every edge, and a
+  first-time certificate waits on DNS validation before that. The script polls,
+  then tells you if it is still settling rather than failing.
+
+### If you are moving a hostname between the two
+
+Say the workspace currently owns `claude.example.com` and you want the landing
+page there instead. **Move the workspace off it first.** Both stacks manage a
+Route53 record, and if you create the landing record while the workspace stack
+still owns that name, they will fight over it.
+
+```bash
+# 1. Give the workspace a new hostname in claude-web.config.json, then:
+./deploy.sh              # deletes the old record, creates the new one
+
+# 2. Only now point the landing site at the freed hostname:
+./deploy-landing.sh
+```
+
+Your projects, session history and volume are unaffected by a hostname change —
+nothing is keyed by domain. Two things do change: **an installed PWA points at
+the old URL** and must be removed from your home screen and re-added at the new
+one, and any bookmark needs updating.
+
 ## Optional: voice dictation
 
 Works out of the box with no API key: `whisper.cpp` with `base.en` runs on the

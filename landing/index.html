@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>claude-web — Claude Code on your phone, on your own AWS account</title>
+<meta name="description" content="Self-hosted Claude Code as an installable chat app, plus a full web IDE. One command to deploy into your own AWS account. Open source, MIT licensed.">
+<meta name="theme-color" content="#141413">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+
+<meta property="og:type" content="website">
+<meta property="og:title" content="claude-web — Claude Code on your phone, self-hosted">
+<meta property="og:description" content="An installable chat app for Claude Code, running on one EC2 instance in your own AWS account. Open source, MIT licensed.">
+<meta property="og:url" content="https://claude.strikelabs.tech/">
+<meta name="twitter:card" content="summary_large_image">
+</head>
+<body>
+
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="nav">
+  <span class="wordmark">claude<span class="dim">-web</span></span>
+  <nav>
+    <a href="#how">How it works</a>
+    <a href="#security">Security</a>
+    <a href="#start">Deploy</a>
+    <a class="ghost" href="https://github.com/MichaelNusair/claude-web">GitHub</a>
+  </nav>
+</header>
+
+<main id="main">
+
+  <!-- ── Hero ────────────────────────────────────────────────────────── -->
+  <section class="hero">
+    <div class="hero-copy">
+      <p class="eyebrow">Open source · MIT · Self-hosted</p>
+      <h1>Claude Code, on your phone.<br><span class="accent">On your own machine.</span></h1>
+      <p class="lede">
+        Send a message from anywhere. Claude works on your actual repo — reads
+        files, runs tests, commits, opens PRs — and answers. The full VS Code
+        editor is still there when you sit down at a desk.
+      </p>
+
+      <div class="cta">
+        <!-- The visible text must match data-copy exactly: when the clipboard
+             API is unavailable the script selects this node instead, and an
+             abbreviated label would hand over a command that doesn't work. -->
+        <button class="copy" data-copy="git clone https://github.com/MichaelNusair/claude-web.git"
+                aria-label="Copy the git clone command">
+          <code>git clone https://github.com/MichaelNusair/claude-web.git</code>
+          <span class="copy-hint" aria-hidden="true">Copy</span>
+        </button>
+        <a class="btn" href="#start">Deploy it →</a>
+      </div>
+
+      <p class="fineprint">
+        Runs on one EC2 instance in your AWS account. Roughly $75/month, less if
+        you stop it when idle.
+      </p>
+    </div>
+
+    <!-- A drawn mockup rather than a screenshot: no image to go stale, and it
+         stays sharp at every size. -->
+    <div class="phone-wrap" aria-hidden="true">
+      <div class="phone">
+        <div class="phone-bar">
+          <span class="back">‹</span>
+          <span class="phone-title">bare-metal<em>opus 5 · max</em></span>
+          <span class="gear">⚙</span>
+        </div>
+        <div class="phone-thread">
+          <div class="bubble user">the allocator test is flaky on arm64 — figure out why and fix it</div>
+          <div class="tool">🔎 <span>Grep</span> <code>alignof|posix_memalign</code></div>
+          <div class="tool">📖 <span>Read</span> <code>src/allocator.c</code></div>
+          <div class="bubble claude">
+            Found it. <code>align_up()</code> assumes 8-byte alignment, but
+            <code>max_align_t</code> is 16 on aarch64 — so the guard page lands
+            mid-block and only trips when the arena starts odd.
+          </div>
+          <div class="tool">✏️ <span>Edit</span> <code>src/allocator.c</code></div>
+          <div class="tool ok">✅ <span>Bash</span> <code>ctest --output-on-failure</code></div>
+          <div class="bubble claude">42 tests passing, 20 runs clean. Pushed to <code>fix/arm64-align</code>.</div>
+        </div>
+        <div class="phone-composer">
+          <span class="mic">🎙</span>
+          <span class="fake-input">Message Claude…</span>
+          <span class="send">▶</span>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── Why ─────────────────────────────────────────────────────────── -->
+  <section class="band">
+    <div class="grid-3">
+      <div class="card">
+        <h3>It's the real CLI</h3>
+        <p>
+          Not a reimplementation. Each conversation is one long-lived
+          <code>claude</code> process, so context, working directory and session
+          id all persist — and a follow-up message costs no startup.
+        </p>
+      </div>
+      <div class="card">
+        <h3>Your sessions follow you</h3>
+        <p>
+          History lives on the server, not the device. Start something on a
+          laptop, pick it up on a phone mid-task. Lock your screen and the work
+          keeps running.
+        </p>
+      </div>
+      <div class="card">
+        <h3>Your code never leaves</h3>
+        <p>
+          One instance, one persistent volume, your AWS account, your GitHub
+          token. Voice dictation transcribes on the box itself — audio never
+          goes anywhere.
+        </p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── How it works ────────────────────────────────────────────────── -->
+  <section id="how" class="section">
+    <h2>How it works</h2>
+    <p class="section-lede">
+      One EC2 instance behind a load balancer, with a persistent volume that
+      survives instance replacement. No Kubernetes, no control plane, nothing to
+      operate.
+    </p>
+
+    <pre class="diagram"><code>your-domain.com
+  │
+  ALB :443 ── TLS, 4000s idle timeout (a turn can run for many minutes)
+  │
+  EC2 t4g.large (Graviton) — reachable only from the load balancer
+  ├── nginx
+  │     ├── /         → chat  (the PWA you install)
+  │     └── /editor/  → code-server + the official Claude extension
+  │
+  ├── chat service
+  │     ├── authenticates every request itself   ← the security boundary
+  │     ├── one `claude` process per conversation, kept alive
+  │     └── whisper.cpp for voice, on-box, no API key
+  │
+  └── /workspace  ← persistent EBS
+        ├── projects/   one directory per repo
+        └── claude/     session history
+
+  Bedrock via instance role — no model keys in the browser</code></pre>
+
+    <div class="grid-2">
+      <div class="card">
+        <h3>Installs like an app</h3>
+        <p>
+          Add to Home Screen on iOS, or the install icon on Android and desktop.
+          Streaming replies, collapsible tool cards, a stop button, and voice
+          dictation that inserts at your cursor.
+        </p>
+      </div>
+      <div class="card">
+        <h3>Survives bad networks</h3>
+        <p>
+          The server keeps the process alive when your phone locks or the signal
+          drops. Reattaching resumes the same conversation mid-task — including
+          work you started on another device.
+        </p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── Security ────────────────────────────────────────────────────── -->
+  <section id="security" class="section security">
+    <h2>Read this part</h2>
+
+    <div class="warn">
+      <p>
+        <strong>This is a web page that runs shell commands on a machine you
+        own.</strong> That's the product, not a side effect. Anyone who logs in
+        has a shell. Deploy it as a personal workspace — not a shared service,
+        and not something you hand a password to a stranger for.
+      </p>
+    </div>
+
+    <p class="section-lede">
+      Because of that, authentication is enforced <em>inside the process that
+      spawns <code>claude</code></em> — never delegated to nginx or the load
+      balancer alone. That design comes from getting it wrong: an earlier version
+      of this project shipped with the chat API reachable without credentials,
+      because a proxy config described a gate that had never been written and
+      every document repeated the claim.
+    </p>
+
+    <div class="grid-2">
+      <div class="card">
+        <h3>Closed by default</h3>
+        <ul>
+          <li>The server <strong>refuses to start</strong> without a strong password and cookie key.</li>
+          <li>Routes are gated by an allowlist, so a new endpoint is private unless deliberately opened.</li>
+          <li>Rotating the password invalidates every existing session.</li>
+          <li>Login throttling at the proxy and in the app.</li>
+          <li>Least-privilege IAM by default; account-wide access is opt-in and documented.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>Checked by machine, not by comment</h3>
+        <ul>
+          <li>A test suite boots the real server and asserts every route and the WebSocket upgrade refuse an unauthenticated caller.</li>
+          <li>The deploy script runs it first and <strong>refuses to deploy</strong> on failure.</li>
+          <li>After deploying, it curls the live URL and aborts if the API answers without a login.</li>
+        </ul>
+        <p class="muted">
+          The last time this was only checked by a comment, the comment was
+          wrong for months.
+        </p>
+      </div>
+    </div>
+
+    <p class="more">
+      Full threat model, what it does and doesn't defend against, and how to cut
+      the blast radius:
+      <a href="https://github.com/MichaelNusair/claude-web/blob/main/docs/SECURITY.md">docs/SECURITY.md</a>.
+    </p>
+  </section>
+
+  <!-- ── Get started ─────────────────────────────────────────────────── -->
+  <section id="start" class="section">
+    <h2>Deploy it</h2>
+    <p class="section-lede">
+      You need an AWS account, a Route53 hosted zone you control, and Bedrock
+      model access enabled. About 20 minutes, most of it waiting for first boot.
+    </p>
+
+    <pre class="shell"><code><span class="c">1 · clone</span>
+git clone https://github.com/MichaelNusair/claude-web.git
+cd claude-web
+
+<span class="c">2 · point it at your domain</span>
+cp claude-web.config.example.json claude-web.config.json
+$EDITOR claude-web.config.json     <span class="c"># domainName + hostedZoneName</span>
+
+<span class="c">3 · go</span>
+./deploy.sh</code></pre>
+
+    <p class="section-lede">
+      It validates your config, runs the auth tests, deploys the stack, waits for
+      the instance, ships the app, then verifies the live URL requires a login.
+      Re-running it is safe and keeps your projects and history.
+    </p>
+
+    <div class="cta">
+      <a class="btn primary" href="https://github.com/MichaelNusair/claude-web">Get it on GitHub</a>
+      <a class="btn" href="https://github.com/MichaelNusair/claude-web/blob/main/docs/DEPLOY.md">Read the deploy guide</a>
+    </div>
+
+    <p class="fineprint">
+      Bringing existing work across? <code>./migrate.sh</code> clones your repos
+      onto the volume and copies your local Claude Code history up, rewriting the
+      paths so past conversations stay resumable.
+    </p>
+  </section>
+
+  <!-- ── Honest limits ───────────────────────────────────────────────── -->
+  <section class="band">
+    <h2 class="small">What it isn't</h2>
+    <div class="grid-3">
+      <div class="card plain">
+        <h3>Multi-user</h3>
+        <p>One shared password, no per-user permissions, no audit of who did what. It's one person's workspace.</p>
+      </div>
+      <div class="card plain">
+        <h3>Free</h3>
+        <p>Around $75/month left running, plus Bedrock usage. The load balancer bills whether or not the instance is up.</p>
+      </div>
+      <div class="card plain">
+        <h3>Sandboxed</h3>
+        <p>Claude runs with real permissions by default. Prompt injection reaching a shell is a genuine risk with no clean fix.</p>
+      </div>
+    </div>
+  </section>
+
+</main>
+
+<footer class="footer">
+  <div>
+    <span class="wordmark">claude<span class="dim">-web</span></span>
+    <p class="muted">MIT licensed. Not affiliated with Anthropic.</p>
+  </div>
+  <nav>
+    <a href="https://github.com/MichaelNusair/claude-web">Source</a>
+    <a href="https://github.com/MichaelNusair/claude-web/blob/main/docs/DEPLOY.md">Deploy</a>
+    <a href="https://github.com/MichaelNusair/claude-web/blob/main/docs/SECURITY.md">Security</a>
+    <a href="https://github.com/MichaelNusair/claude-web/issues">Issues</a>
+  </nav>
+</footer>
+
+<script src="/copy.js" defer></script>
+</body>
+</html>

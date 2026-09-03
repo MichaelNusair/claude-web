@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="claude-web">
+  <rect width="64" height="64" rx="14" fill="#141413"/>
+  <!-- A terminal prompt: the product is a shell you talk to. -->
+  <path d="M17 24l7 8-7 8" fill="none" stroke="#d97757" stroke-width="5"
+        stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M33 40h14" fill="none" stroke="#f5f4ef" stroke-width="5" stroke-linecap="round"/>
+</svg>

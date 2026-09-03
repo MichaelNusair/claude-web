@@ -91,6 +91,24 @@ const DEFAULTS = {
 
   gitUserName: 'Claude Web',
   gitUserEmail: 'claude-web@example.invalid',
+
+  /**
+   * Optional marketing site, served from S3 behind CloudFront on its own
+   * hostname. Entirely separate from the workspace: different stack, different
+   * hostname, no shared resources, and nothing about it can reach the instance.
+   *
+   * Leave `domainName` empty and no landing resources are created at all.
+   */
+  landing: {
+    /** e.g. "claude.example.com". Empty disables the whole landing stack. */
+    domainName: '',
+    /**
+     * CloudFront requires its certificate in us-east-1, regardless of where the
+     * rest of the deployment lives. Empty creates a DNS-validated one there.
+     */
+    certificateArn: '',
+    stackName: 'ClaudeWebLandingStack',
+  },
 };
 
 /** Environment overrides, flattened. */
@@ -137,6 +155,7 @@ export function loadConfig() {
     ...DEFAULTS,
     ...fromFile,
     oidc: { ...DEFAULTS.oidc, ...(fromFile.oidc || {}) },
+    landing: { ...DEFAULTS.landing, ...(fromFile.landing || {}) },
   };
 
   for (const [envVar, key] of Object.entries(ENV_MAP)) {
@@ -210,6 +229,39 @@ export function loadConfig() {
   })) {
     if (!Number.isInteger(value) || value < 8) {
       fail(`${key} must be a whole number of GiB, at least 8. Got ${JSON.stringify(value)}.`);
+    }
+  }
+
+  // --- Landing site (optional) ---------------------------------------------
+  if (config.landing.domainName) {
+    if (!/^[a-z0-9.-]+\.[a-z]{2,}$/i.test(config.landing.domainName)) {
+      fail(
+        `landing.domainName "${config.landing.domainName}" is not a hostname. ` +
+          'Expected e.g. "claude.example.com", or leave it empty to skip the landing site.',
+      );
+    }
+    if (!config.landing.domainName.endsWith(config.hostedZoneName)) {
+      fail(
+        `landing.domainName "${config.landing.domainName}" is not inside ` +
+          `hostedZoneName "${config.hostedZoneName}". The alias record and ` +
+          'certificate validation both need it to be.',
+      );
+    }
+    if (config.landing.domainName === config.domainName) {
+      fail(
+        `landing.domainName and domainName are both "${config.domainName}". They ` +
+          'cannot share a hostname — one DNS record cannot point at both ' +
+          'CloudFront and the load balancer. Give the workspace its own subdomain.',
+      );
+    }
+    // The workspace certificate is only reusable when it happens to live in
+    // us-east-1, which is the only region CloudFront reads certificates from.
+    if (!config.landing.certificateArn && config.region !== 'us-east-1') {
+      console.warn(
+        '[config] landing.certificateArn is empty and region is not us-east-1, ' +
+          'so a certificate will be created in us-east-1 for CloudFront. This is ' +
+          'correct, just worth knowing: the landing stack is always us-east-1.',
+      );
     }
   }
 
