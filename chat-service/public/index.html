@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1, user-scalable=no">
+<meta name="theme-color" content="#141413">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Claude">
+<title>Claude</title>
+<!-- use-credentials is required: a manifest is fetched with credentials omitted
+     by default, which now means a 401 and no install prompt. -->
+<link rel="manifest" href="/chat/manifest.webmanifest" crossorigin="use-credentials">
+<link rel="apple-touch-icon" href="/chat/pwa-icons/icon-192.png">
+<link rel="stylesheet" href="/chat/style.css">
+</head>
+<body>
+
+<!-- Conversation list -->
+<section id="screen-list" class="screen active">
+  <header class="bar">
+    <h1>Chats</h1>
+    <button id="btn-new" class="icon-btn" aria-label="New chat">
+      <svg viewBox="0 0 24 24"><path d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6z"/></svg>
+    </button>
+  </header>
+  <div id="list-body" class="list-body">
+    <div class="empty">Loading…</div>
+  </div>
+  <nav class="tabbar">
+    <button class="tab active">Chats</button>
+    <a class="tab" href="/editor/" target="_blank" rel="noopener">Editor</a>
+  </nav>
+</section>
+
+<!-- New chat: pick a project -->
+<section id="screen-new" class="screen">
+  <header class="bar">
+    <button class="icon-btn back" data-back aria-label="Back">
+      <svg viewBox="0 0 24 24"><path d="M15.4 7.4 14 6l-6 6 6 6 1.4-1.4L10.8 12z"/></svg>
+    </button>
+    <h1>New chat</h1>
+  </header>
+  <div class="list-body">
+    <div class="section-label">Project</div>
+    <div id="project-picker"></div>
+    <div class="section-label">Add a project</div>
+    <form id="form-project" class="inline-form">
+      <input id="input-project" type="text" placeholder="project-name" autocomplete="off"
+             autocapitalize="none" autocorrect="off" spellcheck="false"
+             pattern="[A-Za-z0-9._\-]+" required>
+      <button type="submit">Create</button>
+    </form>
+    <label class="opt-row">
+      <input type="checkbox" id="opt-github" checked>
+      Create a GitHub repo and push
+    </label>
+    <label class="opt-row">
+      <input type="checkbox" id="opt-private" checked>
+      Private repo
+    </label>
+    <p class="hint" id="new-project-status"></p>
+  </div>
+</section>
+
+<!-- Chat thread -->
+<section id="screen-chat" class="screen">
+  <header class="bar">
+    <button class="icon-btn back" data-back aria-label="Back">
+      <svg viewBox="0 0 24 24"><path d="M15.4 7.4 14 6l-6 6 6 6 1.4-1.4L10.8 12z"/></svg>
+    </button>
+    <div class="bar-title">
+      <span id="chat-title">Claude</span>
+      <span id="chat-sub" class="sub">connecting…</span>
+    </div>
+    <button id="btn-settings" class="icon-btn" aria-label="Settings">
+      <svg viewBox="0 0 24 24"><path d="M12 15.5A3.5 3.5 0 1 1 15.5 12 3.5 3.5 0 0 1 12 15.5m7.4-2.6.1-.9-.1-.9 2-1.6-2-3.4-2.3 1a7 7 0 0 0-1.6-.9L15.1 3H10.9l-.4 2.2a7 7 0 0 0-1.6.9l-2.3-1-2 3.4 2 1.6-.1.9.1.9-2 1.6 2 3.4 2.3-1c.5.4 1 .7 1.6.9l.4 2.2h4.2l.4-2.2a7 7 0 0 0 1.6-.9l2.3 1 2-3.4z"/></svg>
+    </button>
+  </header>
+
+  <div id="thread" class="thread"></div>
+
+  <div id="composer" class="composer">
+    <button id="btn-mic" class="mic-btn" aria-label="Dictate">
+      <svg viewBox="0 0 24 24"><path d="M12 14a3 3 0 0 0 3-3V5a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3m5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.9V21h2v-3.1A7 7 0 0 0 19 11z"/></svg>
+    </button>
+    <textarea id="input" rows="1" placeholder="Message Claude…" enterkeyhint="send"></textarea>
+    <button id="btn-send" class="send-btn" aria-label="Send">
+      <svg viewBox="0 0 24 24"><path d="M4 20V4l16 8z"/></svg>
+    </button>
+    <button id="btn-stop" class="stop-btn hidden" aria-label="Stop">
+      <svg viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
+    </button>
+  </div>
+</section>
+
+<!-- Settings sheet -->
+<div id="sheet" class="sheet hidden">
+  <div class="sheet-backdrop" data-close-sheet></div>
+  <div class="sheet-body">
+    <h2>Settings</h2>
+    <label>Model
+      <select id="select-model"></select>
+    </label>
+    <label>Permissions
+      <select id="select-permission">
+        <option value="bypassPermissions">Full autonomy (default)</option>
+        <option value="acceptEdits">Auto-accept edits</option>
+        <option value="plan">Plan first, then confirm</option>
+      </select>
+    </label>
+    <label>Effort
+      <select id="select-effort">
+        <option value="max">Max (default)</option>
+        <option value="xhigh">Extra high</option>
+        <option value="high">High</option>
+        <option value="medium">Medium</option>
+        <option value="low">Low</option>
+      </select>
+    </label>
+    <p class="hint">Applies to new chats. Existing chats keep the mode they started with.</p>
+    <button data-close-sheet class="wide">Done</button>
+  </div>
+</div>
+
+<div id="toast" class="toast hidden"></div>
+
+<script src="/chat/app.js"></script>
+</body>
+</html>

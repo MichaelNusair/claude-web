@@ -1,0 +1,510 @@
+/**
+ * Chat backend: static PWA + JSON API + WebSocket bridge to the Claude CLI,
+ * plus the voice transcription endpoint.
+ *
+ * Listens on localhost only, behind nginx, which terminates TLS.
+ *
+ * Authentication is enforced *here*, not in the proxy. This service starts a
+ * `claude` process with shell access, so an unauthenticated request to it is an
+ * unauthenticated command execution — and the previous version of this file
+ * said the proxy handled that while the proxy config had no such rule. See
+ * auth.js.
+ */
+import http from 'http';
+import { readFile, stat } from 'fs/promises';
+import { join, extname, normalize, sep } from 'path';
+import { fileURLToPath } from 'url';
+import { dirname } from 'path';
+import { WebSocketServer } from 'ws';
+import { SessionManager, PROJECTS_ROOT, DEFAULT_MODEL } from './session-manager.js';
+import { transcribe, voiceStatus, resetConfigCache } from './transcribe.js';
+import {
+  AUTH_MODE,
+  assertAuthConfig,
+  isAuthenticated,
+  isOpenPath,
+  verifyPassword,
+  sessionCookie,
+  clearedCookie,
+  throttleStatus,
+  recordFailure,
+  recordSuccess,
+  clientIp,
+} from './auth.js';
+
+// Fail fast and loudly: a misconfigured deployment must not boot into an open
+// state. This throws before the listener is created.
+assertAuthConfig();
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const PORT = Number(process.env.PORT || 9997);
+const PUBLIC_DIR = join(__dirname, 'public');
+
+const manager = new SessionManager();
+
+const MIME = {
+  '.html': 'text/html; charset=utf-8',
+  '.js': 'application/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.webmanifest': 'application/manifest+json',
+  '.png': 'image/png',
+  '.svg': 'image/svg+xml',
+  '.ico': 'image/x-icon',
+};
+
+const json = (res, code, body) => {
+  const payload = JSON.stringify(body);
+  res.writeHead(code, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Content-Length': Buffer.byteLength(payload),
+  });
+  res.end(payload);
+};
+
+async function readBody(req, limit = 32 * 1024 * 1024) {
+  const chunks = [];
+  let total = 0;
+  for await (const chunk of req) {
+    total += chunk.length;
+    if (total > limit) throw new Error('request body too large');
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks);
+}
+
+// Asset URLs are stamped with the build's mtime so a client holding a stale
+// copy under the old URL can never serve it for the new one. Browsers that
+// cached app.js while it was still `max-age=3600` would otherwise never
+// re-request it, and no server-side header change can reach them.
+let assetVersion = null;
+async function getAssetVersion() {
+  if (assetVersion) return assetVersion;
+  const files = ['app.js', 'style.css'];
+  let newest = 0;
+  for (const f of files) {
+    try {
+      const info = await stat(join(PUBLIC_DIR, f));
+      newest = Math.max(newest, info.mtimeMs);
+    } catch {
+      /* missing file is handled by the request path */
+    }
+  }
+  assetVersion = String(Math.floor(newest)) || '1';
+  return assetVersion;
+}
+
+async function serveStatic(req, res, pathname) {
+  // Resolve inside PUBLIC_DIR only — never trust the request path.
+  const rel = normalize(pathname === '/' ? '/index.html' : pathname).replace(/^(\.\.[/\\])+/, '');
+  const file = join(PUBLIC_DIR, rel);
+  // Compare against the directory *plus a separator*: a bare startsWith would
+  // also accept a sibling directory whose name merely begins with PUBLIC_DIR.
+  if (file !== PUBLIC_DIR && !file.startsWith(PUBLIC_DIR + sep)) {
+    json(res, 403, { error: 'forbidden' });
+    return;
+  }
+
+  try {
+    let data = await readFile(file);
+
+    // Rewrite asset references in the shell to include the version stamp.
+    if (file.endsWith('index.html')) {
+      const v = await getAssetVersion();
+      // Paths are /chat/-prefixed because nginx routes the chat's assets there
+      // and strips the prefix before it reaches us; the catch-all at / belongs
+      // to code-server. Keep these in step with index.html.
+      data = Buffer.from(
+        data
+          .toString()
+          .replace('src="/chat/app.js"', `src="/chat/app.js?v=${v}"`)
+          .replace('href="/chat/style.css"', `href="/chat/style.css?v=${v}"`),
+      );
+    }
+
+    // Revalidate app code and the shell on every load. A stale app.js paired
+    // with fresh HTML is a silent breakage that looks like "stuck loading", and
+    // these files are small enough that a 304 round-trip costs nothing.
+    const revalidate = /\.(html|js|css|webmanifest)$/.test(file);
+    res.writeHead(200, {
+      'Content-Type': MIME[extname(file)] || 'application/octet-stream',
+      'Cache-Control': revalidate ? 'no-cache' : 'public, max-age=86400',
+      ETag: `"${data.length}-${(await stat(file)).mtimeMs}"`,
+    });
+    res.end(data);
+  } catch {
+    // Single-page app: unknown paths fall back to the shell.
+    try {
+      const shell = await readFile(join(PUBLIC_DIR, 'index.html'));
+      res.writeHead(200, { 'Content-Type': MIME['.html'], 'Cache-Control': 'no-cache' });
+      res.end(shell);
+    } catch {
+      json(res, 404, { error: 'not found' });
+    }
+  }
+}
+
+/**
+ * Reject an unauthenticated request. A browser navigating to a page gets sent to
+ * the login form; anything else gets a 401 the client can act on. Both say only
+ * that authentication is required — never whether the path exists, so this
+ * cannot be used to enumerate projects or routes.
+ */
+function denyUnauthenticated(req, res) {
+  const wantsHtml = (req.headers.accept || '').includes('text/html');
+  if (wantsHtml) {
+    // Carry the requested path through the login so the user lands where they
+    // were going. Only the path and query are forwarded, and the login page
+    // additionally refuses anything that isn't a same-origin relative path —
+    // echoing a caller-supplied URL back into a redirect is how a login page
+    // becomes an open redirect.
+    const target = req.url && req.url.startsWith('/') ? req.url : '/';
+    const next = encodeURIComponent(target);
+    res.writeHead(302, { Location: `/login?next=${next}`, 'Cache-Control': 'no-store' });
+    res.end();
+    return;
+  }
+  json(res, 401, { error: 'authentication required' });
+}
+
+async function handleLogin(req, res) {
+  if (AUTH_MODE !== 'password') {
+    // With an identity provider in front, a local password would be a second,
+    // weaker door into the same box.
+    json(res, 400, { error: 'password login is disabled; this deployment uses OIDC' });
+    return;
+  }
+
+  const ip = clientIp(req);
+  const throttle = throttleStatus(ip);
+  if (throttle.locked) {
+    res.writeHead(429, {
+      'Content-Type': 'application/json; charset=utf-8',
+      'Retry-After': String(throttle.retryAfter),
+    });
+    res.end(JSON.stringify({ error: 'too many attempts', retryAfter: throttle.retryAfter }));
+    return;
+  }
+
+  let password = '';
+  try {
+    // Small cap: a login body is a few dozen bytes, and this route is reachable
+    // without a session, so it must not be an unauthenticated memory sink.
+    const body = JSON.parse((await readBody(req, 4 * 1024)).toString() || '{}');
+    password = typeof body.password === 'string' ? body.password : '';
+  } catch {
+    json(res, 400, { error: 'malformed request' });
+    return;
+  }
+
+  if (!verifyPassword(password)) {
+    recordFailure(ip);
+    // Logged without the attempted value: writing guesses to the journal turns
+    // a log leak into a credential leak, and near-misses are still secrets.
+    console.warn(`failed login from ${ip}`);
+    json(res, 401, { error: 'incorrect password' });
+    return;
+  }
+
+  recordSuccess(ip);
+  console.log(`login from ${ip}`);
+  res.writeHead(204, { 'Set-Cookie': sessionCookie(), 'Cache-Control': 'no-store' });
+  res.end();
+}
+
+const server = http.createServer(async (req, res) => {
+  const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+  const { pathname } = url;
+
+  try {
+    if (pathname === '/healthz') {
+      json(res, 200, { ok: true });
+      return;
+    }
+
+    // Lets the client show the right thing on a 401: a password form, or a
+    // "sign in with your identity provider" bounce. Reveals no secret.
+    if (pathname === '/api/auth-mode' && req.method === 'GET') {
+      json(res, 200, { mode: AUTH_MODE });
+      return;
+    }
+
+    if (pathname === '/api/login' && req.method === 'POST') {
+      await handleLogin(req, res);
+      return;
+    }
+
+    if (pathname === '/login' || pathname === '/login.html') {
+      // Self-contained page: it must render before any authenticated asset
+      // loads, so its CSS is inline and it needs nothing else from the server.
+      await serveStatic(req, res, '/login.html');
+      return;
+    }
+
+    // ---- Everything past this line requires a session. ---------------------
+    // Deliberately positioned so that a route added below cannot be reached
+    // without authentication, whatever the author of that route forgets.
+    if (!isOpenPath(pathname) && !(await isAuthenticated(req))) {
+      denyUnauthenticated(req, res);
+      return;
+    }
+
+    if (pathname === '/api/logout' && req.method === 'POST') {
+      res.writeHead(204, { 'Set-Cookie': clearedCookie() });
+      res.end();
+      return;
+    }
+
+    // Reached only with a valid session — the gate above returns 401 otherwise.
+    // Lets the client tell "session expired" apart from "network dropped", which
+    // look identical from a closed WebSocket.
+    if (pathname === '/api/auth-check') {
+      res.writeHead(204, { 'Cache-Control': 'no-store' });
+      res.end();
+      return;
+    }
+
+    if (pathname === '/api/projects' && req.method === 'GET') {
+      json(res, 200, { projects: await manager.listProjects(), defaultModel: DEFAULT_MODEL });
+      return;
+    }
+
+    if (pathname === '/api/projects' && req.method === 'POST') {
+      const body = JSON.parse((await readBody(req)).toString() || '{}');
+      const { name, github, private: isPrivate, description } = body;
+      // Creating the GitHub repo involves network calls, so this can take a few
+      // seconds; the client shows progress rather than assuming it's instant.
+      json(res, 200, {
+        project: await manager.createProject(name, {
+          github: Boolean(github),
+          private: isPrivate !== false,
+          description: typeof description === 'string' ? description.slice(0, 200) : '',
+        }),
+      });
+      return;
+    }
+
+    if (pathname === '/api/transcript' && req.method === 'GET') {
+      const cwd = url.searchParams.get('cwd');
+      const sessionId = url.searchParams.get('sessionId');
+      if (!cwd || !sessionId) {
+        json(res, 400, { error: 'cwd and sessionId are required' });
+        return;
+      }
+      json(res, 200, { messages: await manager.loadTranscript(cwd, sessionId) });
+      return;
+    }
+
+    // Client-side errors land here so a failure that only happens on one device
+    // is visible in `journalctl -u claude-chat` instead of being invisible.
+    if (pathname === '/api/client-error' && req.method === 'POST') {
+      const body = (await readBody(req, 64 * 1024)).toString();
+      console.error('CLIENT ERROR:', body.slice(0, 1200));
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+
+    if (pathname === '/api/voice-status' && req.method === 'GET') {
+      // ?refresh=1 re-reads the secret, so a rotated key or a newly created
+      // deployment takes effect without restarting the service.
+      if (url.searchParams.get('refresh')) resetConfigCache();
+      json(res, 200, await voiceStatus());
+      return;
+    }
+
+    if (pathname === '/api/transcribe' && req.method === 'POST') {
+      const body = await readBody(req);
+      const text = await transcribe(body, req.headers['content-type']);
+      json(res, 200, { text });
+      return;
+    }
+
+    if (pathname === '/api/models' && req.method === 'GET') {
+      json(res, 200, {
+        models: [
+          { id: 'us.anthropic.claude-opus-5', label: 'Opus 5' },
+          { id: 'us.anthropic.claude-sonnet-5', label: 'Sonnet 5' },
+          { id: 'us.anthropic.claude-opus-4-8', label: 'Opus 4.8' },
+          { id: 'us.anthropic.claude-haiku-4-5', label: 'Haiku 4.5' },
+        ],
+      });
+      return;
+    }
+
+    await serveStatic(req, res, pathname);
+  } catch (err) {
+    console.error(`${req.method} ${pathname} failed:`, err.message);
+    json(res, 500, { error: err.message });
+  }
+});
+
+// --- WebSocket bridge -------------------------------------------------------
+// `noServer` rather than `{ server, path }` so the upgrade is authenticated
+// before the socket is accepted. Checking inside the 'connection' handler would
+// be too late: `ws` completes the handshake first, and this socket is the one
+// that can start a `claude` process.
+const wss = new WebSocketServer({ noServer: true });
+
+server.on('upgrade', async (req, socket, head) => {
+  const { pathname } = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+  if (pathname !== '/ws') {
+    socket.destroy();
+    return;
+  }
+
+  let ok = false;
+  try {
+    ok = await isAuthenticated(req);
+  } catch {
+    ok = false;
+  }
+  if (!ok) {
+    // A plain HTTP response on the raw socket: there is no WebSocket connection
+    // yet to send a close frame over.
+    socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n');
+    socket.destroy();
+    return;
+  }
+
+  wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
+});
+
+wss.on('connection', (ws) => {
+  let conv = null;
+  let onEvent = null;
+
+  const send = (msg) => {
+    if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(msg));
+  };
+
+  // Acknowledge immediately so the client can distinguish "connected, waiting
+  // for me to send something" from "connection silently went nowhere".
+  send({ type: 'ready' });
+
+  // Keep-alive: mobile networks and the ALB will drop an idle connection, and
+  // without pings the client can sit on a dead socket believing it's live.
+  ws.isAlive = true;
+  ws.on('pong', () => { ws.isAlive = true; });
+
+  const attach = (conversation, replay) => {
+    if (conv && onEvent) conv.off('event', onEvent);
+    conv = conversation;
+    onEvent = (event) => send(event);
+    conv.on('event', onEvent);
+    send({ type: 'attached', conversationId: conv.id, cwd: conv.cwd, model: conv.model,
+           permissionMode: conv.permissionMode, busy: conv.busy,
+           sessionId: conv.sessionId });
+    if (replay) for (const event of conv.history) send(event);
+  };
+
+  ws.on('message', async (raw) => {
+    let msg;
+    try {
+      msg = JSON.parse(raw.toString());
+    } catch {
+      send({ type: 'error', message: 'malformed message' });
+      return;
+    }
+
+    try {
+      switch (msg.type) {
+        case 'start': {
+          // Is this session already running? If so we are joining it, not
+          // restarting it, and the transcript alone would miss the turn in
+          // flight — so replay the live tail on top of it.
+          const live = msg.resumeSessionId
+            ? manager.getBySession(msg.cwd, msg.resumeSessionId)
+            : null;
+
+          // Resuming a stored session: show recent history before going live.
+          // Sent as ONE batch rather than hundreds of frames — a phone building
+          // 400 bubbles one event at a time stalls long enough to look broken.
+          if (msg.resumeSessionId) {
+            const past = await manager.loadTranscript(msg.cwd, msg.resumeSessionId);
+            // Long transcripts are trimmed: the tail is what's readable on a
+            // phone, and Claude retains the full context regardless.
+            const recent = past.slice(-60);
+            send({
+              type: 'history',
+              messages: recent,
+              truncated: past.length - recent.length,
+            });
+          }
+
+          const conversation = manager.create({
+            cwd: msg.cwd,
+            model: msg.model,
+            permissionMode: msg.permissionMode,
+            effort: msg.effort,
+            resumeSessionId: msg.resumeSessionId,
+          });
+          attach(conversation, false);
+
+          if (live) {
+            // Joining a process mid-task: the transcript ends at the last
+            // completed turn, so hand over what has happened since.
+            const tail = live.liveTail();
+            for (const event of tail.events) send(event);
+            if (tail.partialText) send({ type: 'delta', text: tail.partialText });
+            send({ type: 'joined', busy: live.busy });
+          }
+          return;
+        }
+
+        case 'reattach': {
+          const existing = manager.get(msg.conversationId);
+          if (!existing) {
+            send({ type: 'error', message: 'conversation not found', fatal: true });
+            return;
+          }
+          attach(existing, true);
+          return;
+        }
+
+        case 'message': {
+          if (!conv) {
+            send({ type: 'error', message: 'no active conversation' });
+            return;
+          }
+          conv.send(msg.text);
+          return;
+        }
+
+        case 'interrupt': {
+          conv?.interrupt();
+          return;
+        }
+
+        default:
+          send({ type: 'error', message: `unknown message type: ${msg.type}` });
+      }
+    } catch (err) {
+      send({ type: 'error', message: err.message });
+    }
+  });
+
+  ws.on('close', () => {
+    // Detach the listener but leave the process running, so work continues
+    // when the phone locks and you can reattach later.
+    if (conv && onEvent) conv.off('event', onEvent);
+  });
+});
+
+// Drop sockets that stop responding to pings, so a phone that went to sleep on
+// a cell network doesn't leave a half-open connection behind.
+const heartbeat = setInterval(() => {
+  for (const ws of wss.clients) {
+    if (ws.isAlive === false) {
+      ws.terminate();
+      continue;
+    }
+    ws.isAlive = false;
+    ws.ping();
+  }
+}, 30_000);
+heartbeat.unref?.();
+
+server.listen(PORT, '127.0.0.1', () => {
+  console.log(`chat service on 127.0.0.1:${PORT} (projects: ${PROJECTS_ROOT})`);
+});

@@ -1,0 +1,52 @@
+{
+  "name": "claude-voice",
+  "displayName": "Claude Voice Dictation",
+  "description": "Hold-to-talk voice dictation that inserts transcribed text at the cursor",
+  "version": "1.0.0",
+  "publisher": "claude-web",
+  "private": true,
+  "engines": {
+    "vscode": "^1.94.0"
+  },
+  "categories": ["Other"],
+  "activationEvents": ["onStartupFinished"],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "claudeVoice.dictate",
+        "title": "Voice: Dictate at Cursor",
+        "icon": "$(mic)"
+      },
+      {
+        "command": "claudeVoice.dictateToClaude",
+        "title": "Voice: Dictate to Claude Code"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "claudeVoice.dictate",
+        "key": "ctrl+shift+v",
+        "mac": "cmd+shift+v"
+      }
+    ],
+    "menus": {
+      "editor/title": [
+        {
+          "command": "claudeVoice.dictate",
+          "group": "navigation@1"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Claude Voice Dictation",
+      "properties": {
+        "claudeVoice.language": {
+          "type": "string",
+          "default": "",
+          "description": "Optional ISO-639-1 language hint for transcription (e.g. 'en', 'he'). Empty means auto-detect."
+        }
+      }
+    }
+  }
+}

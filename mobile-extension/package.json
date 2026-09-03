@@ -1,0 +1,26 @@
+{
+  "name": "claude-mobile-shell",
+  "displayName": "Claude Mobile Shell",
+  "description": "Opens the Claude Code panel full-screen and strips VS Code chrome for phone use",
+  "version": "1.0.0",
+  "publisher": "claude-web",
+  "private": true,
+  "engines": {
+    "vscode": "^1.94.0"
+  },
+  "categories": ["Other"],
+  "activationEvents": ["onStartupFinished"],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "claudeMobile.focusClaude",
+        "title": "Mobile: Open Claude full screen"
+      },
+      {
+        "command": "claudeMobile.toggleChrome",
+        "title": "Mobile: Toggle editor chrome"
+      }
+    ]
+  }
+}

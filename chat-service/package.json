@@ -1,0 +1,17 @@
+{
+  "name": "claude-chat-service",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@aws-sdk/client-secrets-manager": "^3.700.0",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "jsdom": "^30.0.1"
+  }
+}

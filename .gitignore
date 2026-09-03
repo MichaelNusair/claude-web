@@ -1,0 +1,21 @@
+node_modules/
+.env
+dist/
+infra/cdk.out/
+*.vsix
+.DS_Store
+
+# Your deployment's settings: domain, hosted zone, AWS profile, git identity.
+# Ignored so a fork never publishes one person's account details — copy
+# claude-web.config.example.json to create it.
+claude-web.config.json
+
+# CDK caches Route53/AZ lookups here, and those cache entries embed your AWS
+# account id. Regenerated on demand, so there is no reason to commit it.
+infra/cdk.context.json
+
+# Copied in from pwa/ + pwa-icons/ by deploy.sh. pwa/ is the source of truth;
+# committing both copies lets them drift.
+chat-service/public/manifest.webmanifest
+chat-service/public/sw.js
+chat-service/public/pwa-icons/

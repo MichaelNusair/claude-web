@@ -1,0 +1,82 @@
+{
+  "$comment": [
+    "Copy this file to claude-web.config.json and edit it, then run ./deploy.sh.",
+    "claude-web.config.json is gitignored so your settings never get committed.",
+    "Only domainName and hostedZoneName are required; everything else has a",
+    "working default. Every key can also be set as an environment variable —",
+    "see ENV_MAP in infra/config.js. Full reference: docs/DEPLOY.md.",
+    "",
+    "SECURITY: read docs/SECURITY.md before exposing this to the internet.",
+    "Claude runs shell commands on this machine, so the login password is the",
+    "boundary between the internet and a shell on your box."
+  ],
+
+  "domainName": "claude.example.com",
+  "hostedZoneName": "example.com",
+
+  "region": "us-east-1",
+
+  "$comment_optional_dns": [
+    "hostedZoneId skips a Route53 lookup at synth time. Leave it empty to have",
+    "the zone resolved by name. certificateArn reuses an existing ACM",
+    "certificate; leave it empty and a DNS-validated one is created for you."
+  ],
+  "hostedZoneId": "",
+  "certificateArn": "",
+
+  "$comment_profile": "Named AWS profile for the CLI. Empty uses the default credential chain.",
+  "awsProfile": "",
+
+  "$comment_auth": [
+    "'password' is self-contained: a 32-character password is generated into",
+    "Secrets Manager and exchanged for a signed session cookie. Nothing else to",
+    "set up.",
+    "",
+    "'oidc' moves authentication to the load balancer, so no unauthenticated",
+    "request ever reaches the instance. It requires an OAuth app with your",
+    "provider and all six oidc fields below."
+  ],
+  "authMode": "password",
+  "oidc": {
+    "issuer": "",
+    "authorizationEndpoint": "",
+    "tokenEndpoint": "",
+    "userInfoEndpoint": "",
+    "clientId": "",
+    "clientSecretArn": ""
+  },
+
+  "$comment_network": [
+    "Who can reach the load balancer at all. ['0.0.0.0/0'] is the whole",
+    "internet, which is what the login gate is for. If you only ever use this",
+    "from known networks, narrowing this is the single highest-value hardening",
+    "step available — it removes the login page from public reach entirely."
+  ],
+  "allowedCidrs": ["0.0.0.0/0"],
+
+  "$comment_instance": "t4g.large is 2 vCPU / 8 GiB on Graviton. Sizes in GiB.",
+  "instanceType": "t4g.large",
+  "workspaceVolumeSize": 100,
+  "rootVolumeSize": 40,
+
+  "$comment_admin": [
+    "false attaches only what the app needs: Bedrock invoke, its own secrets,",
+    "its own volume. true adds AdministratorAccess so the workspace can deploy",
+    "other AWS infrastructure the way your laptop can — and means one leaked",
+    "password is account takeover, because Claude executes commands here."
+  ],
+  "instanceAdminAccess": false,
+
+  "$comment_claude": [
+    "permissionMode 'bypassPermissions' lets Claude run commands without asking,",
+    "which is the intended experience and also the main risk. 'acceptEdits'",
+    "auto-applies file edits but prompts for commands; 'plan' confirms first."
+  ],
+  "defaultModel": "us.anthropic.claude-opus-5",
+  "permissionMode": "bypassPermissions",
+  "effortLevel": "xhigh",
+
+  "$comment_git": "Author on commits Claude makes in the workspace.",
+  "gitUserName": "Your Name",
+  "gitUserEmail": "you@example.com"
+}
