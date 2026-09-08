@@ -486,6 +486,22 @@ real_ip_recursive on;
 # route so a burst of chat traffic is never throttled.
 limit_req_zone \$binary_remote_addr zone=login:10m rate=12r/m;
 limit_req_status 429;
+
+# What gets injected into the <head> of code-server's HTML: the mobile viewport
+# and the overlay that adds the mic and the project switcher.
+#
+# It lives in a map because it must not go into every HTML response. code-server
+# serves VS Code webviews from this same origin under .../webview/browser/pre/,
+# and the Claude Code panel is one of those webviews — injecting there mounted a
+# second mic and a second project switcher inside the panel's iframe, a few
+# pixels off the workbench's own pair. nginx has no way to switch sub_filter off
+# per request, but a sub_filter replacement string may contain variables, so the
+# decision moves here. The overlay also refuses to run outside the top frame;
+# this keeps the bytes from being shipped at all.
+map \$request_uri \$cmo_head {
+    default '<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,maximum-scale=1,user-scalable=no"><meta name="apple-mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"><script src="/mobile-overlay.js" defer></script>';
+    "~*/webview/browser/pre/" '';
+}
 REALIP
 
 cat > /etc/nginx/conf.d/claude-web.conf <<NGINXCONF
@@ -580,7 +596,7 @@ server {
         proxy_pass http://127.0.0.1:9999/;
         proxy_redirect / /editor/;
         proxy_set_header Accept-Encoding "";
-        sub_filter '</head>' '<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,maximum-scale=1,user-scalable=no"><meta name="apple-mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"><script src="/mobile-overlay.js" defer></script></head>';
+        sub_filter '</head>' '\${cmo_head}</head>';
         sub_filter_once on;
         sub_filter_types text/html;
         proxy_http_version 1.1;
@@ -603,7 +619,7 @@ server {
         # Only viewport/PWA meta plus the overlay script. Deliberately NO
         # stylesheet: CSS that touches `.part.*` desynchronises the workbench's
         # JS-computed absolute layout and renders as a blank gray screen.
-        sub_filter '</head>' '<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,maximum-scale=1,user-scalable=no"><meta name="apple-mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"><script src="/mobile-overlay.js" defer></script></head>';
+        sub_filter '</head>' '\${cmo_head}</head>';
         sub_filter_once on;
         sub_filter_types text/html;
         # sub_filter cannot rewrite compressed bytes.
