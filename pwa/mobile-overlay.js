@@ -432,6 +432,12 @@
         const form = new FormData();
         form.append('audio', wav, 'recording.wav');
         const res = await fetch('/api/transcribe', { method: 'POST', body: form });
+        // Transcription lives behind the chat service's session, which is
+        // separate from code-server's password. Say so plainly instead of
+        // reporting a bare "authentication required" that looks like a bug.
+        if (res.status === 401) {
+          throw new Error('Sign in first — tap the project switcher.');
+        }
         const data = await res.json();
         if (!res.ok) throw new Error(data.error || 'transcription failed');
         textarea.value = (textarea.value ? textarea.value + ' ' : '') + data.text;
@@ -508,6 +514,27 @@
     let projects = [];
     try {
       const res = await fetch('/api/projects');
+      // The editor and the chat API are gated separately — code-server checks its
+      // own password, the API checks a session cookie. Signing into the editor
+      // alone leaves this request unauthorized, and without this branch the 401
+      // body falls through to `|| []` and renders as "No projects found", which
+      // looks like an empty workspace rather than a missing login.
+      if (res.status === 401) {
+        const next = encodeURIComponent(location.pathname + location.search);
+        openSheet(`
+          <p class="cmo-title">Sign in to list projects</p>
+          <p class="cmo-hint">The project list comes from the chat service, which
+          needs its own sign-in. Same password as the editor — once only.</p>
+          <div class="cmo-row">
+            <button class="cmo-action" id="cmo-signin">Sign in</button>
+            <button class="cmo-action cmo-alt" id="cmo-close-projects">Close</button>
+          </div>`);
+        panel.querySelector('#cmo-close-projects').addEventListener('click', closeSheet);
+        panel.querySelector('#cmo-signin').addEventListener('click', () => {
+          location.href = `/login?next=${next}`;
+        });
+        return;
+      }
       projects = (await res.json()).projects || [];
     } catch {
       panel.innerHTML =
@@ -536,8 +563,11 @@
     panel.querySelector('#cmo-new-project').addEventListener('click', openNewProject);
     panel.querySelectorAll('.cmo-item').forEach((btn) => {
       btn.addEventListener('click', () => {
-        // ?folder= is code-server's own way to open a workspace.
-        location.href = `/?folder=${btn.dataset.path}`;
+        // ?folder= is code-server's own way to open a workspace, and code-server
+        // is mounted at /editor/ — `/` is the chat. Navigating to `/?folder=...`
+        // silently threw you into the chat while the editor kept whatever folder
+        // it had, which reads as "the project switcher does nothing".
+        location.href = `/editor/?folder=${btn.dataset.path}`;
       });
     });
   }
@@ -628,7 +658,7 @@
           ? `Created and pushed to ${repo.url}. Opening…`
           : 'Created. Opening…';
         setTimeout(() => {
-          location.href = `/?folder=${encodeURIComponent(data.project.path)}`;
+          location.href = `/editor/?folder=${encodeURIComponent(data.project.path)}`;
         }, 900);
       } catch (err) {
         status.textContent = err.message;

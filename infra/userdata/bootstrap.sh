@@ -34,8 +34,14 @@ DATA_MNT="/workspace"
 # ---------------------------------------------------------------------------
 # Split into required vs nice-to-have: a single unavailable optional package
 # must not abort provisioning (this script runs under `set -e`).
+# tmux is load-bearing, not a convenience: it is what makes a Claude session
+# outlive the browser. code-server tears the extension host down within seconds
+# of the last WebSocket closing (measured: 5s, mid-turn, work lost), and the
+# extension's CLI dies with it. A session started under tmux is parented to
+# systemd instead, so it survives closing the editor, a code-server restart, and
+# a redeploy — and several devices can attach to the same live session at once.
 dnf install -y git tar gzip unzip jq nginx gcc gcc-c++ make cmake python3 python3-pip \
-  openssl shadow-utils nvme-cli xfsprogs
+  openssl shadow-utils nvme-cli xfsprogs tmux
 # ripgrep is not in the AL2023 repos; Claude Code ships its own, so this is
 # only a convenience for interactive shell use.
 dnf install -y ripgrep || echo "ripgrep unavailable in repos; skipping"

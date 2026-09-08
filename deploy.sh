@@ -165,6 +165,9 @@ rm -rf dist/stage/chat-service/node_modules
 # The overlay script is injected into the editor shell by nginx, so it ships as
 # a top-level asset rather than inside the chat service.
 mkdir -p dist/stage/pwa && cp pwa/mobile-overlay.js dist/stage/pwa/
+# Ships in the payload rather than baked into userdata, so `cc` can be updated
+# without replacing the instance.
+mkdir -p dist/stage/scripts && cp scripts/cc-session.sh dist/stage/scripts/
 mkdir -p dist/stage/vsix
 cp dist/claude-voice.vsix dist/claude-mobile.vsix dist/stage/vsix/
 # The chat UI serves its own PWA assets, so bundle them into its public dir.
@@ -176,7 +179,7 @@ cp pwa-icons/*.png dist/stage/chat-service/public/pwa-icons/
 # downloaded and newly written files). Those stubs land on the instance, show up
 # as phantom files in the editor, and left a non-empty directory behind that
 # broke the vsix cleanup below.
-COPYFILE_DISABLE=1 tar -czf dist/payload.tar.gz -C dist/stage chat-service pwa vsix
+COPYFILE_DISABLE=1 tar -czf dist/payload.tar.gz -C dist/stage chat-service pwa vsix scripts
 
 # Staged through S3 rather than inlined into the SSM command.
 #
@@ -219,6 +222,13 @@ cmds = [
   "cd /opt/claude-web/chat-service && npm install --omit=dev",
   "test -d /opt/claude-web/chat-service/node_modules || { echo 'npm install produced no node_modules'; exit 1; }",
   "chown -R coder:coder /opt/claude-web",
+  # `cc <project>` starts or rejoins a permanent Claude session under tmux. On
+  # PATH for both the editor terminal and an SSM shell.
+  # NOTE: no apostrophes in comments here — this block sits inside a command
+  # substitution, and bash tracks single quotes through it, so one stray
+  # apostrophe breaks the whole script with a confusing EOF error.
+  "install -m 0755 /opt/claude-web/scripts/cc-session.sh /usr/local/bin/cc",
+  "command -v tmux >/dev/null || dnf install -y tmux",
   "sudo -u coder HOME=/home/coder /usr/bin/code-server"
   " --user-data-dir /workspace/code-server-data"
   " --extensions-dir /workspace/code-server-ext"

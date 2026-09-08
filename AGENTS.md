@@ -171,6 +171,24 @@ smaller `instanceType` works but `whisper.cpp` transcription gets slower. Do not
 suggest removing the ALB — it terminates TLS, and the security model depends on
 the instance being unreachable except through it.
 
+## The three surfaces, and which one persists
+
+Know this before answering any question about long-running work:
+
+| Surface | Who owns `claude` | Survives closing the app | Shared live across devices |
+| --- | --- | --- | --- |
+| Chat (`/`) | `claude-chat` systemd service | yes | yes — `getBySession` hands both sockets the same process |
+| `cc` / tmux | tmux server, parented to systemd | yes | yes — multiple tmux clients, one session |
+| VS Code extension (`/editor/`) | extension host, tied to the browser | **no — dies in ~5s** | no |
+
+That 5 seconds is measured, not guessed: a probe on a live box recorded
+`exthost` and `claude` both `DEAD` five seconds after `ws_conns` hit 0, mid-turn.
+`ReconnectionGraceTime` does appear in the code-server bundle, which misleadingly
+suggests a 3-hour grace period — it does not apply here. Do not tell someone the
+extension will keep working in the background; it will not.
+
+If a user wants a long autonomous run, point them at `cc <project>`.
+
 ## Gotchas that look like bugs
 
 Things that have burned people, in this codebase specifically:

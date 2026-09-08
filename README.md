@@ -81,6 +81,33 @@ your-domain.com
 - **One-tap new project** — creates the directory, a git repo, and optionally a
   GitHub remote.
 
+## Sessions that outlive the browser
+
+The VS Code extension is the nicest surface, but its Claude process is a child of
+the extension host — and code-server tears that down within **five seconds** of
+the last browser WebSocket closing. Measured on a live deployment: extension host
+and `claude` both dead, mid-turn, work lost.
+
+So for anything long-running, start it under tmux instead:
+
+```bash
+cc                      # list live sessions and projects
+cc my-project           # start, or rejoin, a permanent session
+cc my-project --kill    # end it
+```
+
+That runs the real CLI in a tmux server parented to systemd, so:
+
+- closing the editor, the browser, or your laptop changes nothing
+- it survives a code-server restart and a redeploy
+- **attaching from a second device joins the same live session** — same screen,
+  same scrollback — rather than starting a second Claude
+
+Because it is the real CLI, `/model`, permission modes, `@file` references,
+thinking and tool output are all the genuine thing rather than a copy of it. The
+trade-off: tmux sizes the window to the smallest attached client, so a phone
+constrains a desktop while both are attached.
+
 ## Voice
 
 Tap the mic, talk, tap to stop. The transcript is inserted **at your cursor** with
