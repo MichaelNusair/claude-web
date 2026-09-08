@@ -7,15 +7,35 @@
  * blank gray screen. Everything here lives in its own fixed-position container
  * appended to <body>, above the workbench, and never restyles it.
  *
- * The Claude Code panel is a cross-origin iframe (webviews are served from
- * vscode-cdn.net), so its input cannot be written to directly. Dictated text is
- * therefore delivered the two ways that do work from outside a webview:
+ * The Claude Code panel is a webview iframe with its own document, so its input
+ * cannot be written to directly. (Desktop VS Code serves webviews from
+ * vscode-cdn.net; code-server serves them from this origin under
+ * /stable-<commit>/static/. Either way they are a separate window.) Dictated
+ * text is therefore delivered the two ways that work from outside a webview:
  *   1. clipboard — one tap to paste, works everywhere
  *   2. synthetic keystrokes into whatever has focus, for same-origin inputs
  * Both are offered; the UI is explicit about which it used.
  */
 (function () {
   'use strict';
+
+  /*
+   * Top-level document only.
+   *
+   * nginx injects this script into every text/html response code-server serves,
+   * and the workbench serves its webview container from this same origin
+   * (/stable-<commit>/static/out/vs/workbench/contrib/webview/browser/pre/).
+   * So the Claude Code panel's iframe was getting the script too, and mounting a
+   * second mic and a second project switcher a few pixels off the first pair.
+   * The __claudeMobileOverlay flag below cannot catch that: the iframe is a
+   * different window, with its own globals.
+   *
+   * Comparing window references never throws, even cross-origin — only reading
+   * properties off a foreign window does. So this is safe in both the
+   * same-origin webview code-server actually uses and the vscode-cdn.net one
+   * desktop VS Code uses.
+   */
+  if (window.top !== window.self) return;
 
   if (window.__claudeMobileOverlay) return;
   window.__claudeMobileOverlay = true;
