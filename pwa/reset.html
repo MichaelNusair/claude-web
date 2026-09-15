@@ -32,15 +32,16 @@
 <main>
   <h1>Reset this device</h1>
   <p>
-    The editor caches its own code in a service worker, which survives a normal
-    reload. If the workspace shows a black screen, a stale cached build is the
-    usual cause. This clears every service worker and cache for this site — it
-    touches nothing on the server, and no projects or sessions are affected.
+    Two things survive a normal reload and can leave the editor unusable: a stale
+    build cached by a service worker, which shows up as a black screen, and the
+    saved workbench state, which is why a file view that has taken over the
+    layout comes straight back. This clears both, for this site only — it touches
+    nothing on the server, and no projects, chats or sessions are affected.
   </p>
   <button id="go">Clear caches and reload</button>
   <pre id="log">Ready.</pre>
   <p style="margin-top:14px">
-    Then reopen <a href="/">the workspace</a> or the <a href="/chat">chat</a>.
+    Then reopen <a href="/editor/">the workspace</a> or the <a href="/">chat</a>.
   </p>
 </main>
 <script>
@@ -84,9 +85,43 @@
         say('storage not clearable (private mode?)');
       }
 
+      // VS Code for the web keeps its own state — which editors are open, how
+      // the groups are split — in IndexedDB, not localStorage. So this is the
+      // part that actually undoes a layout a file view has taken over, and
+      // without it a reload restores the same wedged workspace.
+      if (window.indexedDB) {
+        // `databases()` is unavailable on older Safari; fall back to the names
+        // VS Code uses so a phone isn't the one device this can't rescue.
+        let names = ['vscode-web-db', 'vscode-web-state-db-global'];
+        try {
+          if (indexedDB.databases) {
+            names = (await indexedDB.databases()).map((d) => d.name).filter(Boolean);
+          }
+        } catch {
+          say('could not list databases; trying known names');
+        }
+        say(`databases: ${names.join(', ') || 'none'}`);
+        for (const name of names) {
+          // A database still open in another tab blocks deletion forever, so
+          // don't wait past a couple of seconds for one.
+          await new Promise((resolve) => {
+            const req = indexedDB.deleteDatabase(name);
+            req.onsuccess = () => { say(`  deleted ${name}`); resolve(); };
+            req.onerror = () => { say(`  could not delete ${name}`); resolve(); };
+            req.onblocked = () => { say(`  ${name} is open elsewhere — close other tabs`); resolve(); };
+            setTimeout(resolve, 2000);
+          });
+        }
+      }
+
       say('\nDone. Reloading in 2s…');
+      // Land back on the surface they came from — arriving in the chat after
+      // rescuing the editor reads as one more thing that didn't work. `/` is the
+      // chat; the workbench is at /editor/.
+      const from = new URLSearchParams(location.search).get('from');
+      const back = from === 'editor' ? '/editor/' : '/';
       // Bypass the HTTP cache too on the way out.
-      setTimeout(() => location.replace('/?fresh=' + Date.now()), 2000);
+      setTimeout(() => location.replace(back + '?fresh=' + Date.now()), 2000);
     } catch (err) {
       say('FAILED: ' + err.message);
       btn.disabled = false;

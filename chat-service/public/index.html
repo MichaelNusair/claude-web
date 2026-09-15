@@ -44,6 +44,21 @@
   <div class="list-body">
     <div class="section-label">Project</div>
     <div id="project-picker"></div>
+
+    <div class="section-label">Clone from GitHub</div>
+    <form id="form-clone" class="inline-form">
+      <input id="input-clone" type="text" placeholder="owner/repo" autocomplete="off"
+             autocapitalize="none" autocorrect="off" spellcheck="false" required>
+      <button type="submit">Clone</button>
+    </form>
+    <!-- Typing owner/repo on a phone keyboard is the worst part of this flow, so
+         the token's own repository list is one tap away. -->
+    <div class="opt-row">
+      <button type="button" id="btn-browse-repos" class="linkish">Browse my repositories</button>
+    </div>
+    <div id="repo-picker"></div>
+    <p class="hint" id="clone-status"></p>
+
     <div class="section-label">Add a project</div>
     <form id="form-project" class="inline-form">
       <input id="input-project" type="text" placeholder="project-name" autocomplete="off"
@@ -79,6 +94,17 @@
   </header>
 
   <div id="thread" class="thread"></div>
+
+  <!-- Dictation state, in words, directly above the composer.
+       A tinted mic button is not enough: the failure this exists for is the
+       display sleeping mid-sentence, and what the user needs when the screen
+       comes back is a message that is still there saying dictation stopped. -->
+  <div id="dictation-bar" class="dictation-bar hidden" role="status" aria-live="polite">
+    <span id="dictation-text"></span>
+    <button type="button" id="btn-dictation-resume" class="dictation-action hidden">Resume</button>
+    <button type="button" id="btn-dictation-dismiss" class="dictation-action hidden"
+            aria-label="Dismiss">✕</button>
+  </div>
 
   <div id="composer" class="composer">
     <button id="btn-mic" class="mic-btn" aria-label="Dictate">
@@ -119,7 +145,31 @@
       </select>
     </label>
     <p class="hint">Applies to new chats. Existing chats keep the mode they started with.</p>
+    <label class="opt-row">
+      <input type="checkbox" id="opt-keep-awake" checked>
+      Keep the screen awake while the app is open
+    </label>
+    <p class="hint" id="keep-awake-hint"></p>
+    <label class="opt-row">
+      <input type="checkbox" id="opt-polish" checked>
+      Punctuate dictation when I stop talking
+    </label>
+    <p class="hint" id="polish-hint"></p>
     <button data-close-sheet class="wide">Done</button>
+  </div>
+</div>
+
+<!-- Project sheet: what a project still holds, and removing it once it doesn't
+     hold anything that only exists here. -->
+<div id="project-sheet" class="sheet hidden">
+  <div class="sheet-backdrop" data-close-project></div>
+  <div class="sheet-body">
+    <h2 id="project-sheet-title">Project</h2>
+    <div id="project-sheet-body">Checking…</div>
+    <button type="button" id="btn-project-remove" class="wide danger hidden">
+      Push &amp; delete from this machine
+    </button>
+    <button type="button" data-close-project class="wide subtle">Close</button>
   </div>
 </div>
 

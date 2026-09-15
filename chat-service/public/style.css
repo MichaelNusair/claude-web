@@ -248,6 +248,38 @@ html, body {
   50% { box-shadow: 0 0 0 12px rgba(224,82,82,0) }
 }
 
+/* --- dictation status --- */
+/* Sits between the thread and the composer so it is the last thing above the
+   keyboard: the one place a glance always lands while dictating. */
+.dictation-bar {
+  flex: 0 0 auto;
+  display: flex; align-items: center; gap: 10px;
+  padding: 9px 14px;
+  font-size: 13px; line-height: 1.35;
+  border-top: 1px solid var(--border);
+  background: var(--bg-raised); color: var(--text-dim);
+}
+.dictation-bar.listening { color: var(--text); }
+.dictation-bar.listening::before {
+  content: ''; flex: 0 0 auto;
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--error); animation: blink 1.3s infinite both;
+}
+/* Loud on purpose. This is the state the user came back to the phone to find. */
+.dictation-bar.stopped {
+  background: rgba(224, 82, 82, .14);
+  color: var(--text);
+  border-top-color: var(--error);
+}
+.dictation-bar span { flex: 1; min-width: 0; }
+.dictation-action {
+  flex: 0 0 auto;
+  padding: 7px 12px; border: none; border-radius: 10px;
+  background: var(--accent); color: #fff;
+  font: inherit; font-size: 13px; font-weight: 600; cursor: pointer;
+}
+#btn-dictation-dismiss { background: transparent; color: var(--text-dim); padding: 7px 4px; }
+
 /* --- sheet --- */
 .sheet { position: fixed; inset: 0; z-index: 50; }
 .sheet-backdrop { position: absolute; inset: 0; background: rgba(0,0,0,.55); }
@@ -289,4 +321,45 @@ html, body {
   padding: 4px 16px; font-size: 14px; color: var(--text-dim);
 }
 .opt-row input { width: 19px; height: 19px; accent-color: var(--accent); }
-#new-project-status { padding: 6px 16px 0; font-size: 13px; }
+#new-project-status, #clone-status { padding: 6px 16px 0; font-size: 13px; }
+
+.linkish {
+  background: none; border: none; padding: 6px 0;
+  color: var(--accent); font: inherit; font-size: 14px; cursor: pointer;
+  text-align: left;
+}
+
+/* A project row with its own manage button. `.row` is a <button>, so the second
+   control has to be a sibling — a button inside a button is not valid HTML and
+   browsers recover from it unpredictably. */
+.row-wrap {
+  display: flex; align-items: center;
+  border-bottom: 1px solid var(--border);
+}
+.row-wrap .row { border-bottom: none; flex: 1; min-width: 0; }
+.row-wrap .icon-btn { margin-right: 6px; color: var(--text-dim); }
+.row-wrap .icon-btn svg { width: 20px; height: 20px; }
+
+/* Repo rows from GitHub: denser than a chat row, since there can be many. */
+.repo-row { padding: 11px 16px; }
+.repo-row .row-title { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 14px; }
+.repo-tag {
+  display: inline-block; margin-left: 6px; padding: 1px 6px;
+  border-radius: 9px; font-size: 11px; font-weight: 600;
+  background: var(--bg-input); color: var(--text-dim); vertical-align: 1px;
+}
+
+/* Project sheet */
+#project-sheet .sheet-body { max-height: 86vh; overflow-y: auto; }
+#project-sheet-body { font-size: 14px; color: var(--text-dim); }
+.fact-list { margin: 0; padding: 0; list-style: none; }
+.fact-list li {
+  display: flex; gap: 10px; justify-content: space-between;
+  padding: 8px 0; border-bottom: 1px solid var(--border);
+}
+.fact-list li span:last-child { color: var(--text); text-align: right; word-break: break-word; }
+/* Anything that only exists on this machine is called out, because it is the
+   whole reason the delete button might be the wrong thing to press. */
+.fact-list li.at-risk span:last-child { color: var(--accent); }
+.danger { background: var(--error); }
+.subtle { background: var(--bg-input); color: var(--text); }

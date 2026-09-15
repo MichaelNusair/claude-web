@@ -49,8 +49,11 @@ itself is not something you will do on an internet-facing deployment.
 ### Before you finish any change to auth, routing, or the stack
 
 ```bash
-npm run test:auth      # must be 36/36 or better; never fewer checks than before
+npm run test:auth      # must be 41/41 or better; never fewer checks than before
 npm run test:client
+npm run test:overlay   # 38/38; the editor overlay, its chords, its drafts, its clipboard
+npm run test:polish    # 19/19; the dictation cleanup's bounds, and its failure paths
+npm run test:projects  # 53/53; real git repos, real pushes
 cd infra && npx cdk synth --quiet
 ```
 
@@ -64,9 +67,21 @@ chat-service/            The chat backend + PWA client. The security boundary.
   auth.js                Password + OIDC verification, cookies, throttling.
   auth-test.js           End-to-end auth tests. Run these.
   server.js              HTTP routes, static files, WebSocket upgrade gate.
-  session-manager.js     One `claude` process per conversation; transcripts.
+  session-manager.js     One `claude` process per conversation; transcripts;
+                         the project lifecycle (create, clone, remove).
   transcribe.js          Voice: local whisper.cpp, optional Azure override.
+  polish.js              Makes a finished dictation readable: punctuation,
+                         capitals, misheard names. Bedrock Haiku, one bounded
+                         pass, returns the raw transcript on any failure.
   smoke-test.js          Boots app.js in jsdom — catches load-time breakage.
+  polish-test.js         The cleanup's guard rails: what `looksLikeCleanup`
+                         must reject, and that every failure path hands the
+                         raw transcript back.
+  overlay-test.js        Boots pwa/mobile-overlay.js in jsdom. Nothing else
+                         loads that file, and it drives the editor by
+                         keybinding, so this is what checks both.
+  project-test.js        Project removal against real git repos. Deletes trees,
+                         so the refusals are what this tests hardest.
   public/                index.html, app.js, style.css, login.html.
 
 infra/                   AWS CDK (JavaScript, not TypeScript).
@@ -81,7 +96,8 @@ landing/                 The public marketing page. Static, no build step.
 pwa/                     Assets copied into chat-service/public/ by deploy.sh.
                          THIS IS THE SOURCE OF TRUTH for manifest + sw.js.
 voice-extension/         VS Code dictation extension (for the editor surface).
-mobile-extension/        Strips VS Code chrome for phone use.
+mobile-extension/        Strips VS Code chrome for phone use, and owns the
+                         rescue from a layout a file view has taken over.
 deploy.sh                The whole deploy. Read it before changing the pipeline.
 deploy-landing.sh        The landing site only. Independent of deploy.sh.
 migrate.sh               Brings local repos + Claude session history up.
@@ -151,6 +167,40 @@ message says so. That is correct behaviour, not a crash — find out why
 process → `public/app.js` for UI. Client requests go through the `api()` wrapper
 so a 401 redirects to login; use it rather than bare `fetch`.
 
+### "Delete a project I'm done with"
+
+`POST /api/projects/remove` — commit, push every branch and tag, verify with the
+remote that it landed, then `rm -rf` the directory. Reachable from the chat: New
+chat → the ⋯ next to a project.
+
+The order matters and the verification is not decoration. A `git push` that exits
+0 is not proof the remote has anything: the remote-tracking ref it updated is a
+local file, and this operation deletes the only other copy of the work. So the
+commit on disk is compared against `git ls-remote`, over the network, and anything
+short of a match refuses to delete.
+
+It returns **409, not 500**, when something exists only on that machine — no
+remote, a stash, a push that partly failed, a chat still working in the directory.
+That is a refusal the user can answer, and the client turns it into a specific
+question with `force` as the answer. If you add a new way for work to be
+local-only, add a check for it *and* a case to `project-test.js`. `force` must
+never become the default, and must never be inferred.
+
+Chat transcripts under `CLAUDE_HOME` are deliberately left behind. They are small,
+they are the record of what was done, and keeping them means re-cloning the repo
+later lands next to its own history.
+
+### "Clone one of my GitHub repos"
+
+`POST /api/projects/clone`, or the repository list from `GET /api/github/repos`.
+
+`parseGithubRepo()` accepts `owner/repo` and github.com URLs and **rejects every
+other host**. That is a security boundary, not tidiness: the workspace's git
+credential helper (`git-credential-secretsmanager`) answers with the PAT for
+whatever host git asks it about, so cloning a caller-supplied URL from elsewhere
+would hand that host the token. Do not relax it to "any git URL". If someone wants
+that, the fix is to scope the credential helper to github.com first.
+
 ### "Change the routing"
 
 Read the comment block above the nginx config in `bootstrap.sh` first. The layout
@@ -206,6 +256,47 @@ Things that have burned people, in this codebase specifically:
 - **The service worker deliberately unregisters itself.** It caches nothing. A
   stale cached shell breaks a live WebSocket client rather than helping, and a
   wedged worker has no user-side escape. Do not add caching.
+- **The overlay drives the editor through keyboard chords, and both ends have to
+  agree.** `pwa/mobile-overlay.js` cannot call a VS Code command — there is no
+  supported global for the workbench's command service, and rewriting the bundle
+  to get one black-screened the editor twice. So the Layout buttons synthesise
+  `ctrl+alt+shift+F9`/`F10`, and `mobile-extension/package.json` binds those to
+  its commands. Nothing throws if they drift apart; the buttons just stop working,
+  on the surface where the user has no other way out. `overlay-test.js` reads the
+  chords out of the manifest and compares them against what the buttons dispatch —
+  keep it that way rather than hard-coding the keys in the test as well.
+- **The workbench reloads itself, and a reload of `/editor/` destroys work.** Its
+  lifecycle service calls `location.reload()` when the browser restores the page
+  from the back/forward cache — on a phone that is every app switch — and a reload
+  restarts the extension host, which is where the Claude conversation lives. So
+  treat *every* extra page load on that surface as damage: it is measurable (the
+  remote agent log shows a fresh `ManagementConnection` and "Extension Host Process
+  exited with code: 0" per load, and `code-server-data/logs/*/exthost*/` gains a
+  directory) and it is what "it refreshed a few times and deleted what I typed"
+  means. Two rules follow. Never navigate to arrive where you already are — the
+  project switcher checks the current `?folder=` first. And nothing may hold typed
+  text as its only copy: the chat composer and the overlay's dictation textarea both
+  write to localStorage as you type, because the reload is not this app's decision.
+  When a report like that comes in again, the Layout sheet shows this tab's recent
+  loads with `navigation.type` for each — `navigate` means something assigned to
+  `location`, `reload` means the page or the OS did it, `bfcache-restore` means the
+  browser suspended the tab and the workbench reloaded in response. That line is the
+  only diagnostic; the server side of all three causes is identical.
+- **The startup layout pass must only act when the layout is wrong.** The mobile
+  extension re-checks at 0.8/2/4s because VS Code restores its saved layout shortly
+  after startup — but it used to re-run the whole sequence each time, and
+  `joinAllGroups` moves editors between groups, which re-parents the Claude webview
+  and re-creates it, taking an unsent message with it. So the passes are gated on
+  `layoutIsSettled()`, `focusClaude()` skips `openLast` when the panel is already
+  open, and `applySettings()` compares `inspect(key).globalValue` before writing —
+  45 redundant `update()` calls is 45 configuration-change events through the
+  workbench while it is still starting.
+- **`closeFileTabs()` closes files, never webviews.** The Claude panel *is* a
+  webview, and disposing it ends the conversation inside it. So the rescue works
+  from an allowlist of text/diff/notebook tabs: misjudging that way leaves a file
+  open, which is untidy, while the inverse throws away a turn in flight. Dirty
+  tabs are skipped on purpose too — closing one raises a modal save prompt, which
+  is the dead end this whole extension exists to avoid.
 - **Every `__PLACEHOLDER__` in `bootstrap.sh` needs a matching `sed -e` in
   `stack.js`.** A mismatch ships a literal `__FOO__` to the box. Check with:
 
@@ -228,6 +319,46 @@ Things that have burned people, in this codebase specifically:
   exactly like a mobile overflow bug and isn't one. Use
   `Emulation.setDeviceMetricsOverride` with `mobile: true`, and confirm with
   `documentElement.scrollWidth` rather than by eye.
+- **The screen wake lock has to be re-requested, not acquired.** It is held for as
+  long as the app is open and visible, not just during dictation, because hiding the
+  page also freezes the WebSocket and suspends the recognizer. The browser releases
+  the lock on every hide and never re-takes it, and the OS revokes it silently
+  (battery saver) with no event to say you may have it back. So there is one
+  `syncWakeLock()` reconciler called from `visibilitychange`, `pageshow`, `focus`
+  and a 30s timer — not an `acquireWakeLock()` called once at startup, which is
+  awake for exactly one screen-off and asleep forever after. The same reconciler is
+  duplicated in `pwa/mobile-overlay.js` (injected raw into code-server, imports
+  nothing) and reads the same `claude-keep-awake` localStorage key, so one switch
+  governs both surfaces. Covered in `smoke-test.js` against a fake `navigator.wakeLock`,
+  because whether a display sleeps is invisible to the page.
+- **Dictation stops when the page is hidden, on purpose.** A phone being dictated
+  into is a phone nobody is touching, so the display sleeps and the recognizer
+  goes with it — silently, because the screen showing "recording" is what turned
+  off. The wake lock above is the first defence; the second is treating any stop
+  they did not ask for as an event to announce: beep, vibrate, and a banner that
+  outlives the screen going dark. Do not "improve" this by letting dictation carry
+  on through `visibilitychange` and hoping — that is the original bug, and the
+  failure is invisible from a desktop browser. The interruption path is covered in
+  `smoke-test.js` for exactly that reason.
+- **The `record` (whisper) dictation path stops by transcribing.** An interrupted
+  recording still yields the words spoken before the interruption, so an unexpected
+  stop must call `recorder.stop()` rather than discarding the chunks.
+- **The dictation cleanup pass may only ever improve text that is already there.**
+  Neither transcriber can punctuate a whole utterance — the browser recognizer emits
+  none at all, and whisper sees one pause-delimited phrase at a time — so
+  `POST /api/polish` (`polish.js`) makes one Bedrock Haiku pass over the finished
+  text. Four rules, and none of them are optional: the raw transcript is written
+  into the composer *first* and every failure path leaves it exactly there; the pass
+  runs only after dictation ended and the phrase queue drained, never mid-sentence
+  and never after an interruption (Resume continues that dictation); the result is
+  discarded unless the dictated span is still untouched, because a reply about text
+  the user has since edited or sent would overwrite newer work; and the dictated
+  text is data, never an instruction — the prompt says so, and `looksLikeCleanup()`
+  rejects a model that answered instead of editing. In the overlay the clipboard
+  write happens inside the tap, *before* the pass, both because iOS refuses a write
+  issued after an `await` and because the copy is the only handover. Covered in
+  `smoke-test.js` (span guards, the switch, a send that waits) and `overlay-test.js`
+  (copy order, a 503).
 - **The CLI's flags are process arguments**, so model, permission mode and effort
   are fixed for the life of a conversation. Settings changes apply to new chats
   only. This is not a bug to fix.
@@ -250,7 +381,7 @@ Things that have burned people, in this codebase specifically:
 There is no staging environment, so local verification is what you have:
 
 ```bash
-npm test                                   # auth + client
+npm test                                   # auth + client + project lifecycle
 cd infra && npx cdk synth --quiet          # stack compiles
 bash -n deploy.sh migrate.sh infra/userdata/bootstrap.sh
 node --check chat-service/server.js

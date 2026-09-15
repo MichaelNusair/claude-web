@@ -75,11 +75,21 @@ your-domain.com
   and full output. Failures auto-expand.
 - **Live streaming** text, with a typing indicator while Claude works.
 - **Stop button** while a turn is running.
+- **Drafts survive the app going away** — a half-typed or half-dictated message is
+  saved as you write it and restored with the conversation, because a phone browser
+  reloads a backgrounded tab whenever it likes and a paragraph of dictation exists
+  nowhere else.
 - **Reconnect-safe** — the server keeps the process alive when your phone locks or
   the network drops. Reattaching resumes the same conversation mid-task, including
   work started from another device.
 - **One-tap new project** — creates the directory, a git repo, and optionally a
   GitHub remote.
+- **Clone an existing GitHub repo** — paste `owner/repo`, or tap one from the list
+  of repositories the workspace token can see.
+- **Retire a project** — commits, pushes every branch and tag, checks with the
+  remote that it really landed, then deletes the folder from the instance. It
+  refuses if anything would be lost (no remote, a stash, a push that failed) and
+  says which; overriding is a separate, deliberate tap. Chat history is kept.
 
 ## Sessions that outlive the browser
 
@@ -118,7 +128,70 @@ Transcription runs **on the instance** (`whisper.cpp`, `base.en`): no API key, n
 quota request, nothing per request, and audio never leaves the box. Measured on 2
 vCPUs, ~4s for 11s of audio.
 
-Two details worth knowing:
+**Then it gets punctuated.** Raw speech-to-text is the one place this used to feel
+worse than a consumer app: no punctuation, no capitals, and every product name
+mangled — "compared to ChatGPT and Gemini apps" arrives as "compared to Georgia PT
+and Germany apps". Neither engine can do better on its own, because sentence
+boundaries and proper nouns need the whole utterance and both of them work in
+fragments: the browser's recognizer emits no punctuation at all, and whisper sees
+one pause-delimited phrase at a time so that text keeps up with the speaker.
+
+So when you stop talking, the finished text gets one pass through Claude Haiku on
+Bedrock — punctuation, capitals, the names it plainly misheard, filler removed —
+and nothing else. It never answers or acts on what you dictated, and it never
+rewrites your words. The raw transcript is in the composer first and stays there
+if the pass fails, times out, or comes back looking like a reply rather than an
+edit; a send that lands mid-pass waits a moment for it. Costs a second or two and
+a few tokens per dictation; the switch is in Settings, and it covers the editor
+overlay too, where it runs after the text is already on your clipboard.
+
+A long dictation used to end without warning: a phone being talked into is a phone
+nobody is touching, so the display sleeps on its idle timer, and the speech
+recognizer goes with it. The screen that was showing "recording" is the thing that
+turned off, so there was nothing to notice. Now:
+
+- the app **holds the screen awake** for as long as it is open — see below;
+- the status bar above the composer counts the seconds, so a stalled recognizer is
+  visible at a glance rather than inferred from silence;
+- and any stop you did not ask for **beeps, buzzes, and leaves a banner** that is
+  still there when you look at the phone again. The words already dictated stay in
+  the box, and Resume carries on from where it stopped.
+
+Where a wake lock is not available the status bar says so outright rather than
+promising a screen that will sleep anyway.
+
+## Keeping the screen awake
+
+The phone's display sleeps on its idle timer, and this app is used in long
+stretches where nobody is touching the screen: dictating a paragraph, watching a
+task run for two minutes, reading a long answer. When the display sleeps the page
+is hidden, and hiding the page suspends the recognizer and freezes the WebSocket —
+so the idle timer is not a cosmetic annoyance, it ends whatever was in flight.
+
+So the **Screen Wake Lock** is held for as long as the app is open and in front,
+not only while dictating. It is on by default, the switch is in Settings, and one
+switch covers both the chat and the editor — they are one origin behind nginx, so
+they share the setting. Three properties of the API shape the implementation:
+
+- it needs a **visible** document; requesting while hidden is rejected;
+- the browser **releases it on every hide and never re-acquires it**, so every
+  return to the foreground has to re-request;
+- the OS **revokes it whenever it likes** (battery saver, low battery) with no
+  event to say you may have it back, so the only way to notice is to keep asking.
+
+Hence one `syncWakeLock()` that reconciles held-against-wanted, called from every
+event that can change either, plus a 30s timer for the revocation case. Turning the
+setting off still lets dictation hold the screen: "off" means *don't burn my battery
+while I read*, not *cut me off mid-sentence*.
+
+What no web page can do is keep the display on once you leave the app or press the
+power button — that is the OS's decision and the page is not consulted. Nor is there
+a workaround from inside a browser with no wake lock API at all (iOS before 16.4);
+there, raise the screen timeout in the OS settings. That residue is why the
+"announce every stop we did not ask for" behaviour above still exists rather than
+being replaced by the wake lock.
+
+Two more details worth knowing:
 
 - **The browser converts audio to 16 kHz mono WAV before uploading.** Browsers
   record webm/**opus**, and the bundled decoder (miniaudio) handles WAV/MP3/FLAC/
@@ -130,6 +203,42 @@ Two details worth knowing:
 
 Azure OpenAI Whisper is supported as an optional override, falling back to local
 if Azure errors. See [docs/DEPLOY.md](docs/DEPLOY.md).
+
+## The editor on a phone
+
+`/editor/` is real code-server running the real Claude Code extension, with the
+activity bar, status bar and tabs stripped so the panel gets the whole screen. A
+small bar of buttons — dictate, switch project, fix the layout — floats over it;
+long-press any of them to move the bar to the other edge.
+
+The layout button is there because of one specific way the editor gets stuck: tap
+a file in the transcript and it opens beside the panel, and with no tabs and no
+status bar there is nothing on screen that closes it again. The panel keeps
+whatever width is left, and reloading brings the file back with it. Three
+escalating ways out, because the first two can't confirm they worked:
+
+- **Back to Claude** closes the files and diffs the panel opened and gives Claude
+  the whole window. The conversation keeps running; unsaved files are left alone
+  rather than raising a save dialog no phone can answer.
+- **Show tabs & bars** puts the chrome back so things can be closed by hand.
+- **Reload** now recovers on its own — the editor closes restored file tabs at
+  startup, so a refresh means what you expect. Set
+  `claudeMobile.closeFilesOnStartup` to `false` if you use this as an IDE at a
+  desk and want your open editors back after a reload.
+
+A reload of the editor is not free — it restarts the extension host, and the
+Claude conversation lives inside it — and it is not always your decision: the
+workbench reloads itself when the browser restores the page from its back/forward
+cache, which on a phone happens whenever you switch apps and come back. So the
+surface no longer adds loads of its own (tapping the project you are already in
+does nothing, and the startup layout pass only acts when the layout is actually
+wrong), dictated text is saved as you speak it rather than living only in the
+overlay's textarea, and the Layout sheet lists this tab's recent loads and what
+caused each one — which is the only way that symptom is visible from a phone.
+
+Beyond that, `…/chat/reset.html` clears the service worker, the caches and the
+saved workbench state for the device — which is what a black screen or a layout
+that survives everything else actually needs. It touches nothing on the server.
 
 ## Defaults
 
@@ -199,7 +308,7 @@ rules that matter, and the gotchas that have burned people. Contributions welcom
 — see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ```bash
-npm test                              # auth + client tests
+npm test                              # auth + client + overlay + dictation + projects
 cd infra && npx cdk synth --quiet     # stack compiles
 ```
 

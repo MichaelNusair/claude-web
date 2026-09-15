@@ -18,9 +18,33 @@
         "title": "Mobile: Open Claude full screen"
       },
       {
+        "command": "claudeMobile.backToClaude",
+        "title": "Mobile: Back to Claude (close open files)"
+      },
+      {
         "command": "claudeMobile.toggleChrome",
         "title": "Mobile: Toggle editor chrome"
       }
-    ]
+    ],
+    "keybindings": [
+      {
+        "command": "claudeMobile.backToClaude",
+        "key": "ctrl+alt+shift+f9"
+      },
+      {
+        "command": "claudeMobile.toggleChrome",
+        "key": "ctrl+alt+shift+f10"
+      }
+    ],
+    "configuration": {
+      "title": "Claude Mobile Shell",
+      "properties": {
+        "claudeMobile.closeFilesOnStartup": {
+          "type": "boolean",
+          "default": true,
+          "description": "Close restored files and diffs when the workbench starts, so reloading the page recovers a layout that a file view has taken over. Turn this off to keep your open editors across reloads."
+        }
+      }
+    }
   }
 }

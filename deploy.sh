@@ -68,6 +68,30 @@ step "Checking the client boots"
 ) || { echo "client smoke test failed — not deploying." >&2; exit 1; }
 
 # ---------------------------------------------------------------------------
+step "Checking the editor overlay"
+# ---------------------------------------------------------------------------
+# Nothing but nginx loads this file, so a load-time error removes the mic, the
+# project switcher and the layout rescue from the editor with no other symptom.
+# It also checks that the rescue's keyboard chords still match the keybindings
+# the mobile extension declares — two files, no shared code, and a silent
+# failure if they drift.
+(
+  cd chat-service
+  node overlay-test.js
+) || { echo "editor overlay test failed — not deploying." >&2; exit 1; }
+
+# ---------------------------------------------------------------------------
+step "Checking the project lifecycle"
+# ---------------------------------------------------------------------------
+# Removing a project deletes a directory tree, so this exercises the refusals
+# against real git repositories: unpushed commits, no remote, a stash. A bug here
+# loses work that exists nowhere else, which no later fix recovers.
+(
+  cd chat-service
+  node project-test.js
+) || { echo "project lifecycle tests failed — not deploying." >&2; exit 1; }
+
+# ---------------------------------------------------------------------------
 step "Packaging the voice dictation extension"
 # ---------------------------------------------------------------------------
 mkdir -p dist
@@ -171,7 +195,7 @@ mkdir -p dist/stage/scripts && cp scripts/cc-session.sh dist/stage/scripts/
 mkdir -p dist/stage/vsix
 cp dist/claude-voice.vsix dist/claude-mobile.vsix dist/stage/vsix/
 # The chat UI serves its own PWA assets, so bundle them into its public dir.
-cp pwa/manifest.webmanifest pwa/sw.js dist/stage/chat-service/public/
+cp pwa/manifest.webmanifest pwa/sw.js pwa/reset.html dist/stage/chat-service/public/
 mkdir -p dist/stage/chat-service/public/pwa-icons
 cp pwa-icons/*.png dist/stage/chat-service/public/pwa-icons/
 # COPYFILE_DISABLE stops macOS tar from emitting AppleDouble `._*` companions for

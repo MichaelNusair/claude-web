@@ -18,6 +18,7 @@ import { dirname } from 'path';
 import { WebSocketServer } from 'ws';
 import { SessionManager, PROJECTS_ROOT, DEFAULT_MODEL } from './session-manager.js';
 import { transcribe, voiceStatus, resetConfigCache } from './transcribe.js';
+import { polish } from './polish.js';
 import {
   AUTH_MODE,
   assertAuthConfig,
@@ -284,6 +285,53 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    // What deleting this project would cost, asked before anything is offered.
+    if (pathname === '/api/project-status' && req.method === 'GET') {
+      const name = url.searchParams.get('name');
+      if (!name) {
+        json(res, 400, { error: 'name is required' });
+        return;
+      }
+      json(res, 200, { status: await manager.projectStatus(name) });
+      return;
+    }
+
+    // Commit, push, verify, then delete from the machine. This is irreversible,
+    // so a refused removal comes back as 409 with the reason and the repository
+    // state that produced it — the client turns that into a specific question
+    // rather than a generic failure. `force` is the answer to that question, and
+    // must never be the default.
+    if (pathname === '/api/projects/remove' && req.method === 'POST') {
+      const body = JSON.parse((await readBody(req, 4 * 1024)).toString() || '{}');
+      if (!body.name) {
+        json(res, 400, { error: 'name is required' });
+        return;
+      }
+      try {
+        json(res, 200, await manager.removeProject(body.name, { force: body.force === true }));
+      } catch (err) {
+        if (!err.blocked) throw err;
+        console.warn(`refused to remove ${body.name}: ${err.message}`);
+        json(res, 409, { error: err.message, canForce: true, status: err.status, steps: err.steps });
+      }
+      return;
+    }
+
+    // Bring an existing GitHub repository into the workspace. Cloning is slow
+    // enough on a phone to need its own progress reporting client-side.
+    if (pathname === '/api/projects/clone' && req.method === 'POST') {
+      const body = JSON.parse((await readBody(req, 4 * 1024)).toString() || '{}');
+      json(res, 200, {
+        project: await manager.cloneProject({ repo: body.repo, name: body.name }),
+      });
+      return;
+    }
+
+    if (pathname === '/api/github/repos' && req.method === 'GET') {
+      json(res, 200, { repos: await manager.listGithubRepos() });
+      return;
+    }
+
     if (pathname === '/api/transcript' && req.method === 'GET') {
       const cwd = url.searchParams.get('cwd');
       const sessionId = url.searchParams.get('sessionId');
@@ -317,6 +365,25 @@ const server = http.createServer(async (req, res) => {
       const body = await readBody(req);
       const text = await transcribe(body, req.headers['content-type']);
       json(res, 200, { text });
+      return;
+    }
+
+    /*
+     * Punctuate and capitalise a finished dictation, and fix the names the small
+     * recognizers mangle. See polish.js: it is a repair pass with a hard timeout
+     * that returns the original text on any failure, so this route answers 200
+     * with something usable even when Bedrock is unreachable.
+     *
+     * The project names go in as vocabulary. They are the words this speaker says
+     * most and the ones no general model could guess, and they are already visible
+     * to any caller who can reach this route (`GET /api/projects`), so nothing new
+     * is disclosed by sending them.
+     */
+    if (pathname === '/api/polish' && req.method === 'POST') {
+      const body = JSON.parse((await readBody(req, 64 * 1024)).toString() || '{}');
+      const names = (await manager.listProjects().catch(() => [])).map((p) => p.name);
+      const { text, changed } = await polish(body.text, { vocabulary: names });
+      json(res, 200, { text, changed });
       return;
     }
 

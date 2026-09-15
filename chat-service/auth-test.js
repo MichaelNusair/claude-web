@@ -147,10 +147,19 @@ console.log('\nRejects unauthenticated access:');
 const guarded = [
   ['GET', '/api/projects'],
   ['POST', '/api/projects'],
+  // Reads and writes the project tree: status inspects a repository, remove
+  // deletes a directory, clone runs git against the network.
+  ['GET', '/api/project-status?name=demo'],
+  ['POST', '/api/projects/remove'],
+  ['POST', '/api/projects/clone'],
+  ['GET', '/api/github/repos'],
   ['GET', '/api/transcript?cwd=/tmp&sessionId=x'],
   ['GET', '/api/models'],
   ['GET', '/api/voice-status'],
   ['POST', '/api/transcribe'],
+  // Spends Bedrock tokens on caller-supplied text, so it is a paid endpoint as
+  // well as a private one.
+  ['POST', '/api/polish'],
   ['POST', '/api/client-error'],
   ['GET', '/app.js'],
   ['GET', '/'],

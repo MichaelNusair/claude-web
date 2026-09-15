@@ -19,9 +19,16 @@ self.addEventListener('activate', (event) => {
       const names = await caches.keys();
       await Promise.all(names.map((n) => caches.delete(n)));
       await self.registration.unregister();
-      // Reload open tabs so they continue uncontrolled by any worker.
+      // Reload open tabs so they continue uncontrolled by any worker — except the
+      // editor. This worker has no fetch handler, so a still-controlled tab
+      // behaves identically to an uncontrolled one and will drop the controller on
+      // its next load anyway; reloading it, on the other hand, restarts
+      // code-server's extension host and discards anything typed into the Claude
+      // panel and not sent. Cosmetic tidiness is not worth a lost message.
       const windows = await self.clients.matchAll({ type: 'window' });
-      for (const client of windows) client.navigate(client.url);
+      for (const client of windows) {
+        if (!new URL(client.url).pathname.startsWith('/editor')) client.navigate(client.url);
+      }
     })(),
   );
 });

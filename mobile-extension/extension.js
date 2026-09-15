@@ -94,15 +94,32 @@ const MOBILE_SETTINGS = {
   'security.workspace.trust.enabled': false,
 };
 
+/**
+ * Write the settings that are not already what we want, and nothing else.
+ *
+ * Every one of these is global, so after the first activation they are all
+ * already set — and writing a setting is not free: each `update()` rewrites
+ * settings.json and fires a configuration-change event through the whole
+ * workbench, which on this surface means ~45 rounds of relayout while the window
+ * is still starting. Skipping the no-ops makes the second and every later load
+ * write nothing at all.
+ */
 async function applySettings() {
   const config = vscode.workspace.getConfiguration();
+  let written = 0;
   for (const [key, value] of Object.entries({ ...CLAUDE_SETTINGS, ...MOBILE_SETTINGS })) {
     try {
+      // Compare against the *global* value specifically: matching the effective
+      // value would skip keys that only look right because a workspace or a
+      // default is currently supplying them.
+      if (JSON.stringify(config.inspect(key)?.globalValue) === JSON.stringify(value)) continue;
       await config.update(key, value, vscode.ConfigurationTarget.Global);
+      written += 1;
     } catch {
       // A setting may not exist in this build; skip rather than abort the rest.
     }
   }
+  return written;
 }
 
 const run = async (command, ...args) => {
@@ -113,6 +130,101 @@ const run = async (command, ...args) => {
     return false; // command unavailable in this build
   }
 };
+
+/**
+ * Tab kinds that are safe to close when the layout has to be rescued.
+ *
+ * Deliberately an allowlist of *file* tabs rather than "everything that isn't
+ * Claude". The Claude panel is a webview, and closing a webview disposes it —
+ * which on this surface ends the conversation running inside it. Misjudging in
+ * this direction leaves a file open, which is merely untidy; misjudging in the
+ * other direction throws away work. So the uncertainty is spent where it costs
+ * least, and files and diffs are exactly what Claude opens at you anyway.
+ *
+ * The classes are probed rather than assumed: an older build that lacks one
+ * would otherwise throw on the `instanceof` and take the whole rescue with it.
+ */
+const FILE_TAB_KINDS = [
+  'TabInputText',
+  'TabInputTextDiff',
+  'TabInputTextMultiDiff',
+  'TabInputNotebook',
+  'TabInputNotebookDiff',
+];
+
+function isFileTab(tab) {
+  return FILE_TAB_KINDS.some((name) => vscode[name] && tab.input instanceof vscode[name]);
+}
+
+/**
+ * The Claude panel's own tab.
+ *
+ * It is a webview, and the API reports webview tabs by `viewType` — which VS Code
+ * namespaces internally (`mainThreadWebview-claudeVSCodePanel`), so this matches
+ * loosely rather than on an exact id, and falls back to the tab's label for a
+ * build that reports the type differently.
+ */
+function isClaudeTab(tab) {
+  const type = vscode.TabInputWebview && tab.input instanceof vscode.TabInputWebview
+    ? String(tab.input.viewType)
+    : '';
+  return /claude/i.test(type) || /claude/i.test(String(tab.label));
+}
+
+/**
+ * Is the window already showing what the rescue would produce?
+ *
+ * This is the gate that keeps the startup schedule from being a nuisance. The
+ * layout commands are not free and not invisible: `joinAllGroups` moves editors
+ * between groups, and moving a webview re-parents its iframe, which re-creates
+ * the Claude panel and discards whatever was typed into it and not sent. Running
+ * them once is a rescue; running them every second on a window that is already
+ * fine is the flicker-and-lose-my-message bug.
+ *
+ * So the check is deliberately conservative — one group, Claude in front, no
+ * files — and everything it cannot see (side bar, panel, activity bar) is left to
+ * the single unconditional pass at activation, when there is nothing to lose.
+ */
+function layoutIsSettled() {
+  const groups = vscode.window.tabGroups.all;
+  if (groups.length !== 1) return false;
+  const { tabs, activeTab } = groups[0];
+  if (!activeTab || !isClaudeTab(activeTab)) return false;
+  return !tabs.some(isFileTab);
+}
+
+/**
+ * Close the files and diffs cluttering the editor area.
+ *
+ * Dirty tabs are left alone on purpose. Closing one raises a modal save prompt,
+ * and a modal is a dead end on a phone — the thing this whole extension exists
+ * to avoid. Unsaved work also deserves better than being swept up by a layout
+ * button. Say what was skipped instead, and let "Show tabs & bars" handle it.
+ *
+ * `notify` is off for the startup passes, which re-check as the workbench
+ * settles: nobody asked for those, and a warning about the same file each time is
+ * worse than none.
+ */
+async function closeFileTabs(notify) {
+  const files = vscode.window.tabGroups.all.flatMap((g) => g.tabs).filter(isFileTab);
+  const closable = files.filter((t) => !t.isDirty);
+  const dirty = files.length - closable.length;
+
+  if (closable.length) {
+    try {
+      // preserveFocus: focusClaude() decides where focus lands, a moment later.
+      await vscode.window.tabGroups.close(closable, true);
+    } catch {
+      // A tab that refuses to close is not a reason to skip the refocus below.
+    }
+  }
+  if (dirty && notify) {
+    vscode.window.showWarningMessage(
+      `Left ${dirty} unsaved file${dirty === 1 ? '' : 's'} open. Save or discard, then try again.`,
+    );
+  }
+  return closable.length;
+}
 
 /**
  * Put the real Claude Code UI in the center of the screen, alone.
@@ -129,31 +241,82 @@ async function focusClaude() {
   // full viewport, so this avoids the tradeoff entirely.
   //
   // `openLast` reuses the existing tab; `open` always adds another, which
-  // stacks duplicates on every reload.
-  if (!(await run('claude-vscode.editor.openLast'))) {
-    await run('claude-vscode.editor.open');
+  // stacks duplicates on every reload. Skipped entirely when the panel is
+  // already open — VS Code restores it across a reload, and asking for it again
+  // is what used to make it flash.
+  if (!vscode.window.tabGroups.all.some((g) => g.tabs.some(isClaudeTab))) {
+    if (!(await run('claude-vscode.editor.openLast'))) {
+      await run('claude-vscode.editor.open');
+    }
   }
 
   // With Claude in the editor, everything around it can go: the explorer and
-  // the auxiliary bar each claim roughly half the width.
+  // the auxiliary bar each claim roughly half the width. These are idempotent —
+  // "close", not "toggle" — so they cost nothing when already shut.
   await run('workbench.action.closeSidebar');
   await run('workbench.action.closeAuxiliaryBar');
   await run('workbench.action.closePanel');
-  // Single group, full width — no split leftovers.
-  await run('workbench.action.joinAllGroups');
+  // Single group, full width — no split leftovers. Only when there is actually
+  // something to join: this command moves editors between groups, and moving a
+  // webview re-creates it, taking an unsent message with it.
+  if (vscode.window.tabGroups.all.length > 1) {
+    await run('workbench.action.joinAllGroups');
+  }
   await run('claude-vscode.focus');
+}
+
+/**
+ * The escape hatch: close the files, give the whole window back to Claude.
+ *
+ * Tapping a file in the transcript opens it in the editor area, and with tabs,
+ * the activity bar and the status bar all hidden there is then nothing on screen
+ * that closes it again — the panel is squeezed into whatever width is left, for
+ * good. Reaching this from a phone is what `claudeMobile.backToClaude` is for;
+ * the overlay's Layout button triggers it through the keybinding below.
+ */
+async function backToClaude(notify) {
+  await closeFileTabs(notify);
+  await focusClaude();
 }
 
 function activate(context) {
   // Settings must land before the panel opens, or Claude starts a conversation
   // in the old permission mode.
   applySettings().then(async () => {
-    await focusClaude();
+    /*
+     * Reloading the page is the one recovery that is always available on a
+     * phone, and restored editors are what stopped it working: VS Code brings
+     * back the file that wedged the layout, so the reload changed nothing and
+     * the editor stayed stuck until someone reached the box. Clearing them here
+     * makes a refresh mean what the user expects.
+     *
+     * Nothing in the first few seconds of a cold workbench was opened by hand,
+     * so there is nothing of the user's to lose in this window. Someone who
+     * wants their restored tabs back — at a desk, using this as an IDE — turns
+     * `claudeMobile.closeFilesOnStartup` off.
+     */
+    const closeFiles = vscode.workspace
+      .getConfiguration()
+      .get('claudeMobile.closeFilesOnStartup', true);
+    // Silent: the warning about unsaved files belongs to the button, not to a
+    // pass the user never asked for.
+    const rescue = () => (closeFiles ? backToClaude(false) : focusClaude());
+
+    // One unconditional pass, at the only moment when nothing on screen can
+    // belong to the user yet: this is also the only pass that can shut the side
+    // bar and the panel, since the API reports neither.
+    await rescue();
     // VS Code restores its saved layout shortly after startup, at a time that
-    // varies with load, so re-assert on a short schedule rather than betting on
-    // a single delay.
+    // varies with load, so keep watching for a few seconds rather than betting on
+    // a single delay — but only act when the layout is actually wrong. Re-running
+    // the sequence regardless, which is what this used to do, re-created the
+    // Claude panel up to four times per load: the view visibly refreshing a few
+    // times after picking a project, and a message typed in between silently
+    // gone.
     for (const delay of [800, 2000, 4000]) {
-      setTimeout(focusClaude, delay);
+      setTimeout(() => {
+        if (!layoutIsSettled()) rescue();
+      }, delay);
     }
     // Last resort: if nothing is showing after everything has settled, the
     // layout ended up in a state that hides Claude. Reopen the side bar so the
@@ -170,6 +333,8 @@ function activate(context) {
 
   context.subscriptions.push(
     vscode.commands.registerCommand('claudeMobile.focusClaude', focusClaude),
+    // Asked for by hand, so this one reports what it had to skip.
+    vscode.commands.registerCommand('claudeMobile.backToClaude', () => backToClaude(true)),
   );
 
   context.subscriptions.push(

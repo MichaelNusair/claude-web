@@ -198,6 +198,7 @@
   }
   .cmo-action.cmo-alt { background: #3a3a38; color: #f5f4ef; }
   .cmo-hint { color: #a3a099; font-size: 12.5px; margin: 10px 0 0; }
+  .cmo-hint a { color: #d97757; }
   .cmo-status { color: #d97757; font-size: 13px; margin: 8px 0 0; min-height: 18px; }
   .cmo-item {
     display: block; width: 100%; text-align: left; padding: 14px 12px;
@@ -226,6 +227,7 @@
   const fab = document.createElement('div');
   fab.id = 'cmo-fab';
   fab.innerHTML = `
+    <button class="cmo-btn cmo-secondary" id="cmo-layout" aria-label="Fix the layout">&#10038;</button>
     <button class="cmo-btn cmo-secondary" id="cmo-projects" aria-label="Switch project">&#9707;</button>
     <button class="cmo-btn" id="cmo-mic" aria-label="Dictate">&#127908;</button>`;
   document.body.appendChild(fab);
@@ -297,8 +299,124 @@
     document.getElementById('cmo-mic')?.classList.remove('cmo-rec');
   }
 
+  /*
+   * Dictated text is the most expensive thing on this surface. The Claude panel is
+   * a sandboxed iframe, so it cannot be typed into from out here — the words have
+   * to sit in this textarea until they are copied across, and that is exactly when
+   * the workbench is most likely to reload underneath them: its lifecycle service
+   * reloads the window whenever the browser restores the page from the back/forward
+   * cache, which on a phone means every time you switch apps and come back. A
+   * paragraph of speech has no backup anywhere, so it is written down as it is
+   * spoken.
+   */
+  const DICTATION_KEY = 'cmo-dictation-draft';
+  const DICTATION_MAX_AGE = 60 * 60 * 1000;
+  let dictationTimer = null;
+  let pendingDictation = null;
+
+  function writeDictation() {
+    clearTimeout(dictationTimer);
+    dictationTimer = null;
+    if (pendingDictation === null) return;
+    const text = pendingDictation;
+    pendingDictation = null;
+    try {
+      if (text.trim()) {
+        localStorage.setItem(DICTATION_KEY, JSON.stringify({ text, at: Date.now() }));
+      } else {
+        localStorage.removeItem(DICTATION_KEY);
+      }
+    } catch {
+      /* private mode: the words are still on screen, which is where they were */
+    }
+  }
+
+  // Debounced, because the recognizer rewrites the whole textarea on every interim
+  // result — several times a second while someone is talking.
+  function saveDictation(text) {
+    pendingDictation = text;
+    if (!dictationTimer) dictationTimer = setTimeout(writeDictation, 400);
+  }
+
+  function clearDictation() {
+    clearTimeout(dictationTimer);
+    dictationTimer = null;
+    pendingDictation = null;
+    try {
+      localStorage.removeItem(DICTATION_KEY);
+    } catch {
+      /* nothing was stored either */
+    }
+  }
+
+  function loadDictation() {
+    try {
+      const saved = JSON.parse(localStorage.getItem(DICTATION_KEY) || 'null');
+      if (saved?.text && Date.now() - (saved.at || 0) < DICTATION_MAX_AGE) return saved.text;
+    } catch {
+      /* unreadable: treat as nothing saved */
+    }
+    return '';
+  }
+
+  /*
+   * The same cleanup pass the chat composer runs, for the same reason: what comes
+   * out of either recognizer has no punctuation, no capitals and mangled product
+   * names, and here it is on its way to the clipboard rather than into a box you
+   * can tidy up by hand. Server side is /api/polish (see chat-service/polish.js).
+   *
+   * The switch is the chat app's key, read on use rather than cached: one origin,
+   * one setting, and the chat may have flipped it in another tab since this
+   * workbench loaded.
+   */
+  const POLISH_KEY = 'claude-polish-dictation';
+  const POLISH_TIMEOUT_MS = 6000;
+
+  function polishWanted() {
+    try {
+      return localStorage.getItem(POLISH_KEY) !== '0';
+    } catch {
+      return true;
+    }
+  }
+
+  /** The cleaned-up text, or '' if there is nothing better than what came in. */
+  async function polishText(text) {
+    if (!polishWanted() || text.split(/\s+/).filter(Boolean).length < 3) return '';
+    try {
+      const res = await fetch('/api/polish', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text }),
+        // The route answers with the raw text rather than an error when Bedrock is
+        // slow, so this bound is only for a request that never arrives at all.
+        signal: AbortSignal.timeout?.(POLISH_TIMEOUT_MS),
+      });
+      // Includes 401 — the chat service's session, not code-server's password.
+      // Nothing to say about it here: the text is already copied.
+      if (!res.ok) return '';
+      const data = await res.json();
+      return data.changed && data.text ? String(data.text) : '';
+    } catch {
+      return '';
+    }
+  }
+
+  async function copyText(text) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch {
+      // Needs a secure context, and can still be refused.
+      return false;
+    }
+  }
+
   function openDictation() {
-    committedText = '';
+    // Restored into `committedText`, not just the textarea: that is what the
+    // recognizer appends to, so dictation carries on from the recovered text
+    // instead of overwriting it on the first result.
+    committedText = loadDictation();
     liveText = '';
     openSheet(`
       <p class="cmo-title">Dictate</p>
@@ -317,26 +435,65 @@
 
     const textarea = panel.querySelector('#cmo-text');
     const status = panel.querySelector('#cmo-status');
+    textarea.value = committedText;
+    if (committedText) status.textContent = 'Recovered what you dictated before.';
     textarea.focus();
+    textarea.addEventListener('input', () => saveDictation(textarea.value));
 
-    panel.querySelector('#cmo-cancel').addEventListener('click', closeSheet);
+    // Cancel is a decision to throw the text away. Dismissing the sheet by tapping
+    // outside it is not, so that path keeps the draft — on a phone the two are one
+    // stray tap apart.
+    panel.querySelector('#cmo-cancel').addEventListener('click', () => {
+      clearDictation();
+      closeSheet();
+    });
     panel.querySelector('#cmo-again').addEventListener('click', () => {
       stopRecognition();
       startDictation(textarea, status);
     });
     panel.querySelector('#cmo-copy').addEventListener('click', async () => {
-      const text = textarea.value.trim();
-      if (!text) return closeSheet();
-      try {
-        await navigator.clipboard.writeText(text);
-        status.textContent = 'Copied — paste into Claude.';
-      } catch {
-        // Clipboard API needs a secure context and can still be refused;
-        // selecting the text lets the user copy with the native control.
+      const raw = textarea.value.trim();
+      if (!raw) return closeSheet();
+
+      /*
+       * Copy the raw text first, then punctuate and copy again.
+       *
+       * The order matters twice over. The copy is the handover — it is the only way
+       * text leaves this sheet — so it must not wait on a network round trip that
+       * can fail, and a clipboard write issued after an `await` is refused outright
+       * on iOS. Doing it in the tap means the worst case is unpunctuated text on
+       * the clipboard, which is what this sheet did before, rather than nothing.
+       */
+      if (!(await copyText(raw))) {
+        // Selecting the text lets the user copy with the native control instead.
         textarea.select();
         status.textContent = 'Press Copy on the selection.';
         return;
       }
+      status.textContent = 'Copied — paste into Claude.';
+
+      const cleaned = await polishText(raw);
+      if (cleaned && cleaned !== raw) {
+        // Shown as well as copied: the user is about to paste it, and finding
+        // something they did not see arrive in Claude's input is worse than a
+        // second of delay.
+        textarea.value = cleaned;
+        if (await copyText(cleaned)) {
+          status.textContent = 'Copied, punctuated — paste into Claude.';
+        } else {
+          // The raw text is on the clipboard and the better version is only on
+          // screen, so this one is still the user's to copy — and still worth
+          // keeping if the workbench reloads before they do.
+          saveDictation(cleaned);
+          writeDictation();
+          textarea.select();
+          status.textContent = 'Punctuated — press Copy on the selection.';
+          return;
+        }
+      }
+      // On the clipboard now, which outlives the page: the copy is the handover,
+      // so keeping a second copy here would only resurface it next time.
+      clearDictation();
       setTimeout(closeSheet, 700);
     });
 
@@ -384,6 +541,7 @@
         interim,
       );
       textarea.value = joined.replace(/\s+/g, ' ').trimStart();
+      saveDictation(textarea.value);
     };
 
     rec.onerror = (event) => {
@@ -562,11 +720,23 @@
       return;
     }
 
+    // Which folder this window already has, so tapping it can do nothing instead
+    // of reloading the workbench to arrive where it already is.
+    let current = '';
+    try {
+      current = new URLSearchParams(location.search).get('folder') || '';
+    } catch {
+      /* no folder in the URL: an empty window, so nothing is "already open" */
+    }
+
     const items = projects
-      .map(
-        (p) =>
-          `<button class="cmo-item" data-path="${encodeURIComponent(p.path)}">${p.name}</button>`,
-      )
+      .map((p) => {
+        const open = current !== '' && current === p.path;
+        return (
+          `<button class="cmo-item" data-path="${encodeURIComponent(p.path)}"` +
+          `${open ? ' data-open="1"' : ''}>${p.name}${open ? ' — open' : ''}</button>`
+        );
+      })
       .join('');
 
     openSheet(`
@@ -583,6 +753,15 @@
     panel.querySelector('#cmo-new-project').addEventListener('click', openNewProject);
     panel.querySelectorAll('.cmo-item').forEach((btn) => {
       btn.addEventListener('click', () => {
+        // Already this folder. Navigating would reload the entire workbench, kill
+        // the extension host and take an unsent message in the Claude panel with
+        // it — to end up exactly here. The switcher is also the natural thing to
+        // open when checking which project you are in, so this is a normal tap,
+        // not a mistake to punish.
+        if (btn.dataset.open) {
+          closeSheet();
+          return;
+        }
         // ?folder= is code-server's own way to open a workspace, and code-server
         // is mounted at /editor/ — `/` is the chat. Navigating to `/?folder=...`
         // silently threw you into the chat while the editor kept whatever folder
@@ -697,6 +876,236 @@
       ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
   }
 
+  // ------------------------------------------------- escaping a stuck layout
+  /*
+   * Claude opens files and diffs in the editor area. With tabs, the activity bar
+   * and the status bar all hidden for phone use, nothing on screen closes one
+   * again: the panel keeps whatever width is left over, and reloading brings the
+   * file back. On a desktop you can at least drag the split to the edge — on a
+   * phone the workspace is simply stuck, which is why this exists.
+   *
+   * The workbench's command service is not reachable from here. There is no
+   * supported global for it, and this file must not reach into VS Code's
+   * internals — rewriting the bundle black-screened the editor twice already
+   * (see the disconnect-frame note above). So the commands are driven the one way
+   * a page can drive them from outside: keybindings. The mobile extension binds
+   * ctrl+alt+shift+F9 and F10, and these synthesise those chords. VS Code's
+   * keybinding service listens for keydown on the window and does not check
+   * `isTrusted`, so a dispatched event reaches it even while focus sits inside
+   * the Claude webview's iframe.
+   *
+   * Nothing observable comes back, so success cannot be reported honestly from
+   * out here. Hence three escalating options rather than one button that claims
+   * to have worked: the command, the chrome so files can be closed by hand, and
+   * a reload — which now recovers on its own, because the extension closes
+   * restored file tabs at startup.
+   */
+  const KEY_BACK = { key: 'F9', code: 'F9', keyCode: 120 };
+  const KEY_CHROME = { key: 'F10', code: 'F10', keyCode: 121 };
+
+  function pressChord(spec) {
+    const init = {
+      key: spec.key,
+      code: spec.code,
+      keyCode: spec.keyCode,
+      which: spec.keyCode,
+      ctrlKey: true,
+      altKey: true,
+      shiftKey: true,
+      bubbles: true,
+      cancelable: true,
+      composed: true,
+    };
+    // Dispatch from whatever holds focus so the event bubbles up through body and
+    // document to the window, wherever the listener happens to be attached.
+    const target = document.activeElement || document.body;
+    for (const type of ['keydown', 'keyup']) {
+      const event = new KeyboardEvent(type, init);
+      // `keyCode` in the init dictionary is a legacy extension, and VS Code maps
+      // keys from it. Where the browser ignores it, define it by hand rather
+      // than dispatching an event the keybinding service will discard.
+      if (!event.keyCode) {
+        try {
+          Object.defineProperty(event, 'keyCode', { get: () => spec.keyCode });
+          Object.defineProperty(event, 'which', { get: () => spec.keyCode });
+        } catch {
+          /* nothing else to try; `code` may still be enough */
+        }
+      }
+      target.dispatchEvent(event);
+    }
+  }
+
+  // --------------------------------------------------- what reloaded the editor
+  /*
+   * A reload of the workbench is not a cosmetic event here: it restarts the
+   * extension host and takes anything typed into the Claude panel and not sent
+   * with it. Reports of "it refreshed a few times and deleted what I typed" cannot
+   * be diagnosed from the instance, because the server side of every cause looks
+   * identical — a new connection and a dead extension host — whether the page
+   * navigated itself, the user pulled to refresh, or iOS discarded the tab to
+   * reclaim memory.
+   *
+   * So each load writes down how it happened, and the Layout sheet shows the last
+   * few. `navigation.type` is what separates the cases: `navigate` means something
+   * assigned to `location` (a project switch), `reload` means the page or the OS
+   * reloaded it, `back_forward` means history. The folder comes along because a
+   * run of `navigate` entries with the *same* folder is a very different bug from
+   * one where it changes.
+   */
+  const LOADS_KEY = 'claude-editor-loads';
+  const LOADS_KEEP = 12;
+
+  function loadHistory() {
+    try {
+      const list = JSON.parse(localStorage.getItem(LOADS_KEY) || '[]');
+      return Array.isArray(list) ? list : [];
+    } catch {
+      return [];
+    }
+  }
+
+  function recordLoad(reason) {
+    let how = reason || 'unknown';
+    try {
+      const nav = !reason
+        && performance.getEntriesByType
+        && performance.getEntriesByType('navigation')[0];
+      if (nav && nav.type) how = String(nav.type);
+    } catch {
+      /* no navigation timing: the entry is still worth having for its timestamp */
+    }
+    let folder = '';
+    try {
+      folder = new URLSearchParams(location.search).get('folder') || '';
+    } catch {
+      /* empty window */
+    }
+    const list = loadHistory();
+    list.push({ t: Date.now(), how, folder });
+    try {
+      localStorage.setItem(LOADS_KEY, JSON.stringify(list.slice(-LOADS_KEEP)));
+    } catch {
+      /* private mode: the history is diagnostic, never load-bearing */
+    }
+  }
+
+  function loadSummary() {
+    const list = loadHistory();
+    if (!list.length) return '';
+    const recent = list.filter((e) => Date.now() - e.t < 5 * 60 * 1000).length;
+    const shown = list.slice(-5).map((e) => {
+      const at = new Date(e.t).toTimeString().slice(0, 8);
+      const where = e.folder ? ` ${e.folder.split('/').filter(Boolean).pop()}` : '';
+      return `${at} ${e.how}${where}`;
+    });
+    return `${recent} load${recent === 1 ? '' : 's'} in the last five minutes. ` +
+      shown.join(' · ');
+  }
+
+  function openLayout() {
+    openSheet(`
+      <p class="cmo-title">Layout</p>
+      <div class="cmo-row">
+        <button class="cmo-action" id="cmo-back">Back to Claude, full screen</button>
+      </div>
+      <div class="cmo-row">
+        <button class="cmo-action cmo-alt" id="cmo-chrome">Show tabs &amp; bars</button>
+        <button class="cmo-action cmo-alt" id="cmo-reload">Reload the editor</button>
+      </div>
+      <div class="cmo-row">
+        <button class="cmo-action cmo-alt" id="cmo-layout-close">Close</button>
+      </div>
+      <p class="cmo-status" id="cmo-layout-status"></p>
+      <p class="cmo-hint">The first button closes the files and diffs Claude
+      opened and gives it the whole window back — the conversation keeps running,
+      and unsaved files are left alone. If the layout is still wrong, show the
+      tabs and close things by hand, or reload. Last resort, when even a reload
+      comes back broken:
+      <a href="/chat/reset.html?from=editor">reset this device</a>.</p>
+      <p class="cmo-hint" id="cmo-loads"></p>`);
+
+    const status = panel.querySelector('#cmo-layout-status');
+    // Only shown once there is something to show, so the sheet stays a set of
+    // buttons for the person who came here to fix their screen.
+    const loads = loadSummary();
+    if (loads) panel.querySelector('#cmo-loads').textContent = `This tab: ${loads}`;
+
+    panel.querySelector('#cmo-layout-close').addEventListener('click', closeSheet);
+    panel.querySelector('#cmo-reload').addEventListener('click', () => {
+      status.textContent = 'Reloading…';
+      location.reload();
+    });
+    panel.querySelector('#cmo-back').addEventListener('click', () => {
+      pressChord(KEY_BACK);
+      status.textContent = 'Asked the editor to close open files.';
+      setTimeout(closeSheet, 700);
+    });
+    panel.querySelector('#cmo-chrome').addEventListener('click', () => {
+      pressChord(KEY_CHROME);
+      status.textContent = 'Toggled tabs, activity bar and status bar.';
+      setTimeout(closeSheet, 700);
+    });
+  }
+
+  // ------------------------------------------------------- keep the screen on
+  /*
+   * The editor has the same problem as the chat app: the display sleeps on its
+   * idle timer while you are reading a diff or waiting on a task, and hiding the
+   * page suspends dictation and freezes the workbench's socket.
+   *
+   * Same reconciler as chat-service/public/app.js, and deliberately the same
+   * localStorage key — code-server and the chat are one origin behind nginx, so
+   * the switch in the chat's Settings governs both. Duplicated rather than shared
+   * because this file is injected raw into the workbench and imports nothing.
+   *
+   * The wake lock is released by the browser on every hide and never re-taken,
+   * and the OS revokes it silently, so it has to be re-requested rather than
+   * acquired once.
+   */
+  var wakeLock = null;
+  var wakeLockPending = false;
+
+  function keepAwakeWanted() {
+    try {
+      return localStorage.getItem('claude-keep-awake') !== '0';
+    } catch (err) {
+      return true;
+    }
+  }
+
+  function syncWakeLock() {
+    if (!keepAwakeWanted() || document.visibilityState !== 'visible') {
+      var held = wakeLock;
+      wakeLock = null;
+      try { if (held) held.release(); } catch (err) { /* already gone */ }
+      return;
+    }
+    if (wakeLock || wakeLockPending || !navigator.wakeLock) return;
+    wakeLockPending = true;
+    navigator.wakeLock.request('screen').then(function (lock) {
+      wakeLockPending = false;
+      // The page may have been hidden, or the switch flipped, while we waited.
+      if (!keepAwakeWanted() || document.visibilityState !== 'visible') {
+        try { lock.release(); } catch (err) { /* nothing to undo */ }
+        return;
+      }
+      wakeLock = lock;
+      lock.addEventListener('release', function () {
+        if (wakeLock === lock) wakeLock = null;
+      });
+    }).catch(function () {
+      // Hidden, unsupported, or refused by the OS. The timer retries.
+      wakeLockPending = false;
+    });
+  }
+
+  document.addEventListener('visibilitychange', syncWakeLock);
+  window.addEventListener('pageshow', syncWakeLock);
+  window.addEventListener('focus', syncWakeLock);
+  setInterval(syncWakeLock, 30000);
+  syncWakeLock();
+
   // -------------------------------------------------------------- wiring
   document.getElementById('cmo-mic').addEventListener('click', () => {
     if (recognition) {
@@ -706,6 +1115,28 @@
     if (!sheet.classList.contains('cmo-open')) openDictation();
   });
   document.getElementById('cmo-projects').addEventListener('click', openProjects);
+  document.getElementById('cmo-layout').addEventListener('click', openLayout);
+
+  // One line per workbench load, so a phone that reloads itself leaves a trail.
+  recordLoad();
+  /*
+   * A page restored from the back/forward cache is not a load — but the workbench
+   * makes it one: its lifecycle service calls location.reload() on
+   * `pageshow.persisted`, because the sockets it was holding while suspended are
+   * gone. On a phone that is a routine event (switch apps, swipe back, answer a
+   * message), and it is invisible from the server, which sees only another dead
+   * extension host. So it gets its own line: if this one ever shows up right
+   * before a `reload`, the cause is the browser suspending the tab, and no amount
+   * of settling the layout on our side will change it.
+   */
+  // The debounce above must not be what loses the last sentence.
+  window.addEventListener('pagehide', writeDictation);
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState !== 'visible') writeDictation();
+  });
+  window.addEventListener('pageshow', (e) => {
+    if (e.persisted) recordLoad('bfcache-restore');
+  });
 
   /*
    * Long-press either button to flip the bar to the other edge, and remember it.

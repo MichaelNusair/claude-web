@@ -7,7 +7,7 @@
  * session id all persist, and a follow-up message costs no startup.
  */
 import { spawn, execFile } from 'child_process';
-import { readdir, readFile, stat, mkdir, realpath, writeFile } from 'fs/promises';
+import { readdir, readFile, stat, mkdir, realpath, writeFile, rm } from 'fs/promises';
 import { join } from 'path';
 import { randomUUID } from 'crypto';
 import { EventEmitter } from 'events';
@@ -83,6 +83,92 @@ const SYNTHETIC_USER_PATTERNS = [
 function isSyntheticUserText(text) {
   const trimmed = text.trim();
   return SYNTHETIC_USER_PATTERNS.some((re) => re.test(trimmed));
+}
+
+/**
+ * Validate a project name and turn it into a path under PROJECTS_ROOT.
+ *
+ * The character class is the whole defence: with no `/` and no leading dot,
+ * `join` cannot be talked out of the projects root. Reaching any caller of this
+ * requires a valid session — and a logged-in user already has a shell here — but
+ * one of these callers deletes a directory tree, so the name it is handed must
+ * not be able to name a directory somewhere else.
+ */
+function projectPathFor(name) {
+  if (typeof name !== 'string' || !/^[A-Za-z0-9._-]+$/.test(name)) {
+    throw new Error('name may only contain letters, numbers, dot, dash and underscore');
+  }
+  if (name.startsWith('.') || name.length > 100) throw new Error('invalid project name');
+  return join(PROJECTS_ROOT, name);
+}
+
+/**
+ * Accept the forms people actually paste — `owner/repo`, a browser URL, an SSH
+ * remote — and normalise them to one slug.
+ *
+ * Deliberately GitHub-only. The workspace's git credential helper answers with
+ * the PAT for whatever host git asks it about, so cloning a caller-supplied URL
+ * from some other host would hand that host the token. Restricting the input to
+ * github.com is what keeps this endpoint from being a credential exfiltrator.
+ */
+function parseGithubRepo(input) {
+  const raw = String(input || '').trim().replace(/\/+$/, '').replace(/\.git$/, '');
+  const match =
+    /^(?:(?:https?:\/\/)?(?:www\.)?github\.com\/|git@github\.com:)?([A-Za-z0-9][A-Za-z0-9-]{0,38})\/([A-Za-z0-9._-]{1,100})$/
+      .exec(raw);
+  if (!match) throw new Error('expected owner/repo, or a github.com URL');
+  const [, owner, repo] = match;
+  if (repo === '.' || repo === '..') throw new Error('expected owner/repo, or a github.com URL');
+  return { owner, repo, slug: `${owner}/${repo}` };
+}
+
+/**
+ * Run git and report the outcome instead of throwing.
+ *
+ * Inspecting a repository means asking questions that legitimately fail — "is
+ * there an origin remote?" answers itself with a non-zero exit — so the caller
+ * decides what a failure means.
+ *
+ * `GIT_TERMINAL_PROMPT=0` matters more than it looks: without it a repository
+ * whose credentials cannot be resolved makes git sit waiting for a username on
+ * a stdin nobody is attached to, and the HTTP request hangs until the timeout
+ * rather than returning a usable error.
+ */
+async function git(cwd, args, { timeout = 60_000, env = {} } = {}) {
+  try {
+    const { stdout, stderr } = await execFileAsync('git', args, {
+      cwd,
+      timeout,
+      maxBuffer: 8 * 1024 * 1024,
+      env: { ...process.env, GIT_TERMINAL_PROMPT: '0', ...env },
+    });
+    return { ok: true, out: (stdout || '').trim(), err: (stderr || '').trim() };
+  } catch (err) {
+    return {
+      ok: false,
+      out: (err.stdout || '').toString().trim(),
+      err: (err.stderr || err.message || '').toString().trim(),
+    };
+  }
+}
+
+/**
+ * A refusal the UI can act on, as opposed to a crash.
+ *
+ * Removing a project deletes a directory tree, so every check that says "this
+ * work only exists here" has to be able to stop the operation *and* explain
+ * itself well enough that the user can decide to override. A bare Error would
+ * arrive at the client as a 500 with a sentence, and the honest answer here has
+ * structure: what blocked it, and what the repository looked like at the time.
+ */
+class Blocked extends Error {
+  constructor(message, { status = null, steps = [] } = {}) {
+    super(message);
+    this.name = 'Blocked';
+    this.blocked = true;
+    this.status = status;
+    this.steps = steps;
+  }
 }
 
 const PERMISSION_MODES = new Set([
@@ -596,12 +682,7 @@ export class SessionManager {
    * from a fully wired one, and the UI says which happened.
    */
   async createProject(name, { github = false, private: isPrivate = true, description = '' } = {}) {
-    if (!/^[A-Za-z0-9._-]+$/.test(name)) {
-      throw new Error('name may only contain letters, numbers, dot, dash and underscore');
-    }
-    if (name.startsWith('.') || name.length > 100) throw new Error('invalid project name');
-
-    const path = join(PROJECTS_ROOT, name);
+    const path = projectPathFor(name);
     try {
       await stat(path);
       throw new Error(`"${name}" already exists`);
@@ -673,6 +754,307 @@ export class SessionManager {
 
     return { name, path, sessions: [], steps };
   }
+
+  /** Live conversations working in a directory, so it isn't deleted from under one. */
+  #liveIn(cwd) {
+    return [...this.conversations.values()].filter((c) => c.cwd === cwd && !c.exited);
+  }
+
+  /**
+   * What would be lost if this project were deleted right now.
+   *
+   * The removal flow is irreversible, so the client asks this first and shows the
+   * answer before offering the button. Every field here exists because it names a
+   * way work can live *only* on this machine: uncommitted edits, commits no
+   * remote has, stashes, and files git was told to ignore.
+   */
+  async projectStatus(name) {
+    const path = projectPathFor(name);
+    const info = await stat(path).catch(() => null);
+    if (!info?.isDirectory()) throw new Error(`no project named "${name}"`);
+
+    const status = {
+      name,
+      path,
+      isRepo: false,
+      hasCommits: false,
+      branch: null,
+      remote: null,
+      dirty: 0,
+      dirtySample: [],
+      unpushed: 0,
+      unpushedBranches: [],
+      stashes: 0,
+      // Present in the directory but invisible to git: an .env or a local build
+      // that no push can preserve. Almost always fine to lose, occasionally the
+      // only copy of a credential, so it is shown rather than assumed.
+      ignored: [],
+      live: this.#liveIn(path).map((c) => ({ sessionId: c.sessionId, busy: c.busy })),
+      transcripts: (await this.listSessions(path)).length,
+    };
+
+    if (!(await git(path, ['rev-parse', '--git-dir'])).ok) return status;
+    status.isRepo = true;
+
+    const branch = await git(path, ['rev-parse', '--abbrev-ref', 'HEAD']);
+    status.branch = branch.ok ? branch.out : null;
+    status.hasCommits = (await git(path, ['rev-parse', '--verify', 'HEAD'])).ok;
+
+    const remote = await git(path, ['remote', 'get-url', 'origin']);
+    status.remote = remote.ok ? remote.out : null;
+
+    const porcelain = await git(path, ['status', '--porcelain']);
+    const changes = porcelain.out ? porcelain.out.split('\n') : [];
+    status.dirty = changes.length;
+    status.dirtySample = changes.slice(0, 8).map((l) => l.slice(3));
+
+    // `--ignored` collapses whole ignored directories into one entry, so this is
+    // "node_modules/, .env" rather than forty thousand paths.
+    const ignored = await git(path, ['status', '--porcelain', '--ignored']);
+    status.ignored = (ignored.out ? ignored.out.split('\n') : [])
+      .filter((l) => l.startsWith('!! '))
+      .map((l) => l.slice(3))
+      .slice(0, 12);
+
+    const stashes = await git(path, ['stash', 'list']);
+    status.stashes = stashes.out ? stashes.out.split('\n').length : 0;
+
+    // Per branch, not just the current one: the directory is about to stop
+    // existing, so a side branch nobody pushed is a side branch that is gone.
+    const heads = await git(path, ['for-each-ref', '--format=%(refname:short)', 'refs/heads']);
+    for (const head of heads.out ? heads.out.split('\n') : []) {
+      const log = await git(path, ['log', '--oneline', head, '--not', '--remotes']);
+      const commits = log.ok && log.out ? log.out.split('\n').length : 0;
+      if (commits) {
+        status.unpushed += commits;
+        status.unpushedBranches.push({ branch: head, commits });
+      }
+    }
+
+    return status;
+  }
+
+  /**
+   * Commit, push, verify the push actually landed, then delete the directory.
+   *
+   * "Verify" is the whole point. A `git push` that exits 0 is not proof: the
+   * remote-tracking ref it updated is a local file, and this operation deletes
+   * the only other copy of the work. So the commit on disk is compared against
+   * what the remote reports over the network, and anything short of a match
+   * refuses to delete.
+   *
+   * Chat transcripts under CLAUDE_HOME are deliberately left in place. They are
+   * small, they are the record of what was done here, and keeping them means
+   * cloning the repo back later lands next to its own history.
+   */
+  async removeProject(name, { force = false } = {}) {
+    const status = await this.projectStatus(name);
+    const { path } = status;
+    const steps = [];
+    const block = (message) => {
+      throw new Blocked(message, { status, steps });
+    };
+
+    if (!force) {
+      if (status.live.some((c) => c.busy)) {
+        block('a chat in this project is still working — stop it first, or force the removal');
+      }
+      if (!status.isRepo) {
+        block(`"${name}" is not a git repository, so there is nowhere to push it — deleting it would lose the files outright`);
+      }
+      if (status.stashes) {
+        block(`${status.stashes} stashed change${status.stashes === 1 ? '' : 's'} would be lost — a stash is not pushed by anything`);
+      }
+    }
+
+    if (status.isRepo) {
+      if (status.hasCommits && status.branch === 'HEAD' && !force) {
+        block('HEAD is detached — check out a branch so there is something to push');
+      }
+
+      if (status.dirty) {
+        const add = await git(path, ['add', '-A'], { timeout: 300_000 });
+        if (!add.ok && !force) block(`git add failed: ${add.err}`);
+        const commit = await git(
+          path,
+          ['commit', '-m', 'Save work before removing this project from the workspace'],
+          { timeout: 300_000 },
+        );
+        // "nothing to commit" is a success here: it means everything still
+        // showing as dirty was ignored, which the ignored-files list covers.
+        const empty = /nothing to commit|nothing added to commit/i.test(`${commit.out}\n${commit.err}`);
+        if (!commit.ok && !empty && !force) block(`git commit failed: ${commit.err || commit.out}`);
+        steps.push({ step: 'commit', ok: commit.ok || empty, error: commit.ok || empty ? undefined : commit.err });
+      }
+
+      // Re-read after the commit: an empty repository that had uncommitted files
+      // has a HEAD (and a branch) now, and both are what the push verifies.
+      const hasCommits = (await git(path, ['rev-parse', '--verify', 'HEAD'])).ok;
+      const branch = hasCommits
+        ? (await git(path, ['rev-parse', '--abbrev-ref', 'HEAD'])).out
+        : null;
+
+      if (!hasCommits) {
+        // A git repo with no commits holds nothing a push could preserve.
+        steps.push({ step: 'push', ok: true, note: 'no commits to push' });
+      } else if (!status.remote && !force) {
+        block(`"${name}" has no git remote — there is nothing to push to, so deleting it would lose the commits`);
+      } else if (status.remote) {
+        // Every branch and every tag, because none of them survive the delete.
+        const all = await git(path, ['push', '--all', 'origin'], { timeout: 900_000 });
+        if (all.ok) {
+          steps.push({ step: 'push', ok: true });
+        } else {
+          // One branch failing (a diverged side branch, a protected ref) must not
+          // stop the current branch from being saved. The verification below is
+          // what decides whether pushing only HEAD was good enough.
+          const head = await git(path, ['push', '-u', 'origin', 'HEAD'], { timeout: 900_000 });
+          steps.push({
+            step: 'push',
+            ok: head.ok,
+            note: head.ok ? `some branches were not pushed: ${all.err.slice(0, 200)}` : undefined,
+            error: head.ok ? undefined : head.err.slice(0, 300),
+          });
+        }
+        const tags = await git(path, ['push', '--tags', 'origin'], { timeout: 300_000 });
+        if (!tags.ok) steps.push({ step: 'push tags', ok: false, error: tags.err.slice(0, 200) });
+      }
+
+      if (hasCommits && !force) {
+        const leftover = await git(path, ['log', '--oneline', '--branches', '--not', '--remotes']);
+        if (leftover.out) {
+          const n = leftover.out.split('\n').length;
+          block(`${n} commit${n === 1 ? '' : 's'} still exist only on this machine after pushing — refusing to delete`);
+        }
+
+        // Ask the remote directly. The check above trusts remote-tracking refs,
+        // which are local files and can be stale or hand-edited; this one cannot.
+        const local = await git(path, ['rev-parse', 'HEAD']);
+        const remoteRef = await git(path, ['ls-remote', 'origin', `refs/heads/${branch}`], {
+          timeout: 120_000,
+        });
+        if (!remoteRef.ok) block(`could not reach the remote to verify the push: ${remoteRef.err}`);
+        if (!remoteRef.out.startsWith(local.out)) {
+          block(`the remote's ${branch} is not at the commit on this machine — refusing to delete`);
+        }
+        steps.push({ step: 'verify', ok: true, commit: local.out.slice(0, 12), branch });
+      }
+    }
+
+    // Stop the processes before the directory goes away: a `claude` whose cwd has
+    // been deleted keeps running against a working directory that no longer
+    // exists, which fails in far more confusing ways than being stopped here.
+    for (const conv of this.#liveIn(path)) {
+      conv.stop();
+      this.#forget(conv);
+    }
+
+    await rm(path, { recursive: true, force: true });
+    steps.push({ step: 'delete', ok: true });
+
+    return { name, removed: true, steps, transcriptsKept: status.transcripts, forced: force };
+  }
+
+  /**
+   * Clone a repository that already exists on GitHub into the workspace.
+   *
+   * `gh` is preferred when a token is available — it is what `createProject`
+   * already uses, and it authenticates private clones without depending on the
+   * credential helper being configured. Plain `git clone` is the fallback, which
+   * is what works on a box provisioned with the helper but no gh.
+   */
+  async cloneProject({ repo, name } = {}) {
+    const { slug, repo: repoName } = parseGithubRepo(repo);
+    const target = name ? name : repoName;
+    const path = projectPathFor(target);
+
+    if (await stat(path).catch(() => null)) {
+      throw new Error(`"${target}" already exists in the workspace`);
+    }
+    await mkdir(PROJECTS_ROOT, { recursive: true });
+
+    const steps = [];
+    const token = await getGithubToken();
+    const url = `https://github.com/${slug}.git`;
+    // A big repository on a small instance is minutes, not seconds. nginx and the
+    // ALB both allow an hour, so the ceiling here is the real one.
+    const timeout = 900_000;
+
+    let clone;
+    if (token) {
+      clone = await git(PROJECTS_ROOT, ['clone', '--recurse-submodules', url, target], {
+        timeout,
+        env: { GH_TOKEN: token, GITHUB_TOKEN: token },
+      });
+      if (!clone.ok) {
+        // gh knows how to turn a token into git credentials on its own.
+        const viaGh = await execFileAsync('gh', ['repo', 'clone', slug, path, '--', '--recurse-submodules'], {
+          timeout,
+          maxBuffer: 8 * 1024 * 1024,
+          env: { ...process.env, GH_TOKEN: token, GITHUB_TOKEN: token, GIT_TERMINAL_PROMPT: '0' },
+        }).then(
+          () => ({ ok: true, out: '', err: '' }),
+          (err) => ({ ok: false, out: '', err: (err.stderr || err.message || '').toString().trim() }),
+        );
+        if (viaGh.ok) clone = viaGh;
+      }
+    } else {
+      clone = await git(PROJECTS_ROOT, ['clone', '--recurse-submodules', url, target], { timeout });
+    }
+
+    if (!clone.ok) {
+      // A failed clone can leave a partial directory behind, and a half-repo in
+      // the project list is worse than no project at all.
+      await rm(path, { recursive: true, force: true }).catch(() => {});
+      const hint = /not found|repository .* does not exist|could not read Username/i.test(clone.err)
+        ? ' — check the name, and that the workspace token can see it'
+        : '';
+      throw new Error(`clone failed: ${clone.err.slice(0, 400)}${hint}`);
+    }
+    steps.push({ step: 'clone', ok: true, url: `https://github.com/${slug}` });
+
+    return { name: target, path, sessions: [], steps };
+  }
+
+  /**
+   * The repositories this workspace's token can see, so cloning is a tap rather
+   * than typing `owner/repo` on a phone keyboard.
+   */
+  async listGithubRepos({ limit = 60 } = {}) {
+    const token = await getGithubToken();
+    if (!token) throw new Error('no GitHub token is configured for this workspace');
+
+    const { stdout } = await execFileAsync(
+      'gh',
+      [
+        'repo', 'list',
+        '--limit', String(Math.min(Math.max(Number(limit) || 60, 1), 200)),
+        '--json', 'nameWithOwner,description,isPrivate,updatedAt',
+      ],
+      {
+        timeout: 60_000,
+        maxBuffer: 8 * 1024 * 1024,
+        env: { ...process.env, GH_TOKEN: token, GITHUB_TOKEN: token },
+      },
+    );
+
+    const present = new Set(
+      (await readdir(PROJECTS_ROOT, { withFileTypes: true }).catch(() => []))
+        .filter((e) => e.isDirectory())
+        .map((e) => e.name),
+    );
+
+    return JSON.parse(stdout || '[]').map((r) => ({
+      slug: r.nameWithOwner,
+      name: r.nameWithOwner.split('/')[1],
+      description: r.description || '',
+      private: Boolean(r.isPrivate),
+      updatedAt: r.updatedAt,
+      // Already here: the UI labels these instead of offering a clone that would
+      // fail on the "already exists" check.
+      present: present.has(r.nameWithOwner.split('/')[1]),
+    }));
+  }
 }
 
-export { PROJECTS_ROOT, DEFAULT_MODEL };
+export { PROJECTS_ROOT, DEFAULT_MODEL, parseGithubRepo, projectPathFor };

@@ -160,6 +160,12 @@ function recorderHtml(mode) {
   @keyframes pulse { 0%,100% { box-shadow: 0 0 0 0 rgba(209,52,56,.55); }
                      50%     { box-shadow: 0 0 0 22px rgba(209,52,56,0); } }
   #label { font-size: 14px; opacity: .85; text-align: center; padding: 0 16px; }
+  /* Loud, and it stays put: this is what the user reads after the display slept
+     mid-sentence and took the recording with it. */
+  #label.cut-off {
+    opacity: 1; font-weight: 600; color: #fff;
+    background: #d13438; border-radius: 10px; padding: 10px 14px;
+  }
   #timer { font-variant-numeric: tabular-nums; font-size: 20px; opacity: .7; }
 </style>
 </head>
@@ -174,7 +180,33 @@ function recorderHtml(mode) {
   const timerEl = document.getElementById('timer');
   let mode = ${JSON.stringify(mode)};
   let recorder = null, chunks = [], stream = null, recording = false;
-  let started = 0, ticker = null;
+  let started = 0, ticker = null, wakeLock = null, screenHeld = false;
+
+  /*
+   * A phone dictating a long passage is a phone nobody is touching, so the
+   * display sleeps on its idle timer and the recording stops with it — silently,
+   * because the screen that was showing "Recording…" is what just turned off.
+   *
+   * Hold a screen wake lock so that does not happen; and when it happens anyway
+   * (no wake lock in this webview, the user locked the phone, the OS revoked it)
+   * say so in a way that survives the screen coming back on.
+   */
+  async function holdScreen() {
+    if (!navigator.wakeLock) return false;
+    try {
+      wakeLock = await navigator.wakeLock.request('screen');
+      wakeLock.addEventListener('release', () => { wakeLock = null; });
+      return true;
+    } catch (err) {
+      return false;
+    }
+  }
+
+  function releaseScreen() {
+    const held = wakeLock;
+    wakeLock = null;
+    try { if (held) held.release(); } catch (err) { /* already gone */ }
+  }
 
   window.addEventListener('message', (e) => {
     if (e.data && e.data.type === 'reset') mode = e.data.mode;
@@ -211,20 +243,48 @@ function recorderHtml(mode) {
     ticker = setInterval(tick, 250);
     mic.classList.add('recording');
     mic.innerHTML = '&#9632;';
-    label.textContent = 'Recording… tap to stop.';
+    label.classList.remove('cut-off');
+    screenHeld = await holdScreen();
+    label.textContent = screenHeld
+      ? 'Recording… tap to stop.'
+      : 'Recording… tap to stop. The screen may sleep and cut this off.';
   }
 
-  function stop() {
+  /**
+   * A "reason" marks a stop the user did not ask for. Either way the audio
+   * already captured is transcribed — an interrupted recording still yields words
+   * spoken before the interruption — but an unasked-for stop also buzzes and
+   * leaves a message on screen, because the point of failure is a moment when
+   * nobody is looking at the phone.
+   */
+  function stop(reason) {
     if (!recorder || recorder.state === 'inactive') return;
     recording = false;
     clearInterval(ticker);
+    releaseScreen();
     recorder.stop();
     mic.classList.remove('recording');
     mic.disabled = true;
     mic.innerHTML = '&#8987;';
-    label.textContent = 'Transcribing…';
-    vscodeApi.postMessage({ type: 'status', text: 'Transcribing…' });
+    if (reason) {
+      try { if (navigator.vibrate) navigator.vibrate([140, 90, 140]); } catch (err) { /* optional */ }
+      label.classList.add('cut-off');
+      label.textContent = 'Recording stopped — ' + reason + '. Transcribing what was captured…';
+      vscodeApi.postMessage({ type: 'error', text: 'dictation stopped: ' + reason });
+    } else {
+      label.textContent = 'Transcribing…';
+      vscodeApi.postMessage({ type: 'status', text: 'Transcribing…' });
+    }
   }
+
+  // The webview is suspended when the phone locks or the user switches away, so
+  // the recorder is finished whether or not we admit it. Admitting it is what
+  // turns lost audio into transcribed audio.
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState !== 'visible' && recording) {
+      stop('the screen turned off');
+    }
+  });
 
   async function onStop() {
     const blob = new Blob(chunks, { type: recorder.mimeType });
@@ -239,10 +299,16 @@ function recorderHtml(mode) {
       }
       const data = await res.json();
       vscodeApi.postMessage({ type: 'transcript', text: data.text, mode });
-      label.textContent = 'Inserted. Tap to dictate again.';
+      // Keep the interruption on screen if there was one: "Inserted." alone would
+      // hide the fact that the recording was cut short, which is the one thing
+      // the user needs to know before carrying on.
+      label.textContent = label.classList.contains('cut-off')
+        ? 'Inserted what was captured before it stopped. Tap to continue.'
+        : 'Inserted. Tap to dictate again.';
       timerEl.textContent = '0:00';
     } catch (err) {
       vscodeApi.postMessage({ type: 'error', text: err.message });
+      label.classList.add('cut-off');
       label.textContent = 'Transcription failed. Tap to retry.';
     } finally {
       mic.disabled = false;
