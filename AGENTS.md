@@ -249,10 +249,29 @@ Things that have burned people, in this codebase specifically:
 - **The manifest link needs `crossorigin="use-credentials"`.** Manifests are
   fetched with credentials omitted by default, which means 401 and no install
   prompt now that static files are gated.
-- **`userDataCausesReplacement: false` is deliberate.** The bootstrap script's S3
-  asset hash is in userdata, so leaving it on replaced the instance on every
-  script edit. `deploy.sh` re-runs `/opt/bootstrap.sh` on the live instance
-  instead. This is why `bootstrap.sh` must stay idempotent.
+- **`userDataCausesReplacement: false` is deliberate, and does not mean userdata
+  edits are free.** The bootstrap script's S3 asset hash is in userdata, so
+  leaving the flag on replaced the instance on every script edit; `deploy.sh`
+  re-runs `/opt/bootstrap.sh` on the live instance instead, which is why
+  `bootstrap.sh` must stay idempotent. But CloudFormation's own update behaviour
+  for `UserData` on a running instance is *replacement*, so a changed bootstrap
+  asset hash still replaces the box — observed 2026-09-15, when a deploy carrying
+  one moved the whole thing to a new instance. `cdk diff` says "may be replaced"
+  when this is about to happen, and it is worth reading, because two things follow:
+  `/opt/claude-web` lives on the root volume and dies with the instance, and the
+  payload that recreates it is pushed by `deploy.sh` *after* the stack completes.
+  So drive that deploy from a machine other than the one being replaced. From the
+  instance itself it only worked because CloudFormation deletes the old instance
+  last, which is luck rather than design.
+- **The CDK CLI reads a narrower slice of `~/.aws/config` than the AWS CLI.** A
+  profile whose credentials come from `credential_source = Ec2InstanceMetadata`
+  fails the CDK step with "Unable to resolve AWS account to use" while every `aws`
+  call in the same script, with the same `--profile`, works. `deploy.sh` resolves
+  the profile with `aws configure export-credentials` and hands CDK environment
+  credentials instead of the flag. It also checks `sts get-caller-identity` up
+  front, because the other way this shows up is a configured profile that no
+  longer exists — an instance replacement takes `~/.aws` with the root volume
+  while `awsProfile` in the config keeps naming it.
 - **The service worker deliberately unregisters itself.** It caches nothing. A
   stale cached shell breaks a live WebSocket client rather than helping, and a
   wedged worker has no user-side escape. Do not add caching.

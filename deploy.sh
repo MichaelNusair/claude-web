@@ -42,6 +42,23 @@ printf '\n\033[1mDeploying\033[0m %s\n' "https://$DOMAIN"
 printf '  region %s   auth %s   permissions %s   admin-role %s\n' \
   "$REGION" "$CFG_AUTH_MODE" "$CFG_PERMISSION_MODE" "$CFG_ADMIN"
 
+# Credentials are checked before anything is built, because when they are wrong
+# the failure otherwise lands minutes in, after the tests and the vsix packaging,
+# wearing a message about something else. Two real cases: an expired SSO session,
+# and — after this stack replaced its own instance — an `awsProfile` still naming
+# a profile that lived in the old root volume's ~/.aws and was simply gone.
+if ! IDENTITY="$(aws sts get-caller-identity --query Arn --output text "${AWS_ARGS[@]}" 2>&1)"; then
+  {
+    echo "Cannot use these AWS credentials:"
+    echo "  $IDENTITY"
+    [ -n "$PROFILE" ] &&
+      echo "  awsProfile in claude-web.config.json is \"$PROFILE\". Clear it to fall back to" &&
+      echo "  the default credential chain (on the instance, that is its own role)."
+  } >&2
+  exit 1
+fi
+printf '  identity %s\n' "$IDENTITY"
+
 # ---------------------------------------------------------------------------
 step "Checking authentication"
 # ---------------------------------------------------------------------------

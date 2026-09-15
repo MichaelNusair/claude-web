@@ -229,15 +229,20 @@ export class ClaudeWebStack extends Stack {
       securityGroup: instanceSg,
       role,
       userData,
-      // userData changes alone don't replace an instance; this makes the hash
-      // part of the launch config so provisioning edits actually take effect.
-      // Deliberately false. The bootstrap script's S3 asset hash is embedded in
-      // userdata, so leaving this on replaced the instance on every script edit
-      // — a full rebuild for a one-line change, and each rebuild dropped the
-      // app payload until the next deploy re-pushed it. Provisioning changes
-      // are applied to the running box by deploy.sh instead; use
-      // `cdk deploy --force` or terminate the instance when a genuinely clean
-      // rebuild is wanted.
+      // Deliberately false: it stops CDK from folding the userdata hash into the
+      // instance's *logical id*, which made every bootstrap edit a guaranteed
+      // rebuild — and each rebuild dropped the app payload until the next deploy
+      // re-pushed it. Provisioning changes are applied to the running box by
+      // deploy.sh instead.
+      //
+      // It does not make userdata edits free. CloudFormation's own update
+      // behaviour for `UserData` on a running instance is replacement, so a
+      // changed bootstrap asset hash still replaces the box: observed
+      // 2026-09-15, i-00a02e3307d3b8799 → i-0533875a166194308. Check `cdk diff`
+      // for "may be replaced" before assuming otherwise, and drive that deploy
+      // from somewhere other than the instance being replaced — /opt/claude-web
+      // is on the root volume, and the payload that recreates it is pushed after
+      // the stack completes.
       userDataCausesReplacement: false,
       vpcSubnets: { availabilityZones: [workspaceAz], subnetType: ec2.SubnetType.PUBLIC },
       associatePublicIpAddress: true,
