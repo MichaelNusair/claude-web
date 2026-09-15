@@ -111,10 +111,32 @@ done
 step "Deploying infrastructure"
 # ---------------------------------------------------------------------------
 CDK_ARGS=()
-[ -n "$PROFILE" ] && CDK_ARGS+=(--profile "$PROFILE")
+CDK_CREDS=""
+if [ -n "$PROFILE" ]; then
+  # The CDK CLI understands a narrower slice of ~/.aws/config than the AWS CLI
+  # does. A profile that sources its credentials from somewhere CDK has not
+  # implemented — `credential_source = Ec2InstanceMetadata` is the one that bit
+  # us, deploying from an instance — fails with "Unable to resolve AWS account to
+  # use" while every `aws` call in this script using the same profile works.
+  #
+  # So the profile is resolved by the tool that understands it, and CDK is handed
+  # the result as plain environment credentials. `--profile` is then deliberately
+  # not passed: it would send CDK back to the config file it cannot read.
+  if CDK_CREDS="$(aws configure export-credentials --profile "$PROFILE" --format env 2>/dev/null)" \
+    && [ -n "$CDK_CREDS" ]; then
+    echo "  resolved profile $PROFILE into environment credentials for CDK"
+  else
+    # Older AWS CLIs have no export-credentials. Fall back to the flag, which
+    # works for the ordinary profile types.
+    CDK_CREDS=""
+    CDK_ARGS+=(--profile "$PROFILE")
+  fi
+fi
 (
   cd infra
   [ -d node_modules ] || npm install
+  # Scoped to this subshell so the rest of the script keeps using --profile.
+  [ -n "$CDK_CREDS" ] && eval "$CDK_CREDS"
   npx cdk deploy "$STACK_NAME" \
     "${CDK_ARGS[@]+"${CDK_ARGS[@]}"}" \
     --require-approval never \
