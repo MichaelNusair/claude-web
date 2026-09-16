@@ -229,6 +229,7 @@
   fab.innerHTML = `
     <button class="cmo-btn cmo-secondary" id="cmo-layout" aria-label="Fix the layout">&#10038;</button>
     <button class="cmo-btn cmo-secondary" id="cmo-projects" aria-label="Switch project">&#9707;</button>
+    <button class="cmo-btn cmo-secondary" id="cmo-terminal" aria-label="Terminal">&#10095;</button>
     <button class="cmo-btn" id="cmo-mic" aria-label="Dictate">&#127908;</button>`;
   document.body.appendChild(fab);
 
@@ -902,6 +903,7 @@
    */
   const KEY_BACK = { key: 'F9', code: 'F9', keyCode: 120 };
   const KEY_CHROME = { key: 'F10', code: 'F10', keyCode: 121 };
+  const KEY_TERMINAL = { key: 'F11', code: 'F11', keyCode: 122 };
 
   function pressChord(spec) {
     const init = {
@@ -1116,6 +1118,12 @@
   });
   document.getElementById('cmo-projects').addEventListener('click', openProjects);
   document.getElementById('cmo-layout').addEventListener('click', openLayout);
+  // Straight to the chord, no sheet: a terminal appearing is its own feedback, and
+  // pressing it again is what puts Claude back. The extension decides which of
+  // those two a press means, since only it can see what is in front.
+  document.getElementById('cmo-terminal').addEventListener('click', () => {
+    pressChord(KEY_TERMINAL);
+  });
 
   // One line per workbench load, so a phone that reloads itself leaves a trail.
   recordLoad();

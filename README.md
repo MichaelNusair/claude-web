@@ -208,8 +208,15 @@ if Azure errors. See [docs/DEPLOY.md](docs/DEPLOY.md).
 
 `/editor/` is real code-server running the real Claude Code extension, with the
 activity bar, status bar and tabs stripped so the panel gets the whole screen. A
-small bar of buttons — dictate, switch project, fix the layout — floats over it;
-long-press any of them to move the bar to the other edge.
+small bar of buttons — dictate, switch project, terminal, fix the layout — floats
+over it; long-press any of them to move the bar to the other edge.
+
+The terminal button opens a shell **in the editor area**, so it gets the whole
+window exactly like Claude does, and pressing it again hands the window back —
+with tabs hidden, the two just take turns. It reuses the shell you already had
+rather than opening another, including across a page reload. It is for the quick
+things (`git log`, run a test); a shell in a tab dies with the tab, so anything
+long-running still belongs in `cc` under tmux, above.
 
 The layout button is there because of one specific way the editor gets stuck: tap
 a file in the transcript and it opens beside the panel, and with no tabs and no

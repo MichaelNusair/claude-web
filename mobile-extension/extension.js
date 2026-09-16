@@ -279,6 +279,54 @@ async function backToClaude(notify) {
   await focusClaude();
 }
 
+/** The shell this extension opened, while it is still alive. */
+let mobileTerminal = null;
+// Named, not left to default to the shell's own name, so a terminal restored
+// after a reload can be recognised as the one this button opened.
+const TERMINAL_NAME = 'Terminal';
+
+const isTerminalTab = (tab) =>
+  Boolean(vscode.TabInputTerminal) && tab.input instanceof vscode.TabInputTerminal;
+
+/**
+ * A shell, on a surface with no status bar to open one from.
+ *
+ * In the **editor area**, not the panel: `workbench.panel.defaultLocation` is
+ * `right` here, so a panel terminal is a narrow column beside Claude — fine on a
+ * desktop, useless on a phone, where the soft keyboard then takes half of what is
+ * left. An editor terminal gets the whole window, exactly like Claude does, and
+ * with tabs hidden the two simply take turns.
+ *
+ * One button, both directions: pressing it while the terminal is in front is how
+ * you get back, so the phone does not need a second control for that. Terminals
+ * are shown rather than created wherever possible — code-server keeps shells
+ * running across a page reload while the extension host does not, so creating one
+ * per press would stack a new shell on every reload and leave the old ones
+ * running.
+ *
+ * Note what this deliberately is not: it is not `cc`. A shell in the editor dies
+ * with its tab; long work still belongs in tmux (see `scripts/cc-session.sh`).
+ */
+async function toggleTerminal() {
+  const active = vscode.window.tabGroups.activeTabGroup?.activeTab;
+  if (active && isTerminalTab(active)) {
+    await focusClaude();
+    return;
+  }
+  if (mobileTerminal && vscode.window.terminals.includes(mobileTerminal)) {
+    mobileTerminal.show();
+    return;
+  }
+  mobileTerminal = vscode.window.terminals.find((t) => t.name === TERMINAL_NAME)
+    || vscode.window.createTerminal({
+      name: TERMINAL_NAME,
+      // Probed: an older build without editor terminals gets a panel one, which
+      // is worse but still a shell.
+      location: vscode.TerminalLocation ? vscode.TerminalLocation.Editor : undefined,
+    });
+  mobileTerminal.show();
+}
+
 function activate(context) {
   // Settings must land before the panel opens, or Claude starts a conversation
   // in the old permission mode.
@@ -335,6 +383,7 @@ function activate(context) {
     vscode.commands.registerCommand('claudeMobile.focusClaude', focusClaude),
     // Asked for by hand, so this one reports what it had to skip.
     vscode.commands.registerCommand('claudeMobile.backToClaude', () => backToClaude(true)),
+    vscode.commands.registerCommand('claudeMobile.toggleTerminal', toggleTerminal),
   );
 
   context.subscriptions.push(

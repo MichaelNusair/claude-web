@@ -77,6 +77,32 @@ ok(
   'mobile-extension binds no keybinding for claudeMobile.toggleChrome',
   bound.has('claudeMobile.toggleChrome'),
 );
+ok(
+  'mobile-extension binds no keybinding for claudeMobile.toggleTerminal — the bar’s ' +
+    'terminal button has nothing to trigger',
+  bound.has('claudeMobile.toggleTerminal'),
+);
+
+/*
+ * The terminal has to open in the *editor area*. `workbench.panel.defaultLocation`
+ * is `right` on this surface, so a panel terminal is a narrow column beside Claude
+ * with the soft keyboard over it. Checked in the source because there is no VS Code
+ * API to run against here, and the failure it guards is silent: a panel terminal
+ * still works, it is just unusable on the device this exists for.
+ */
+const extensionJs = readFileSync(join(root, 'mobile-extension', 'extension.js'), 'utf8');
+ok(
+  'the extension registers no handler for claudeMobile.toggleTerminal',
+  extensionJs.includes("registerCommand('claudeMobile.toggleTerminal'"),
+);
+ok(
+  'the terminal is not opened in the editor area (TerminalLocation.Editor)',
+  /TerminalLocation\.Editor/.test(extensionJs),
+);
+ok(
+  'nothing reuses an existing terminal, so every press or reload stacks a new shell',
+  /vscode\.window\.terminals/.test(extensionJs),
+);
 
 const declared = new Set((manifest.contributes?.commands ?? []).map((c) => c.command));
 for (const command of bound.keys()) {
@@ -263,6 +289,9 @@ assertChord('cmo-back', 'claudeMobile.backToClaude');
 // The sheet closes itself a moment after each tap, so reopen for the next one.
 doc.getElementById('cmo-layout').dispatchEvent(new w.MouseEvent('click', { bubbles: true }));
 assertChord('cmo-chrome', 'claudeMobile.toggleChrome');
+
+// This one is on the bar rather than in a sheet: one tap, from wherever you are.
+assertChord('cmo-terminal', 'claudeMobile.toggleTerminal');
 
 // --------------------------------------------------------- the project switcher
 /*

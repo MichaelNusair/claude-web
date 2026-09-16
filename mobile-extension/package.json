@@ -8,8 +8,12 @@
   "engines": {
     "vscode": "^1.94.0"
   },
-  "categories": ["Other"],
-  "activationEvents": ["onStartupFinished"],
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
   "main": "./extension.js",
   "contributes": {
     "commands": [
@@ -24,6 +28,10 @@
       {
         "command": "claudeMobile.toggleChrome",
         "title": "Mobile: Toggle editor chrome"
+      },
+      {
+        "command": "claudeMobile.toggleTerminal",
+        "title": "Mobile: Terminal in the editor area (toggle)"
       }
     ],
     "keybindings": [
@@ -34,6 +42,10 @@
       {
         "command": "claudeMobile.toggleChrome",
         "key": "ctrl+alt+shift+f10"
+      },
+      {
+        "command": "claudeMobile.toggleTerminal",
+        "key": "ctrl+alt+shift+f11"
       }
     ],
     "configuration": {

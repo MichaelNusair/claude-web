@@ -51,7 +51,7 @@ itself is not something you will do on an internet-facing deployment.
 ```bash
 npm run test:auth      # must be 41/41 or better; never fewer checks than before
 npm run test:client
-npm run test:overlay   # 38/38; the editor overlay, its chords, its drafts, its clipboard
+npm run test:overlay   # 45/45; the editor overlay, its chords, its drafts, its clipboard
 npm run test:polish    # 19/19; the dictation cleanup's bounds, and its failure paths
 npm run test:projects  # 53/53; real git repos, real pushes
 cd infra && npx cdk synth --quiet
@@ -278,12 +278,23 @@ Things that have burned people, in this codebase specifically:
 - **The overlay drives the editor through keyboard chords, and both ends have to
   agree.** `pwa/mobile-overlay.js` cannot call a VS Code command — there is no
   supported global for the workbench's command service, and rewriting the bundle
-  to get one black-screened the editor twice. So the Layout buttons synthesise
-  `ctrl+alt+shift+F9`/`F10`, and `mobile-extension/package.json` binds those to
+  to get one black-screened the editor twice. So the buttons synthesise
+  `ctrl+alt+shift+F9`/`F10`/`F11`, and `mobile-extension/package.json` binds those to
   its commands. Nothing throws if they drift apart; the buttons just stop working,
   on the surface where the user has no other way out. `overlay-test.js` reads the
   chords out of the manifest and compares them against what the buttons dispatch —
   keep it that way rather than hard-coding the keys in the test as well.
+- **The terminal button opens an *editor* terminal, not a panel one.** This surface
+  sets `workbench.panel.defaultLocation: 'right'`, so the obvious
+  `workbench.action.terminal.toggleTerminal` puts a shell in a narrow column beside
+  Claude, with the soft keyboard over what is left of it. An editor terminal gets
+  the whole window the same way Claude does, and with tabs hidden the two take
+  turns — which is also why one button toggles both directions (press it while the
+  terminal is in front and you get Claude back) rather than needing a second
+  control. It shows an existing terminal rather than creating one, because
+  code-server keeps shells alive across a page reload while the extension host is
+  destroyed: creating per press would leave a pile of orphaned shells. A shell in a
+  tab still dies with the tab, so long work belongs in `cc`/tmux, not here.
 - **The workbench reloads itself, and a reload of `/editor/` destroys work.** Its
   lifecycle service calls `location.reload()` when the browser restores the page
   from the back/forward cache — on a phone that is every app switch — and a reload
