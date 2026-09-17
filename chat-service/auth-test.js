@@ -154,6 +154,10 @@ const guarded = [
   ['POST', '/api/projects/clone'],
   ['GET', '/api/github/repos'],
   ['GET', '/api/transcript?cwd=/tmp&sessionId=x'],
+  // Reads the tail of a transcript and asks claude-broker what it is running, so
+  // an unauthenticated hit would be both a read of private conversations and an
+  // inventory of every live one.
+  ['GET', '/api/claude-status?cwd=/tmp'],
   ['GET', '/api/models'],
   ['GET', '/api/voice-status'],
   ['POST', '/api/transcribe'],

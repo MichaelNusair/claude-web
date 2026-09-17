@@ -218,6 +218,43 @@
     margin: 4px 0 2px; font-size: 14.5px; color: #d7d4cc;
   }
   .cmo-check input { width: 19px; height: 19px; accent-color: #d97757; }
+
+  /*
+   * Docked to the TOP, for the same reason the bar is docked to the left: the
+   * bottom right is Claude's own send/stop control, and the left edge is the bar.
+   * Centred and narrow, so it reads as a notification rather than as chrome, and
+   * it is removed from the DOM when it has nothing to say.
+   */
+  #cmo-chip {
+    position: fixed; z-index: 2147483000;
+    top: max(6px, env(safe-area-inset-top));
+    left: 50%; transform: translateX(-50%);
+    max-width: min(92vw, 460px);
+    display: flex; align-items: center; gap: 8px;
+    padding: 9px 13px; border-radius: 999px; border: none;
+    background: rgba(30,30,28,.94); color: #f5f4ef;
+    font: 13px/1.35 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    box-shadow: 0 2px 12px rgba(0,0,0,.45);
+    cursor: pointer; text-align: left;
+    -webkit-tap-highlight-color: transparent; touch-action: manipulation;
+  }
+  #cmo-chip.cmo-gone { opacity: 0; pointer-events: none; transition: opacity .4s; }
+  .cmo-chip-text {
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .cmo-dot {
+    flex: 0 0 auto; width: 8px; height: 8px; border-radius: 50%;
+    background: #6db26d;
+  }
+  .cmo-dot.cmo-busy { background: #d97757; animation: cmo-blink 1.2s infinite; }
+  @keyframes cmo-blink { 0%,100% { opacity: 1 } 50% { opacity: .25 } }
+  /* Whitespace preserved: it is Claude's message, and it was written with shape. */
+  .cmo-said {
+    margin: 10px 0 0; padding: 12px; border-radius: 12px;
+    background: #272725; color: #f5f4ef;
+    font: 14px/1.5 inherit; white-space: pre-wrap; overflow-wrap: anywhere;
+    max-height: 46vh; overflow-y: auto;
+  }
   `;
   const style = document.createElement('style');
   style.textContent = css;
@@ -229,9 +266,19 @@
   fab.innerHTML = `
     <button class="cmo-btn cmo-secondary" id="cmo-layout" aria-label="Fix the layout">&#10038;</button>
     <button class="cmo-btn cmo-secondary" id="cmo-projects" aria-label="Switch project">&#9707;</button>
+    <button class="cmo-btn cmo-secondary" id="cmo-status" aria-label="Is Claude working?">&#9673;</button>
     <button class="cmo-btn cmo-secondary" id="cmo-terminal" aria-label="Terminal">&#10095;</button>
     <button class="cmo-btn" id="cmo-mic" aria-label="Dictate">&#127908;</button>`;
   document.body.appendChild(fab);
+
+  // The chip is created here but only inserted when there is something to say;
+  // an empty pill across the top of the editor is worse than no chip at all.
+  const chip = document.createElement('button');
+  chip.id = 'cmo-chip';
+  chip.type = 'button';
+  chip.innerHTML = '<span class="cmo-dot"></span><span class="cmo-chip-text"></span>';
+  const chipDot = chip.querySelector('.cmo-dot');
+  const chipText = chip.querySelector('.cmo-chip-text');
 
   const sheet = document.createElement('div');
   sheet.id = 'cmo-sheet';
@@ -1108,6 +1155,192 @@
   setInterval(syncWakeLock, 30000);
   syncWakeLock();
 
+  // ------------------------------------------------- is Claude working, and what
+  /*
+   * The one thing you need to know before the history has finished loading.
+   *
+   * Opening a conversation on a second device means waiting while the Claude panel
+   * re-reads and re-renders the entire transcript — measured at 1.75–3.97s inside
+   * the extension host before the CLI is even launched, on transcripts up to 8.7MB,
+   * and it renders oldest-first, so the newest message arrives last. That is the
+   * message you need in order to reply, and it is the one you wait longest for.
+   *
+   * The panel is a proprietary webview, so none of that can be reordered from here.
+   * What can be done is to answer the question from outside it, while it works:
+   *
+   *   Claude is working  ->  the answer has not been said yet. Wait; the history
+   *                          is worth the wait, because the end of it is coming.
+   *   Claude is idle     ->  it is your turn, and the last message is all you
+   *                          need. Here it is, in tens of milliseconds.
+   *
+   * "Working" is not something a transcript can tell you — there is no turn-end
+   * marker on disk — so it comes from claude-broker, which owns the process. See
+   * chat-service/claude-status.js.
+   */
+  const STATUS_POLL_MS = 4000;
+  // A tab left open for hours must not poll forever. Working turns are minutes,
+  // not hours, and a stale chip is harmless once the answer is on screen anyway.
+  const STATUS_POLL_LIMIT = 30 * 60 * 1000;
+  // Long enough to read a line and decide, short enough not to sit on the editor.
+  const CHIP_LINGER_MS = 30000;
+
+  let status = null;
+  let statusPollTimer = null;
+  let statusPollingSince = 0;
+  let chipTimer = null;
+
+  function folder() {
+    try {
+      return new URLSearchParams(location.search).get('folder') || '';
+    } catch {
+      return ''; // an empty window: no conversation to report on
+    }
+  }
+
+  /**
+   * Ask the chat service. Every failure answers null, and null shows nothing:
+   * a 401 (the editor and the chat API are gated separately, so signing into one
+   * leaves the other unauthorized), no route on an older deployment, a dropped
+   * network. None of those are worth a banner over someone's editor — the project
+   * switcher is where a missing chat-service sign-in is explained.
+   */
+  async function fetchStatus() {
+    const cwd = folder();
+    if (!cwd) return null;
+    try {
+      const res = await fetch(`/api/claude-status?cwd=${encodeURIComponent(cwd)}`);
+      if (!res.ok) return null;
+      return await res.json();
+    } catch {
+      return null;
+    }
+  }
+
+  function hideChip() {
+    if (chipTimer) clearTimeout(chipTimer);
+    chipTimer = null;
+    chip.classList.add('cmo-gone');
+    // Removed rather than left transparent: it sits over the editor's top edge,
+    // and `pointer-events: none` is one CSS mistake away from swallowing taps.
+    setTimeout(() => chip.remove(), 450);
+  }
+
+  /** A single line: what it is doing, or the first of what it said. */
+  function chipLine(s) {
+    if (s.state === 'working') return 'Claude is working…';
+    if (s.last?.text) return s.last.text.replace(/\s+/g, ' ').trim();
+    if (s.state === 'unknown') return 'Claude — tap for status';
+    return 'Claude is waiting for you';
+  }
+
+  function showChip(s, { linger = true } = {}) {
+    chipText.textContent = chipLine(s);
+    chipDot.classList.toggle('cmo-busy', s.state === 'working');
+    chip.classList.remove('cmo-gone');
+    if (!chip.isConnected) document.body.appendChild(chip);
+    if (chipTimer) clearTimeout(chipTimer);
+    // A working chip stays: it is the reason to keep waiting, and it is replaced
+    // by the finished one as soon as the turn ends.
+    chipTimer = linger && s.state !== 'working' ? setTimeout(hideChip, CHIP_LINGER_MS) : null;
+  }
+
+  function stopStatusPoll() {
+    if (statusPollTimer) clearTimeout(statusPollTimer);
+    statusPollTimer = null;
+  }
+
+  /**
+   * Poll only while a turn is in flight, and only while the tab is visible.
+   *
+   * The transition from working to idle is the whole point of polling — it is the
+   * moment the answer you were waiting for exists — so the chip is rewritten when
+   * it happens rather than being left saying "working" until the next page load.
+   */
+  async function pollStatus() {
+    stopStatusPoll();
+    if (document.visibilityState !== 'visible') return;
+    if (Date.now() - statusPollingSince > STATUS_POLL_LIMIT) return;
+
+    const next = await fetchStatus();
+    if (!next) return;
+    const finished = status?.state === 'working' && next.state !== 'working';
+    status = next;
+
+    if (next.state === 'working') {
+      showChip(next);
+      statusPollTimer = setTimeout(pollStatus, STATUS_POLL_MS);
+      return;
+    }
+    // Only announce the finish if this tab watched it happen. Otherwise a page
+    // opened onto an idle conversation would claim a turn just ended.
+    if (finished) showChip(next);
+  }
+
+  /**
+   * Answer the question on arrival, unasked.
+   *
+   * Deliberately not behind a tap: the wait this exists for happens on page load,
+   * and being told to tap something while the editor is busy loading is the same
+   * wait with an extra step.
+   */
+  async function checkStatus() {
+    const next = await fetchStatus();
+    if (!next) return;
+    status = next;
+    showChip(next);
+    if (next.state === 'working') {
+      statusPollingSince = Date.now();
+      statusPollTimer = setTimeout(pollStatus, STATUS_POLL_MS);
+    }
+  }
+
+  /** The whole of what Claude last said, for when one line was not enough. */
+  function openStatus() {
+    const s = status;
+    if (!s) {
+      openSheet(`
+        <p class="cmo-title">Claude</p>
+        <p class="cmo-hint">No status yet. The chat service answers this, and it has
+        its own sign-in — open the project switcher if you have not signed in.</p>
+        <div class="cmo-row"><button class="cmo-action cmo-alt" id="cmo-status-close">Close</button></div>`);
+      panel.querySelector('#cmo-status-close').addEventListener('click', closeSheet);
+      return;
+    }
+
+    const working = s.state === 'working';
+    const when = s.last?.at ? new Date(s.last.at) : null;
+    const ago = when ? Math.max(0, Math.round((Date.now() - when.getTime()) / 60000)) : null;
+    const size = s.bytes ? `${(s.bytes / (1024 * 1024)).toFixed(1)} MB` : null;
+
+    openSheet(`
+      <p class="cmo-title">${working ? 'Claude is working' : 'Your turn'}</p>
+      <p class="cmo-hint" id="cmo-status-detail"></p>
+      <div class="cmo-said" id="cmo-status-said"></div>
+      <div class="cmo-row">
+        <button class="cmo-action cmo-alt" id="cmo-status-close">Close</button>
+      </div>
+      <p class="cmo-hint">${
+        working
+          ? 'The panel is still loading the history; the end of it has not been written yet.'
+          : 'This is the last thing Claude said. The panel is still rendering the history above it.'
+      }${size ? ` This conversation is ${size} on disk, which is what the panel is reading.` : ''}</p>`);
+
+    // textContent, not innerHTML: this is a message from a model, it routinely
+    // contains code and angle brackets, and it is not markup.
+    panel.querySelector('#cmo-status-said').textContent =
+      s.last?.text || 'Nothing has been said in this conversation yet.';
+    panel.querySelector('#cmo-status-detail').textContent = [
+      ago === null ? null : ago === 0 ? 'just now' : `${ago} min ago`,
+      // Where the verdict came from, because the two are not equally certain: the
+      // broker knows, the transcript only shows the state it was left in.
+      s.source === 'broker' ? 'live from the broker' : 'inferred from the transcript',
+      s.clients === 0 ? 'no device attached' : null,
+    ]
+      .filter(Boolean)
+      .join(' · ');
+    panel.querySelector('#cmo-status-close').addEventListener('click', closeSheet);
+  }
+
   // -------------------------------------------------------------- wiring
   document.getElementById('cmo-mic').addEventListener('click', () => {
     if (recognition) {
@@ -1118,6 +1351,18 @@
   });
   document.getElementById('cmo-projects').addEventListener('click', openProjects);
   document.getElementById('cmo-layout').addEventListener('click', openLayout);
+  // The chip is the answer; the button is how you get it back after it has gone,
+  // and how you ask again without reloading.
+  document.getElementById('cmo-status').addEventListener('click', async () => {
+    // Refreshed before opening, because this button is also "ask again" — and a
+    // minutes-old snapshot is exactly the wrong thing to answer that with.
+    await checkStatus();
+    openStatus();
+  });
+  chip.addEventListener('click', () => {
+    openStatus();
+    hideChip();
+  });
   // Straight to the chord, no sheet: a terminal appearing is its own feedback, and
   // pressing it again is what puts Claude back. The extension decides which of
   // those two a press means, since only it can see what is in front.
@@ -1144,6 +1389,25 @@
   });
   window.addEventListener('pageshow', (e) => {
     if (e.persisted) recordLoad('bfcache-restore');
+  });
+
+  /*
+   * Ask on arrival, and ask again whenever this tab comes back.
+   *
+   * Coming back to the tab is the other half of the same question: you left the
+   * phone with Claude working, you return, and what you want to know before
+   * anything renders is whether it finished. Polling stops while the tab is
+   * hidden — a suspended phone tab must not hold a request open every four
+   * seconds — so returning is also when polling has to be picked back up.
+   */
+  checkStatus();
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState !== 'visible') {
+      stopStatusPoll();
+      return;
+    }
+    statusPollingSince = Date.now();
+    checkStatus();
   });
 
   /*

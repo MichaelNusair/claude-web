@@ -1128,4 +1128,8 @@ export class SessionManager {
   }
 }
 
-export { PROJECTS_ROOT, DEFAULT_MODEL, parseGithubRepo, projectPathFor };
+// mangleCwd and CLAUDE_HOME are exported for claude-status.js, which reads the
+// same transcripts from the other end. Shared rather than copied: the symlink
+// resolution above is the kind of detail that silently stops finding anything
+// when two copies drift.
+export { PROJECTS_ROOT, CLAUDE_HOME, DEFAULT_MODEL, mangleCwd, parseGithubRepo, projectPathFor };

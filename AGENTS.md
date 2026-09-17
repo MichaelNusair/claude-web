@@ -49,15 +49,19 @@ itself is not something you will do on an internet-facing deployment.
 ### Before you finish any change to auth, routing, or the stack
 
 ```bash
-npm run test:auth      # must be 48/48 or better; never fewer checks than before
+npm run test:auth      # must be 49/49 or better; never fewer checks than before
 npm run test:client
 npm run test:panes     # several chats at once; what closing a tab must not do
-npm run test:overlay   # 45/45; the editor overlay, its chords, its drafts, its clipboard
+npm run test:overlay   # 61/61; the editor overlay, its chords, its drafts, its clipboard
 npm run test:polish    # 19/19; the dictation cleanup's bounds, and its failure paths
 npm run test:projects  # 53/53; real git repos, real pushes
 npm run test:admin     # the operations surface, and every refusal it makes
+npm run test:status    # 21/21; what a device is told about a conversation, and from where
+npm run test:broker    # 44/44; one process per conversation, and failing safe without one
 cd infra && npx cdk synth --quiet
 ```
+
+`npm test` runs all of them in that order.
 
 If you add a route to `server.js`, add it to the `guarded` list in
 `auth-test.js`. A route with no test is a route nobody is checking.
@@ -75,6 +79,17 @@ chat-service/            The chat backend + PWA client. The security boundary.
                          surfaces, what is wrong with it, and stopping one thing
                          at a time. Reads the broker's processes from outside
                          with ps, and refuses far more than it does.
+  claude-status.js       "Is Claude working, and what did it last say" for the
+                         EDITOR's panel, in ~40ms, so a device need not wait out
+                         the panel's own history load to find out. Two sources,
+                         deliberately unequal: the broker for whether a turn is in
+                         flight, the tail of the transcript for the message.
+                         Depends on nothing in this service but the transcript
+                         path helper — the chat service is meant to be retired,
+                         and this should move rather than be rewritten.
+  status-test.js         That the two sources stay separated: a broker answer
+                         wins, a missing one falls back, and neither may claim a
+                         conversation is idle when that is not known.
   transcribe.js          Voice: local whisper.cpp, optional Azure override.
   polish.js              Makes a finished dictation readable: punctuation,
                          capitals, misheard names. Bedrock Haiku, one bounded
@@ -650,6 +665,40 @@ Things that have burned people, in this codebase specifically:
   deliberately: a session that *was* spoken to may have a turn in flight and must
   survive to `IDLE_MS` even when nothing can name it. If you widen that condition,
   the thing you are risking is killing live work.
+- **The wait when you open a conversation on another device is not the broker's,
+  and cannot be fixed there.** It is the panel reloading the transcript: measured
+  1.75–3.97 s in the extension host between the webview asking for the session and
+  `claude` being launched, across twelve page loads, all of it *before* the broker
+  is contacted. For comparison, the broker's replay of the same conversation was
+  4 ms to first byte and 7 ms complete, and the real CLI on `--resume` with no
+  input emits **0 bytes** — history never travels through the broker; the extension
+  reads the `.jsonl` itself. The panel also renders oldest-first, so the newest
+  message, the one you need in order to reply, arrives last. All of that is inside a
+  proprietary webview: there is no setting for it among the extension's 19, and
+  nothing in this repo can reorder it. The only lever we have is transcript size,
+  which the wait scales with. What we did instead was answer the question from
+  outside the panel — see `chat-service/claude-status.js` and the chip in
+  `pwa/mobile-overlay.js` — so you can tell whether the wait is worth sitting
+  through. If someone reports this as slow, do not go looking in `broker.js`.
+- **A transcript cannot tell you whether Claude is working.** There is no turn-end
+  marker on disk: 0 `"type":"result"` entries across every transcript on the box,
+  against 5606 `assistant` entries. Only the process holding the stream sees the
+  `result` event, which is why `broker.js` tracks `turnInFlight` and answers
+  `op: 'status'`, and why that op is the authority. The transcript can be *inferred*
+  from the last `stop_reason` (`tool_use` means a tool is running, `end_turn` means
+  the turn is over) but that is the state the conversation was **left** in, not
+  proof anything is still running it — a conversation abandoned mid-turn reads as
+  "working" forever. Keep the two labelled apart, as `claude-status.js` does with
+  `source`. Conflating them puts "Claude is working…" over a conversation that will
+  never answer.
+- **`op: 'status'` needs a broker restart to appear, and a restart ends every live
+  conversation.** Same rule as any `broker.js` change (see above): `install.sh` uses
+  `enable --now`, never `restart`, so new code sits on disk until someone chooses a
+  moment when losing the running work is acceptable. Until then a broker without the
+  op reads the status frame as a handshake and refuses it — which callers treat as
+  "cannot say" and fall back to the transcript, so the chip degrades to an inferred
+  answer rather than a wrong one. That is the intended behaviour, not a bug to fix
+  by restarting the unit from a deploy path.
 - **A deploy cannot apply an `infra/userdata/bootstrap.sh` edit to a running
   instance.** cloud-init runs `scripts-user` once per instance *ever*
   (`/var/lib/cloud/instances/<id>/sem/config_scripts_user`), so `/opt/bootstrap.sh`
@@ -678,8 +727,9 @@ Things that have burned people, in this codebase specifically:
 There is no staging environment, so local verification is what you have:
 
 ```bash
-npm test                                   # auth + client + panes + project lifecycle
-                                           # + operations surface + broker
+npm test                                   # auth + client + panes + overlay + polish
+                                           # + project lifecycle + operations surface
+                                           # + conversation status + broker
 cd infra && npx cdk synth --quiet          # stack compiles
 bash -n deploy.sh migrate.sh infra/userdata/bootstrap.sh claude-broker/install.sh
 node --check chat-service/server.js

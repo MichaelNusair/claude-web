@@ -40,7 +40,9 @@ const section = (name) => console.log(`\n${name}`);
 
 // A stand-in for the CLI: announces a session id like the real one does, echoes
 // whatever is written to it, and records every start so the test can prove how
-// many processes exist.
+// many processes exist. `end-turn` makes it emit the `result` event that ends a
+// turn in the real stream-json vocabulary, which is the only way the broker can
+// tell "Claude is still working" from "your turn".
 fs.writeFileSync(
   FAKE,
   `#!/usr/bin/env node
@@ -52,7 +54,24 @@ process.stdin.on('data', (c) => {
   const lines = buf.split('\\n');
   buf = lines.pop() || '';
   for (const line of lines) {
-    if (line.trim()) process.stdout.write(JSON.stringify({ type: 'echo', got: line }) + '\\n');
+    if (!line.trim()) continue;
+    if (line.trim() === 'end-turn') {
+      process.stdout.write(JSON.stringify({ type: 'result', subtype: 'success' }) + '\\n');
+      continue;
+    }
+    // The same event, one byte per write, so the broker sees it split across
+    // chunks. The real CLI does this whenever a flush lands mid-token.
+    if (line.trim() === 'end-turn-slowly') {
+      const event = JSON.stringify({ type: 'result', subtype: 'success' }) + '\\n';
+      let i = 0;
+      const tick = setInterval(() => {
+        if (i >= event.length) { clearInterval(tick); return; }
+        process.stdout.write(event[i]);
+        i += 1;
+      }, 2);
+      continue;
+    }
+    process.stdout.write(JSON.stringify({ type: 'echo', got: line }) + '\\n');
   }
 });
 process.stdin.on('end', () => process.exit(0));
@@ -121,6 +140,32 @@ const send = (client, text) =>
   client.sock.write(
     `${JSON.stringify({ s: 'in', d: Buffer.from(text).toString('base64') })}\n`,
   );
+
+/**
+ * Ask the broker what it is running, the way chat-service/claude-status.js does.
+ *
+ * A reader, not a page: it must not attach to anything, must not start anything,
+ * and must not be counted as a client — otherwise polling status would keep
+ * conversations alive and the badge would be the thing preventing the reap.
+ */
+function status() {
+  return new Promise((resolve, reject) => {
+    const sock = net.connect(SOCKET);
+    let buffered = '';
+    sock.on('error', reject);
+    sock.on('connect', () => sock.write(`${JSON.stringify({ v: 1, op: 'status' })}\n`));
+    sock.on('data', (chunk) => {
+      buffered += chunk.toString();
+      if (!buffered.includes('\n')) return;
+      sock.destroy();
+      try {
+        resolve(JSON.parse(buffered.split('\n')[0]));
+      } catch (err) {
+        reject(err);
+      }
+    });
+  });
+}
 
 /**
  * Run the wrapper the way the extension does: EXEC THE FILE, letting its shebang
@@ -298,6 +343,52 @@ async function main() {
     a.out.includes('after-the-wrapper-left'),
     'the conversation survived that page closing',
   );
+
+  section('It can say whether Claude is working, which nothing else can:');
+  /*
+   * The one fact about a conversation that is not on disk. A transcript records
+   * what was said, not whether anything is still saying it — there is no turn-end
+   * marker in the .jsonl at all — so a device that has just opened a conversation
+   * cannot work out whether to wait for the history or simply reply. This process
+   * holds the stream, so it is the only thing that knows.
+   *
+   * Session `a` above was written to and never answered with a `result`, which is
+   * exactly what a turn in flight looks like.
+   */
+  const startsBeforeStatus = starts();
+  const working = await status();
+  const mine = (working.sessions || []).find((s) => s.cwd === TMP);
+  ok(working.ok === true && Array.isArray(working.sessions), 'the broker answers a status request');
+  ok(mine?.sessionId === 'S1', 'it names the conversation the way a device would ask for it');
+  ok(mine?.working === true, 'a conversation that was sent a message and has not answered is working');
+  ok(mine?.clients === 1, 'the page driving it is counted');
+  ok(starts() === startsBeforeStatus, 'asking for status started no process');
+
+  send(a, 'end-turn\n');
+  await sleep(400);
+  const idle = await status();
+  const after = (idle.sessions || []).find((s) => s.cwd === TMP);
+  ok(after?.working === false, 'and it is not working once the turn has ended');
+  ok(after?.clients === 1, 'asking twice did not attach the reader as a page');
+  // Nothing is claimed about `env`: it is the editor's whole environment, it only
+  // reaches this daemon because the wrapper has to pass it through, and a status
+  // reader has no business seeing it.
+  ok(
+    after && !('env' in after) && !('args' in after),
+    'status does not hand out the environment the panel was launched with',
+  );
+
+  // A `result` arriving a byte at a time is invisible to any single chunk, and the
+  // symptom of missing it is a badge stuck on "working" until the next turn ends —
+  // which is precisely when nobody would think to look at this code.
+  send(a, 'a-new-question\n');
+  await sleep(300);
+  ok(((await status()).sessions || []).find((s) => s.cwd === TMP)?.working === true,
+    'a fresh message puts it back to working');
+  send(a, 'end-turn-slowly\n');
+  await sleep(900);
+  const dribbled = ((await status()).sessions || []).find((s) => s.cwd === TMP);
+  ok(dribbled?.working === false, 'a result split across chunks still ends the turn');
 
   section('A process nobody ever spoke to is not parked for twelve hours:');
   // The panel spawns TWO claudes per page load — a probe with no `--resume` that

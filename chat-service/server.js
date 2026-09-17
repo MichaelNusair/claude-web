@@ -19,6 +19,7 @@ import { WebSocketServer } from 'ws';
 import { SessionManager, PROJECTS_ROOT, DEFAULT_MODEL } from './session-manager.js';
 import { transcribe, voiceStatus, resetConfigCache } from './transcribe.js';
 import { polish } from './polish.js';
+import { claudeStatus } from './claude-status.js';
 import { createAdmin } from './admin.js';
 import {
   AUTH_MODE,
@@ -412,6 +413,42 @@ const server = http.createServer(async (req, res) => {
         'Cache-Control': 'no-store',
       });
       res.end(JSON.stringify({ sessions: manager.liveSummary(), at: Date.now() }));
+      return;
+    }
+
+    /*
+     * Is Claude working in the editor's panel, and what did it last say.
+     *
+     * For the editor surface, not this one: the Claude Code panel reloads the
+     * whole transcript on every page load and renders it oldest-first, so opening
+     * a conversation on a second device means seconds of watching history scroll
+     * before the newest message — the one you need in order to reply — appears.
+     * That is inside a proprietary webview and cannot be changed from here. This
+     * answers the same two questions from outside it, in tens of milliseconds, so
+     * the overlay can say whether the wait is worth it. See claude-status.js.
+     *
+     * Reads only. It cannot start, stop or steer a conversation, and asking is not
+     * counted as a page attaching to one.
+     */
+    if (pathname === '/api/claude-status' && req.method === 'GET') {
+      const cwd = url.searchParams.get('cwd');
+      if (!cwd) {
+        json(res, 400, { error: 'cwd is required' });
+        return;
+      }
+      let status;
+      try {
+        status = await claudeStatus(cwd);
+      } catch (err) {
+        json(res, 400, { error: err.message });
+        return;
+      }
+      res.writeHead(200, {
+        'Content-Type': 'application/json; charset=utf-8',
+        // Polled while a turn is in flight; a cached answer is a wrong answer.
+        'Cache-Control': 'no-store',
+      });
+      res.end(JSON.stringify(status));
       return;
     }
 

@@ -135,8 +135,26 @@ w.addEventListener('error', (e) => fail(`uncaught: ${e.message}`));
 let polishReply = null;
 const polishCalls = [];
 
+/*
+ * What the status route answers, and what it was asked.
+ *
+ * It starts as `null` — the route unreachable — because that is the state the
+ * overlay has to survive silently, and the initial check runs at load, before any
+ * test can intervene. A phone whose chat-service session has lapsed gets a 401
+ * here, and the one thing it must not get is a banner across the editor.
+ */
+let statusReply = null;
+const statusCalls = [];
+
 w.fetch = (url, options = {}) => {
   const target = String(url);
+  if (target.includes('/api/claude-status')) {
+    statusCalls.push(target);
+    if (!statusReply) {
+      return Promise.resolve({ ok: false, status: 401, json: () => Promise.resolve({}) });
+    }
+    return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(statusReply) });
+  }
   if (target.includes('/api/projects')) {
     return Promise.resolve({
       ok: true,
@@ -176,9 +194,30 @@ try {
 }
 
 const doc = w.document;
-for (const id of ['cmo-fab', 'cmo-layout', 'cmo-projects', 'cmo-mic']) {
+for (const id of ['cmo-fab', 'cmo-layout', 'cmo-projects', 'cmo-status', 'cmo-mic']) {
   ok(`#${id} did not mount`, doc.getElementById(id));
 }
+
+// --------------------------------------------------------- is Claude working
+/*
+ * The chip answers, on arrival, the question the Claude panel makes you wait
+ * seconds for: is Claude still working, and if not, what did it last say. The
+ * panel loads the whole transcript on every page load and renders it oldest-first,
+ * so the newest message — the one needed in order to reply — arrives last.
+ *
+ * The failure that matters most is the quiet one. The editor and the chat API are
+ * gated separately, so a device signed into code-server alone gets a 401 here, and
+ * an older deployment has no such route at all. Both must leave the editor exactly
+ * as it was: this thing floats over someone's screen, and being wrong about that
+ * is worse than not being there.
+ */
+await new Promise((resolve) => setTimeout(resolve, 20)); // the check at load
+ok('the status route was never asked, so the chip cannot appear at all', statusCalls.length === 1);
+ok(
+  'an unreachable status route still put a chip over the editor — a lapsed chat ' +
+    'session or an older deployment would show it on every page load',
+  !doc.getElementById('cmo-chip'),
+);
 
 // ------------------------------------------------------------ the load history
 /*
@@ -423,6 +462,98 @@ ok(
 ok(
   'a failed cleanup pass left the dictation in storage as well as on the clipboard',
   !w.localStorage.getItem('cmo-dictation-draft'),
+);
+
+// ---------------------------------------------------- what Claude last said
+/*
+ * The idle branch. This is the one that saves the wait: nothing is running, so
+ * there is nothing to wait for, and the last message is the whole payload.
+ *
+ * The message is model output. It routinely contains code, angle brackets and
+ * things that look like markup, and it lands in a sheet built from a template
+ * string — so the check is not that it renders, but that it renders as *text*.
+ */
+const said = 'Done. Try <img src=x onerror="alert(1)"> and `a < b` in one line.\n\nSecond line.';
+statusReply = {
+  cwd: '/workspace/projects/demo',
+  sessionId: 'abc123',
+  state: 'idle',
+  source: 'broker',
+  clients: 0,
+  last: { role: 'assistant', text: said, at: new Date().toISOString() },
+  bytes: 5.1 * 1024 * 1024,
+  at: Date.now(),
+};
+
+const tapStatus = async () => {
+  doc.getElementById('cmo-status').dispatchEvent(new w.MouseEvent('click', { bubbles: true }));
+  await new Promise((resolve) => setTimeout(resolve, 30));
+};
+
+await tapStatus();
+const chipEl = doc.getElementById('cmo-chip');
+ok('an idle conversation showed no chip, so the last message is still unread', chipEl);
+ok(
+  'the chip does not show what Claude said — the only thing that saves the wait',
+  /Done\. Try/.test(chipEl?.querySelector('.cmo-chip-text')?.textContent ?? ''),
+);
+ok(
+  'the chip is on one line, so a long message pushes the editor around',
+  /nowrap/.test(w.getComputedStyle(chipEl.querySelector('.cmo-chip-text')).whiteSpace || 'nowrap'),
+);
+ok(
+  'an idle conversation is shown with the working animation',
+  !chipEl?.querySelector('.cmo-dot')?.classList.contains('cmo-busy'),
+);
+ok(
+  'the status sheet did not open',
+  sheet.classList.contains('cmo-open') && doc.getElementById('cmo-status-said'),
+);
+ok(
+  'the sheet shows a truncated message — the point of it is that one line was not enough',
+  doc.getElementById('cmo-status-said')?.textContent === said,
+);
+ok(
+  'the message was injected as markup, not text: an <img> from a model reply built ' +
+    'an element in the editor',
+  !doc.querySelector('#cmo-status-said img'),
+);
+ok(
+  'the sheet does not say where the verdict came from — the broker knows, the ' +
+    'transcript only shows the state a conversation was left in',
+  /broker/.test(doc.getElementById('cmo-status-detail')?.textContent ?? ''),
+);
+ok(
+  'the sheet does not say how big the transcript is, which is the only number that ' +
+    'explains the wait',
+  /5\.1 MB/.test(doc.getElementById('cmo-panel')?.textContent ?? ''),
+);
+
+// ------------------------------------------------------------ the other branch
+/*
+ * The working branch. Here the wait *is* worth it — the answer has not been said
+ * yet — so the chip says so and does not offer a stale message as if it were the
+ * reply. Getting this backwards is the expensive direction: it invites typing over
+ * a turn that is still running.
+ */
+statusReply = { ...statusReply, state: 'working', clients: 1 };
+await tapStatus();
+const busyChip = doc.getElementById('cmo-chip');
+ok(
+  'a conversation with a turn in flight is not reported as working',
+  /working/i.test(busyChip?.querySelector('.cmo-chip-text')?.textContent ?? ''),
+);
+ok(
+  'the working chip still shows the previous message, which reads as the reply',
+  !/Done\. Try/.test(busyChip?.querySelector('.cmo-chip-text')?.textContent ?? ''),
+);
+ok(
+  'the working chip is not animated, so it looks the same as a finished one',
+  busyChip?.querySelector('.cmo-dot')?.classList.contains('cmo-busy'),
+);
+ok(
+  'the sheet does not say Claude is working',
+  /working/i.test(doc.querySelector('#cmo-panel .cmo-title')?.textContent ?? ''),
 );
 
 // ------------------------------------------------------------------- results
