@@ -15,7 +15,19 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 USER_NAME="coder"
 SETTINGS="/workspace/code-server-data/User/settings.json"
-WRAPPER="$HERE/wrapper.js"
+WRAPPER="$HERE/wrapper"
+
+# The extension chooses how to launch the wrapper from its file extension: a path
+# ending .js/.mjs/.ts/.tsx/.jsx is run as `node <real claude> <wrapper>`, which
+# feeds an ELF binary to node as its entry script and leaves the panel unable to
+# start Claude at all. See the header of `wrapper`. Refuse the deploy rather than
+# write a setting with that shape into the editor.
+case "$WRAPPER" in
+  *.js | *.mjs | *.cjs | *.ts | *.tsx | *.jsx)
+    echo "wrapper path must have no JS extension, or the extension runs it under node: $WRAPPER" >&2
+    exit 1
+    ;;
+esac
 
 install -m 0644 "$HERE/claude-broker.service" /etc/systemd/system/claude-broker.service
 systemctl daemon-reload
@@ -59,10 +71,17 @@ MERGE
 
 chown "$USER_NAME:$USER_NAME" "$SETTINGS"
 
-# A wrapper the extension cannot execute would leave the panel unable to start
-# Claude at all, which is the one outcome worth failing a deploy over.
+# The extension exec's the wrapper itself rather than passing it to node, so the
+# executable bit is what makes the panel work — and a wrapper the extension cannot
+# execute leaves it unable to start Claude at all, which is the one outcome worth
+# failing a deploy over.
 chmod 0755 "$WRAPPER"
 test -x "$WRAPPER" || { echo "wrapper is not executable: $WRAPPER" >&2; exit 1; }
+
+# The payload is untarred over /opt/claude-web without deleting anything, so the
+# pre-rename `wrapper.js` would otherwise sit here forever next to its replacement:
+# executable, plausible, and fatal to anything pointed back at it.
+rm -f "$HERE/wrapper.js"
 
 systemctl is-active --quiet claude-broker || {
   echo "claude-broker did not start:" >&2

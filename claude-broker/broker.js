@@ -10,7 +10,7 @@
 // project. The panel cannot fix this itself — nothing shares an extension host
 // between two page loads.
 //
-// So the panel's stdio is routed here through claude-broker/wrapper.js, and this
+// So the panel's stdio is routed here through claude-broker/wrapper, and this
 // keeps the process. Both pages then drive the same conversation.
 //
 // It is deliberately BYTE-TRANSPARENT. It does not translate the stream-json
@@ -62,6 +62,10 @@ class Session {
     this.sessionId = null;
     this.lastActivity = Date.now();
     this.exited = false;
+    // Whether anyone has ever sent this process a message. A session that has
+    // not been spoken to holds no conversation: nothing was asked, nothing is
+    // running, and its transcript is empty. See `detach`.
+    this.spokenTo = false;
     // Only used to spot the init event; forwarding never waits on it.
     this.lineBuffer = '';
 
@@ -179,10 +183,27 @@ class Session {
     this.clients.delete(client);
     this.lastActivity = Date.now();
     log(`session ${this.key} detached; clients=${this.clients.size}`);
+
+    // Keeping a watched-by-nobody conversation is the entire point of this
+    // service — but only if there is a conversation. The panel spawns TWO
+    // processes on every page load: a probe (`--permission-mode default`, no
+    // `--resume`) that it never writes a byte to, and then the real one. Left to
+    // IDLE_MS, each page load therefore parked ~205MB for twelve hours; ten of
+    // them were resident on the box (2.0GB of 7.8GB) after an afternoon of
+    // reloading. Measured, not estimated: none of the ten had a transcript.
+    //
+    // Deliberately keyed on input rather than on the `pending:` key, because it
+    // must never abort work. A session that WAS spoken to may have a turn in
+    // flight, so it stays until IDLE_MS even when nothing can name it.
+    if (this.clients.size === 0 && !this.spokenTo && !this.exited) {
+      log(`session ${this.key} never spoken to; stopping rather than parking it`);
+      this.stop();
+    }
   }
 
   write(data) {
     this.lastActivity = Date.now();
+    this.spokenTo = true;
     if (this.proc.stdin.writable) this.proc.stdin.write(data);
   }
 

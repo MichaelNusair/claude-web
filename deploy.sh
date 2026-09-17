@@ -289,7 +289,9 @@ mkdir -p dist/stage/scripts && cp scripts/cc-session.sh dist/stage/scripts/
 # The broker that keeps one `claude` per conversation for the editor's panel. No
 # dependencies beyond node, so it ships as plain files with no npm install.
 mkdir -p dist/stage/claude-broker
-cp claude-broker/broker.js claude-broker/wrapper.js claude-broker/package.json \
+# package.json is not decoration here: `wrapper` has no file extension, so its
+# `"type": "module"` is what makes node load it as an ES module.
+cp claude-broker/broker.js claude-broker/wrapper claude-broker/package.json \
   claude-broker/claude-broker.service claude-broker/install.sh dist/stage/claude-broker/
 mkdir -p dist/stage/vsix
 cp dist/claude-voice.vsix dist/claude-mobile.vsix dist/stage/vsix/

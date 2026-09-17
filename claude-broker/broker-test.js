@@ -19,6 +19,7 @@ import { spawn } from 'child_process';
 import { fileURLToPath } from 'url';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
+const WRAPPER = path.join(HERE, 'wrapper');
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'broker-test-'));
 const SOCKET = path.join(TMP, 'broker.sock');
 const PIDFILE = path.join(TMP, 'starts.log');
@@ -61,15 +62,25 @@ setTimeout(() => process.exit(0), 15000).unref();
 );
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const starts = () =>
+const pids = () =>
   fs.existsSync(PIDFILE)
-    ? fs.readFileSync(PIDFILE, 'utf8').trim().split('\n').filter(Boolean).length
-    : 0;
+    ? fs.readFileSync(PIDFILE, 'utf8').trim().split('\n').filter(Boolean).map(Number)
+    : [];
+const starts = () => pids().length;
+const lastPid = () => pids().at(-1);
+const alive = (pid) => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+};
 
 const SESSION_ARGS = ['--input-format', 'stream-json', '--output-format', 'stream-json'];
 
 /** A wrapper-shaped client: speaks the framing, collects decoded stdout. */
-function connect({ resume }) {
+function connect({ resume, cwd = TMP }) {
   const sock = net.connect(SOCKET);
   const client = { sock, hello: null, out: '', frames: [] };
   let buffered = '';
@@ -94,7 +105,7 @@ function connect({ resume }) {
       sock.write(
         `${JSON.stringify({
           v: 1,
-          cwd: TMP,
+          cwd,
           claude: FAKE,
           args: SESSION_ARGS,
           resume,
@@ -112,14 +123,24 @@ const send = (client, text) =>
   );
 
 /**
- * Run the wrapper the way the extension does: real claude path as the first
- * argument, then the extension's own args. `holdMs` keeps stdin open, because the
- * extension holds it open for the life of the session and closing it immediately
- * would test a case that never happens.
+ * Run the wrapper the way the extension does: EXEC THE FILE, letting its shebang
+ * choose node, with the real claude path as the first argument and the extension's
+ * own args after it.
+ *
+ * Spawning `node wrapper …` here instead would be a comfortable lie. That is what
+ * this test used to do, and it is why a wrapper the extension could not launch at
+ * all passed every check: the extension only runs the configured path under node
+ * when the path looks like JavaScript, and in that branch it puts the real binary
+ * BEFORE the script, so node parses the ELF and the wrapper never runs. See the
+ * header of `wrapper`. Exec it exactly as the extension does, or this file proves
+ * nothing about the panel.
+ *
+ * `holdMs` keeps stdin open, because the extension holds it open for the life of
+ * the session and closing it immediately would test a case that never happens.
  */
 function runWrapper(args, env, { holdMs = 300 } = {}) {
   return new Promise((resolve) => {
-    const child = spawn(process.execPath, [path.join(HERE, 'wrapper.js'), FAKE, ...args], {
+    const child = spawn(WRAPPER, [FAKE, ...args], {
       cwd: TMP, // same cwd as the test's clients, so joining is possible at all
       env: { ...process.env, ...env },
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -133,7 +154,64 @@ function runWrapper(args, env, { holdMs = 300 } = {}) {
   });
 }
 
+const isExecutable = (file) => {
+  try {
+    fs.accessSync(file, fs.constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+/**
+ * How the extension launches the wrapper, checked before anything it does.
+ *
+ * These are trivial, static assertions about a filename, and they are here
+ * because the panel has already been broken by exactly that: `wrapper.js` made
+ * the extension run `node <real claude> wrapper.js`, node parsed the ELF, and the
+ * only symptom was a SyntaxError where Claude should have been. Every behavioural
+ * check below this passed throughout, because they spawned the wrapper themselves
+ * instead of the way the extension does.
+ */
+function checkLaunchContract() {
+  section('The extension can launch the wrapper:');
+  // Reads are guarded rather than allowed to throw: the likeliest way to fail this
+  // section is renaming the wrapper back, and an ENOENT stack trace would bury the
+  // one line that says what to do about it.
+  const read = (file) => (fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : '');
+  ok(
+    fs.existsSync(WRAPPER),
+    'the wrapper is at claude-broker/wrapper — extensionless, as its header explains',
+  );
+  ok(
+    !/\.(js|mjs|cjs|ts|tsx|jsx)$/.test(WRAPPER),
+    'its path has no JS extension, so the extension execs it rather than running it under node',
+  );
+  ok(isExecutable(WRAPPER), 'it is executable, which being exec’d directly requires');
+  ok(
+    read(WRAPPER).startsWith('#!'),
+    'and it opens with a shebang, which is what chooses node for it',
+  );
+
+  ok(
+    /\bWRAPPER="\$HERE\/wrapper"/.test(read(path.join(HERE, 'install.sh'))),
+    'install.sh points the editor setting at that exact file',
+  );
+
+  // Absent when this test runs from the deployed payload, which ships the broker
+  // without deploy.sh.
+  const deployPath = path.join(HERE, '..', 'deploy.sh');
+  if (fs.existsSync(deployPath)) {
+    ok(
+      /claude-broker\/wrapper(?![.\w-])/.test(read(deployPath)),
+      'deploy.sh puts it in the payload, so the box gets this file and not a stale one',
+    );
+  }
+}
+
 async function main() {
+  checkLaunchContract();
+
   const broker = spawn(process.execPath, [path.join(HERE, 'broker.js')], {
     env: { ...process.env, CLAUDE_BROKER_SOCKET: SOCKET },
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -220,6 +298,38 @@ async function main() {
     a.out.includes('after-the-wrapper-left'),
     'the conversation survived that page closing',
   );
+
+  section('A process nobody ever spoke to is not parked for twelve hours:');
+  // The panel spawns TWO claudes per page load — a probe with no `--resume` that
+  // it never writes to, then the real conversation — so this is per page load,
+  // not per conversation. Ten of them were resident on the box at 205MB each.
+  //
+  // These use their own cwd because the fake CLI always announces the same id,
+  // and re-keying a second session onto `TMP|S1` would displace the conversation
+  // the section above is still using.
+  const ALT = fs.mkdtempSync(path.join(os.tmpdir(), 'broker-test-alt-'));
+  const probe = await connect({ resume: null, cwd: ALT });
+  await sleep(500);
+  const probePid = lastPid();
+  ok(probe.hello?.ok === true && alive(probePid), 'the probe runs while its page is open');
+  // Destroyed rather than detached politely: a torn-down extension host is how
+  // this actually happens.
+  probe.sock.destroy();
+  await sleep(800);
+  ok(!alive(probePid), 'and is stopped when that page goes away, not held until IDLE_MS');
+
+  const spoken = await connect({ resume: null, cwd: ALT });
+  await sleep(500);
+  const spokenPid = lastPid();
+  send(spoken, 'a-real-first-message\n');
+  await sleep(400);
+  spoken.sock.destroy();
+  await sleep(800);
+  ok(
+    alive(spokenPid),
+    'but a conversation that was spoken to still outlives its last page — the point of all this',
+  );
+  fs.rmSync(ALT, { recursive: true, force: true });
 
   broker.kill('SIGTERM');
   await sleep(500);

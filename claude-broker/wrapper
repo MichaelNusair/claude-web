@@ -3,13 +3,35 @@
 // Stands in for the `claude` binary when the VS Code extension launches it.
 //
 // The extension's setting `claudeCode.claudeProcessWrapper` is documented as
-// "Executable path used to launch the Claude process", and the bundle calls it
-// like this:
+// "Executable path used to launch the Claude process", and the bundle pairs it
+// with the real binary like this:
 //
 //   pathToClaudeCodeExecutable: <wrapper>
 //   executableArgs: [<real claude path>]      then the extension's own args
 //
-// so argv is: [node, wrapper.js, /path/to/real/claude, --output-format, ...].
+// It then decides HOW to run that path, and it decides from the FILE EXTENSION
+// alone (2.1.274, `qW0` and the process transport):
+//
+//   function qW0($){return![".js",".mjs",".tsx",".ts",".jsx"].some((Q)=>$.endsWith(Q))}
+//   let b=qW0(G),               // G = the configured wrapper path
+//       p=b?G:Y,                // Y is the JS runtime, "node" (or "bun")
+//       C=b?[...z,...d]         // exec'd:      wrapper <real claude> <args>
+//         :[...z,G,...d];       // under node:  node <real claude> wrapper <args>
+//
+// That second branch is a trap, because `executableArgs` comes FIRST: node is
+// handed the real `claude` as its entry script, tries to parse an ELF binary as
+// JavaScript, and the panel dies before this file runs at all —
+// `SyntaxError: Invalid or unexpected token`. It shipped that way once, on
+// 2026-09-17, for no reason other than that this file was called `wrapper.js`.
+//
+// SO THIS FILE HAS NO EXTENSION, DELIBERATELY. Do not rename it to wrapper.js,
+// or .mjs/.ts/.tsx/.jsx: the name is the launch contract, and broker-test.js
+// checks it. It is still an ES module — for an extensionless entry point Node
+// takes that from the sibling package.json's `"type": "module"`. Being exec'd
+// directly also means the shebang above and the executable bit are load-bearing;
+// install.sh enforces both.
+//
+// Exec'd, argv is: [node, wrapper, /path/to/real/claude, --output-format, ...].
 //
 // Why it exists: the panel's `claude` is a child of the extension host, and
 // code-server builds one extension host PER BROWSER PAGE. Two devices therefore

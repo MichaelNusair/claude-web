@@ -57,7 +57,7 @@ your-domain.com
   │     └── /api/transcribe → whisper.cpp, on-box, no API key
   │
   ├── code-server + official anthropic.claude-code extension
-  │     └── its Claude launched via claude-broker/wrapper.js
+  │     └── its Claude launched via claude-broker/wrapper
   │
   ├── claude-broker service
   │     ├── one `claude` per conversation, outliving every browser page

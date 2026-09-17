@@ -88,8 +88,10 @@ claude-broker/           Keeps the editor panel's `claude` alive and shared
                          between devices. No dependencies beyond node.
   broker.js              The daemon: one process per (cwd, session id), byte
                          transparent, replays the stream to a joining page.
-  wrapper.js             What the extension launches instead of `claude`. Every
+  wrapper                What the extension launches instead of `claude`. Every
                          failure path execs the real binary — keep it that way.
+                         No file extension, on purpose: see its header, and do
+                         not rename it to wrapper.js.
   broker-test.js         Boots the real broker over a real socket against a fake
                          CLI. Proves sharing, and proves the fallback.
   install.sh             Installs the unit and the editor setting. In the payload
@@ -278,7 +280,7 @@ is take the process out of the extension host altogether:
 conversation, and the extension's own
 `claudeCode.claudeProcessWrapper` setting — "Executable path used to launch the
 Claude process" — points the panel at
-[`claude-broker/wrapper.js`](claude-broker/wrapper.js) instead of the binary. The
+[`claude-broker/wrapper`](claude-broker/wrapper) instead of the binary. The
 wrapper hands its stdio to the broker and every page attaches to the same process.
 The panel is not modified, not patched, and does not know: it sees an ordinary
 stream-json conversation on stdio.
@@ -295,6 +297,29 @@ so `process.argv[2]` is the binary and `slice(3)` is everything the extension
 wanted. Setting a wrapper also makes the extension resolve permission mode itself
 (`resolvePermissionModeInCli: !W0("claudeProcessWrapper")`), which is why the
 wrapper must pass the args through untouched.
+
+**"Exec'd" is conditional, and the condition is the wrapper's file extension.**
+Reading only the pairing above is how the panel came to be broken on 2026-09-17.
+The other half of the bundle turns that pair into a command line, and it branches
+on the configured path's extension:
+
+```js
+function qW0($){return![".js",".mjs",".tsx",".ts",".jsx"].some((Q)=>$.endsWith(Q))}
+let b=qW0(G),          // G = the configured wrapper path
+    p=b?G:Y,           // Y is the JS runtime, "node"
+    C=b?[...z,...d]    // exec'd:     wrapper <real claude> <args>
+      :[...z,G,...d];  // under node: node <real claude> wrapper <args>
+```
+
+`executableArgs` comes first in both branches, so a wrapper named `wrapper.js`
+hands node the real `claude` as its entry script: node parses an ELF binary as
+JavaScript and the panel reports `SyntaxError: Invalid or unexpected token` with
+Claude never having started. Hence the extensionless filename, its `"type":
+"module"` from the sibling `package.json`, its shebang, and its executable bit —
+all four are load-bearing, `install.sh` refuses a JS-looking path, and
+`broker-test.js` exec's the file exactly as the extension does rather than
+spawning `node wrapper`. A test that builds its own argv proves nothing about the
+panel; that is why the break got through a green suite.
 
 **The wrapper fails safe, and every change to it must keep doing so.** It sits in
 front of the only interface the user has, so no broker, a stale socket, a refused
@@ -529,6 +554,17 @@ Things that have burned people, in this codebase specifically:
   64 MB the session stops accepting new pages instead of handing one a broken
   stream — and a refused page just gets its own process, which is only the old
   behaviour. Do not "fix" the cap by replaying a suffix.
+- **The panel spawns two `claude` processes per page load, and only speaks to
+  one.** Before the conversation itself it starts a probe — `--permission-mode
+  default`, no `--resume` — that it never writes a byte to. Through the broker
+  that probe became a resident process nobody could ever name, because a session
+  with no id is keyed `pending:` and only the CLI's init event (which needs input)
+  re-keys it. Ten of them were live on the box at ~205 MB each, 2.0 GB of 7.8 GB,
+  one per reload. So `Session#detach` stops a session that has never been written
+  to once its last client leaves. Keyed on input, not on the `pending:` key,
+  deliberately: a session that *was* spoken to may have a turn in flight and must
+  survive to `IDLE_MS` even when nothing can name it. If you widen that condition,
+  the thing you are risking is killing live work.
 - **A deploy cannot apply an `infra/userdata/bootstrap.sh` edit to a running
   instance.** cloud-init runs `scripts-user` once per instance *ever*
   (`/var/lib/cloud/instances/<id>/sem/config_scripts_user`), so `/opt/bootstrap.sh`
