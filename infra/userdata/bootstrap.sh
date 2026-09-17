@@ -40,8 +40,11 @@ DATA_MNT="/workspace"
 # extension's CLI dies with it. A session started under tmux is parented to
 # systemd instead, so it survives closing the editor, a code-server restart, and
 # a redeploy — and several devices can attach to the same live session at once.
+# zsh is the interactive shell for this box (see the User section below). It is
+# in the required list rather than the optional one because the login shell is
+# set to it: a missing zsh would leave the user with no working shell at all.
 dnf install -y git tar gzip unzip jq nginx gcc gcc-c++ make cmake python3 python3-pip \
-  openssl shadow-utils nvme-cli xfsprogs tmux
+  openssl shadow-utils nvme-cli xfsprogs tmux zsh
 # ripgrep is not in the AL2023 repos; Claude Code ships its own, so this is
 # only a convenience for interactive shell use.
 dnf install -y ripgrep || echo "ripgrep unavailable in repos; skipping"
@@ -53,7 +56,16 @@ dnf install -y nodejs
 # ---------------------------------------------------------------------------
 # User
 # ---------------------------------------------------------------------------
-id -u "$USER_NAME" &>/dev/null || useradd -m -s /bin/bash "$USER_NAME"
+id -u "$USER_NAME" &>/dev/null || useradd -m -s /bin/zsh "$USER_NAME"
+
+# Also switch an account created by an earlier deploy, when bash was the default.
+# Only when it differs, so the log says something when it actually changes — and
+# so a shell deliberately changed on the box to something else is left alone.
+CURRENT_SHELL="$(getent passwd "$USER_NAME" | cut -d: -f7)"
+if [ "$CURRENT_SHELL" = /bin/bash ]; then
+  usermod -s /bin/zsh "$USER_NAME"
+  echo "login shell for $USER_NAME: $CURRENT_SHELL -> /bin/zsh"
+fi
 
 # ---------------------------------------------------------------------------
 # Persistent data volume
@@ -139,6 +151,89 @@ sudo -u "$USER_NAME" bash -euxo pipefail <<VOLLINK
 cd /home/$USER_NAME
 [ -L .claude ] || { rm -rf .claude; ln -s "$DATA_MNT/claude" .claude; }
 VOLLINK
+
+# ---------------------------------------------------------------------------
+# Interactive shell (zsh)
+# ---------------------------------------------------------------------------
+# The environment this box needs in a shell — Bedrock region and model, the
+# GitHub token resolver — is in /etc/profile.d, which is a bash convention. It
+# keeps working under zsh only because AL2023's zsh package wires it up: its
+# /etc/zshrc sources /etc/profile.d/*.sh under `emulate -L ksh` for non-login
+# shells (what a code-server terminal is), and its /etc/zprofile sources
+# /etc/profile for login shells. Verify that still holds before moving this box
+# to a distro whose zsh does not, or `claude` in a terminal loses its model.
+#
+# Our own defaults go in a separate file that this script owns and rewrites, with
+# ~/.zshrc only sourcing it. That way improvements land on an existing box on the
+# next deploy, while anything the user adds to ~/.zshrc survives — the same
+# reason the editor settings above are merged rather than overwritten. `emulate
+# -L ksh` is why they cannot live in /etc/profile.d instead: it localises
+# options, so a `setopt` there would be reverted as the file finished loading.
+install -d -o "$USER_NAME" -g "$USER_NAME" "$DATA_MNT/shell"
+# Two heredocs: this one expands $DATA_MNT, the one below must not expand
+# anything (it is full of `$vcs_info_msg_0_` and prompt escapes). The usual
+# placeholder + sed would have done it in one, but every placeholder in this file
+# is diffed against stack.js (see AGENTS.md) and this value is not one of those:
+# it is substituted here, so adding one would only break that check.
+cat > /etc/claude-web-zshrc <<ZSHRCPATHS
+# Managed by claude-web's bootstrap.sh — rewritten on every deploy.
+# Put your own settings in ~/.zshrc, below the line that sources this file.
+
+# History on the persistent volume: /home is on the root volume and does not
+# survive an instance replacement.
+HISTFILE=$DATA_MNT/shell/zsh_history
+ZSHRCPATHS
+cat >> /etc/claude-web-zshrc <<'ZSHRC'
+
+# Completion. Nothing else calls compinit: the package puts it in the skeleton
+# ~/.zshrc, which is only copied for a home directory created after zsh was
+# installed, and this one is not. `-u` because a group-writable directory in
+# $fpath otherwise turns every shell's first prompt into a security prompt.
+autoload -Uz compinit && compinit -u
+setopt COMPLETE_IN_WORD
+
+# Shared between shells, because the usual reason to want history here is a
+# command typed on a phone and repeated on a laptop. SHARE_HISTORY also appends
+# each command as it is typed, which matters more here than it looks: a shell in
+# a tab dies with the tab, and that is the normal way a shell ends on this
+# surface — history written only at exit would be history mostly lost.
+HISTSIZE=50000
+SAVEHIST=50000
+setopt SHARE_HISTORY EXTENDED_HISTORY HIST_IGNORE_DUPS
+setopt HIST_IGNORE_SPACE HIST_REDUCE_BLANKS
+
+# A short prompt: two lines, so a long path or a deep repo does not leave three
+# columns to type in on a phone, and the command always starts at the margin.
+setopt PROMPT_SUBST
+autoload -Uz vcs_info
+# Branch in one of the basic eight colours, not a 256-colour grey: %F{242} is
+# only valid where terminfo reports 256 colours, and zsh emits a malformed escape
+# rather than falling back where it does not — an ssm session is often plain
+# `xterm`, even though the editor's terminal is `xterm-256color`.
+zstyle ':vcs_info:git:*' formats ' %F{yellow}%b%f'
+precmd() { vcs_info }
+PROMPT='%F{cyan}%~%f${vcs_info_msg_0_}
+%(?..%F{red}%? %f)%# '
+
+# Arrow keys search the history for what has already been typed, which on a
+# phone keyboard is the difference between recalling a command and retyping it.
+autoload -Uz up-line-or-beginning-search down-line-or-beginning-search
+zle -N up-line-or-beginning-search
+zle -N down-line-or-beginning-search
+bindkey '^[[A' up-line-or-beginning-search
+bindkey '^[[B' down-line-or-beginning-search
+
+setopt AUTO_CD INTERACTIVE_COMMENTS NO_BEEP
+ZSHRC
+
+# Append the source line only if it is missing, so this is idempotent and does
+# not disturb whatever else the user has put in the file.
+sudo -u "$USER_NAME" bash -euo pipefail <<ZSHLINK
+cd /home/$USER_NAME
+touch .zshrc
+grep -q '^source /etc/claude-web-zshrc' .zshrc ||
+  printf '%s\n' 'source /etc/claude-web-zshrc' >> .zshrc
+ZSHLINK
 
 # ---------------------------------------------------------------------------
 # Secrets
@@ -386,6 +481,7 @@ cat > /tmp/mobile-defaults.json <<'SETTINGS'
   "breadcrumbs.enabled": false,
   "window.menuBarVisibility": "hidden",
   "terminal.integrated.fontSize": 13,
+  "terminal.integrated.defaultProfile.linux": "zsh",
   "editor.fontSize": 15,
   "editor.lineHeight": 1.6,
   "editor.minimap.enabled": false,
