@@ -159,11 +159,33 @@ chat-service/            The chat backend + PWA client. The security boundary.
   status-test.js         That the two sources stay separated: a broker answer
                          wins, a missing one falls back, and neither may claim a
                          conversation is idle when that is not known.
+  push.js                Web Push, hand-rolled on node crypto: VAPID (ES256) and
+                         RFC 8291 aes128gcm, plus the device list. No dependency
+                         on purpose — see its header. Keys live under CLAUDE_HOME
+                         so a deploy cannot invalidate a phone's subscription.
+  push-test.js           The encryption against RFC 8291's published vector, byte
+                         for byte and step by step, and a fake push service over
+                         real HTTP for the sending, pruning and refusals.
+  turn-watcher.js        What actually decides your phone should buzz: polls the
+                         transcripts every 5s for a turn that just ended in a
+                         session this app is NOT running, and sends one
+                         notification per conversation.
+  turn-watcher-test.js   Mostly about silence — a restart, a rewritten
+                         transcript, a mid-turn write and this app's own
+                         conversations must all announce nothing.
+  manifest.js            One web app manifest per project, so a project can have
+                         its own home-screen icon and therefore its own window on
+                         Android. Differs only in `id`, `start_url`, name.
+  manifest-test.js       That a project's manifest stays installable and stays in
+                         step with pwa/manifest.webmanifest, which it duplicates.
   transcribe.js          Voice: local whisper.cpp, optional Azure override.
   polish.js              Makes a finished dictation readable: punctuation,
                          capitals, misheard names. Bedrock Haiku, one bounded
                          pass, returns the raw transcript on any failure.
   smoke-test.js          Boots app.js in jsdom — catches load-time breakage.
+                         Also the notification switch, against stubbed
+                         Notification/PushManager/serviceWorker: every way that
+                         switch can lie is invisible from a desktop browser.
   polish-test.js         The cleanup's guard rails: what `looksLikeCleanup`
                          must reject, and that every failure path hands the
                          raw transcript back.
@@ -520,6 +542,86 @@ to turn a caller-supplied string into a signal for an arbitrary process.
 `admin-test.js` tests the refusals hardest, and `deploy.sh` will not deploy without
 it.
 
+## Being told a turn ended
+
+The thing that made this box worth building is starting a turn and walking away.
+Which leaves one question — *is it done yet* — and three answers, deliberately
+separate, because they fail in different places and one of them can wake a phone up
+at night.
+
+**A conversation this app is running announces itself on screen.** `announce()` in
+`app.js`: a toast, and a buzz through the Vibration API. It knows the turn ended
+because it is holding the socket, so nothing has to be polled or guessed.
+
+**A conversation this app is *not* running is watched from the transcripts.**
+`chat-service/turn-watcher.js`, started by `server.js`, polls every five seconds
+and sends a Web Push notification when a session in the editor panel or under tmux
+finishes a turn. It reads the same `lastExchange()` as `claude-status.js` rather
+than asking the broker, because the broker has no such event to subscribe to and
+adding one means restarting it — which ends every live conversation, the cgroup rule
+again. Its whole design is about not buzzing for nothing, and each rule is there
+because the failure it prevents would make the feature something you turn off:
+
+- **Nothing is announced for what was already finished when the watcher started.**
+  The first scan seeds silently, so a deploy does not replay the day.
+- **This app's own conversations are excluded**, by session id from
+  `manager.liveSummary()`, *including after they exit* — otherwise a chat you were
+  just reading buzzes as you close the app. That is also why `announce()` keeps its
+  toast and its buzz: the two surfaces do not overlap, so neither is redundant.
+- **One notification per conversation**, with a per-conversation `Topic` and `tag`
+  and `renotify: true`, so a second answer replaces the first rather than stacking
+  behind it.
+- **Nothing older than ten minutes**, and a content digest so a rewritten
+  transcript is not a new answer.
+
+Push itself is `chat-service/push.js`, hand-rolled: VAPID plus RFC 8291, ~400 lines
+of node crypto and no new dependency on a box whose whole job is running shell
+commands. The keypair and the device list live under `CLAUDE_HOME` (not in
+`/opt/claude-web`, which a deploy replaces), so shipping does not silently
+unsubscribe every phone. All four `/api/push/*` routes are gated and listed in
+`auth-test.js`: a subscription endpoint is a capability to write on the operator's
+lock screen, and the list of them is an inventory of their devices.
+
+**A conversation you are looking at in the editor is polled while you look.** The
+overlay's status sheet re-asks `/api/claude-status` every five seconds while it is
+the sheet on screen, and reads a newly changed message aloud. Bounded by that sheet
+on purpose — a phone that starts talking on its own in a meeting is worse than one
+that stays quiet — and unbounded speech is fenced by the same rule: only while the
+sheet is open, only when the *text* changed, never on a change of conversation.
+This is independent of push and must stay that way; the sheet works with
+notifications refused, and notifications work with the sheet never opened.
+
+## A window per project, on a phone
+
+On a laptop each project can have its own window. On Android it cannot: Chrome
+gives an installed web app exactly one window, and there is no API that opens a
+second — this was checked before anything was built, and the answer does not depend
+on our code.
+
+What *is* per-app is identity. A manifest whose `id` differs describes a distinct
+application even when served from the same URL, and a distinct application on
+Android is a distinct home-screen icon with its own task in the recents switcher.
+So `chat-service/manifest.js` hands out one manifest per project — same origin,
+same code, same login, same push subscription, differing in `id`, `start_url` and
+the name under the icon — and `start_url` is `/editor/?folder=<path>`, so tapping a
+project's icon lands exactly where tapping it in the project switcher does. One
+install per project, once, and the second window the user asked for.
+
+**The `<link rel="manifest">` has to be injected into the editor's document**, which
+is why `pwa/mobile-overlay.js` does it (`linkProjectManifest`) rather than the chat
+app: a browser installs the manifest linked from the page you install *from*, and
+that page is code-server's, which ships no manifest at all. The overlay replaces any
+existing link rather than appending — the first one found wins, so appending would
+silently install the wrong app — and keeps `crossorigin="use-credentials"` for the
+same reason the chat's own link does. The install itself is a button in the project
+sheet, using `beforeinstallprompt` where Chrome offers it and telling the user which
+menu item to use where it does not (every iOS browser).
+
+`GET /manifest.webmanifest?project=<name>` is gated like everything else, and is in
+`auth-test.js` for a reason that is easy to miss: it answers 200 for a project that
+exists and 404 for one that does not, so ungated it would enumerate the project
+tree by guessing names.
+
 ## Gotchas that look like bugs
 
 Things that have burned people, in this codebase specifically:
@@ -580,9 +682,16 @@ Things that have burned people, in this codebase specifically:
   front, because the other way this shows up is a configured profile that no
   longer exists — an instance replacement takes `~/.aws` with the root volume
   while `awsProfile` in the config keeps naming it.
-- **The service worker deliberately unregisters itself.** It caches nothing. A
-  stale cached shell breaks a live WebSocket client rather than helping, and a
-  wedged worker has no user-side escape. Do not add caching.
+- **The service worker exists for notifications and has no `fetch` handler.** That
+  absence is the point: a worker that mishandles a request wedges the app in a way
+  the app cannot fix, because the page never loads and so the code that would
+  replace the worker never runs either. That happened once, which is why the
+  previous version of `pwa/sw.js` existed only to unregister itself. It caches
+  nothing — a stale shell breaks a live WebSocket client rather than helping — and
+  a browser will not deliver a push to anything but a worker, which is the only
+  reason one is registered again. It is also registered only when the switch in
+  settings is turned on, never merely by opening the app, and `/chat/reset.html`
+  remains the escape hatch. Do not add caching, and do not add `fetch`.
 - **The overlay drives the editor through keyboard chords, and both ends have to
   agree.** `pwa/mobile-overlay.js` cannot call a VS Code command — there is no
   supported global for the workbench's command service, and rewriting the bundle
@@ -926,8 +1035,9 @@ There is no staging environment, so local verification is what you have:
 
 ```bash
 npm test                                   # auth + client + panes + overlay + polish
-                                           # + project lifecycle + operations surface
-                                           # + conversation status + broker
+                                           # + project lifecycle + per-project manifest
+                                           # + operations surface + conversation status
+                                           # + push + turn watcher + broker
 cd infra && npx cdk synth --quiet          # stack compiles
 bash -n deploy.sh migrate.sh infra/userdata/bootstrap.sh claude-broker/install.sh
 node --check chat-service/server.js

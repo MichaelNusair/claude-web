@@ -92,6 +92,14 @@ your-domain.com
   threads — tapping one rejoins it exactly as another device would. Neither closing
   a tab nor switching conversations stops anything: it goes on running on the box,
   it just is not being watched.
+- **A notification when a session you are not watching finishes** — the editor
+  panel, or anything under tmux: the runs you start and walk away from. Your phone
+  buzzes with the project and the first line or so of the answer; tapping it just
+  dismisses it. One notification per conversation, replaced rather than stacked when
+  that conversation answers again, and nothing for anything older than ten minutes.
+  Chats inside this app are deliberately excluded — they already announce themselves
+  on screen. Off until you turn it on in Settings, which asks the OS once and sends
+  a test notification so you find out immediately rather than hours later.
 - **Drafts survive the app going away** — a half-typed or half-dictated message is
   saved as you write it and restored with the conversation, because a phone browser
   reloads a backgrounded tab whenever it likes and a paragraph of dictation exists
@@ -276,6 +284,17 @@ official extension's panel, sharing one conversation across your devices through
 the broker described above. A terminal session is one setting away
 (`claudeMobile.claudeSurface: tmux`).
 
+The status button answers **is Claude working, and what did it last say** without
+waiting out the panel's own history load — a phone that has just come back from
+sleep otherwise shows an empty transcript for several seconds. One tap gives a
+line; tapping that opens the whole of the last message, with **Read aloud** for
+when it is longer than a phone screen. While that sheet is open it re-asks every
+five seconds and reads a newly arrived message out by itself, so watching a turn
+finish costs nothing at all — bounded by the sheet, because a phone that starts
+talking on its own after you have put it down is worse than one that stays quiet.
+It names the conversation it is talking about, since the panel and the chat app can
+be in different ones.
+
 The terminal button opens a second, plain shell, also in the editor area, and
 pressing it again hands the window back to Claude — with tabs hidden, the two just
 take turns. It reuses the shell you already had rather than opening another,
@@ -355,9 +374,17 @@ blast radius: [docs/SECURITY.md](docs/SECURITY.md). Found a hole? Please report 
 ## Install as an app
 
 Open the URL, sign in, then **Add to Home Screen** (iOS Safari) or the install icon
-in the address bar (Chrome/Edge/Android). The service worker deliberately caches
-nothing — the app is a live WebSocket client, and a stale cached shell would break
-it rather than help.
+in the address bar (Chrome/Edge/Android). The service worker exists only to receive
+notifications: it caches nothing and intercepts no requests — the app is a live
+WebSocket client, and a stale cached shell would break it rather than help.
+
+**A project can have its own icon, and therefore its own window.** Open the project
+in `/editor/`, then the project button on the floating bar → **Give &lt;project&gt; its
+own window**. It lands on the home screen as its own app: tapping it opens the
+editor on that project, in its own task in the app switcher, beside whatever else
+you had open. This is the only way to get a second window on Android — Chrome gives
+an installed web app exactly one, and no API opens another — so it is one install
+per project, once. Same origin, same login, same notifications.
 
 ## Cost
 
