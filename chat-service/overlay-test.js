@@ -115,8 +115,15 @@ const virtualConsole = new VirtualConsole();
 virtualConsole.on('jsdomError', () => {});
 virtualConsole.on('error', (m) => fail(`console error: ${m}`));
 
+/*
+ * The head starts with a manifest link that is not this project's, because that is
+ * the case that fails silently: a browser installs the first manifest it finds, and
+ * code-server is free to grow one of its own between releases. The switcher section
+ * below checks that exactly one survives, and which.
+ */
 const dom = new JSDOM(
-  '<!doctype html><html><head></head><body><iframe id="panel" srcdoc="<p>webview</p>"></iframe></body></html>',
+  '<!doctype html><html><head><link rel="manifest" href="/editor/manifest.json"></head>' +
+    '<body><iframe id="panel" srcdoc="<p>webview</p>"></iframe></body></html>',
   {
     runScripts: 'outside-only',
     // Any HTTPS origin will do; localStorage needs a real one.
@@ -356,11 +363,178 @@ ok(
 );
 ok('a project that is not open was marked as open', otherItem && !otherItem.dataset.open);
 
-currentItem?.dispatchEvent(new w.MouseEvent('click', { bubbles: true }));
+/*
+ * Switching project used to cost you the window you were in: the sheet assigned
+ * `location.href`, so project B replaced project A and nothing offered a second
+ * one. The chat app already gives a project its own window; this is the editor
+ * catching up, and the mechanism is that a project row is a real link.
+ *
+ * jsdom cannot open tabs or long-press, so what is checked here is the contract
+ * that makes both possible in a browser: a real `href` on every row (the only
+ * thing a long-press menu can act on — and the only route to a separate *window*),
+ * a `target="_blank"` sibling for a new tab, and which of the two this file
+ * handles itself. That last one is the part that breaks silently: swallow the
+ * click on the ⧉ anchor and it stops opening a tab, with nothing to show for it.
+ */
+const rows = [...doc.querySelectorAll('.cmo-item-row')];
+ok('a project is no longer a row that can hold a second control', rows.length === 2);
+ok(
+  'a project row is not a link, so a long press offers nothing to open elsewhere',
+  items.length === 2 &&
+    items.every((el) => el.tagName === 'A' && /^\/editor\/\?folder=/.test(el.getAttribute('href'))),
+);
+ok(
+  'the project row links somewhere other than the folder it names',
+  otherItem?.getAttribute('href') === `/editor/?folder=${encodeURIComponent('/workspace/projects/other')}`,
+);
+
+const newTabs = [...doc.querySelectorAll('.cmo-item-new')];
+ok('no "open in a new tab" control was offered per project', newTabs.length === 2);
+ok(
+  'the new-tab control does not open a new tab, or leaks the opener to it',
+  newTabs.every(
+    (el) => el.getAttribute('target') === '_blank' && /noopener/.test(el.getAttribute('rel') || ''),
+  ),
+);
+ok(
+  'the new-tab control points somewhere other than its own project',
+  newTabs.some(
+    (el) =>
+      el.getAttribute('href') ===
+      `/editor/?folder=${encodeURIComponent('/workspace/projects/other')}`,
+  ),
+);
+
+/*
+ * Who handles the tap. The row is this file's business — a plain tap still means
+ * "open it here", so the anchor's own navigation has to be suppressed. The ⧉ is
+ * the browser's business, and a `preventDefault` anywhere near it would quietly
+ * turn it into a button that does nothing.
+ */
+const rowTap = new w.MouseEvent('click', { bubbles: true, cancelable: true });
+otherItem?.dispatchEvent(rowTap);
+ok('a tap on the project row was left to the anchor, opening it twice', rowTap.defaultPrevented);
+ok(
+  'tapping another project closed the sheet, which hides the switch from the user',
+  sheet.classList.contains('cmo-open'),
+);
+
+const newTabTap = new w.MouseEvent('click', { bubbles: true, cancelable: true });
+newTabs[0]?.dispatchEvent(newTabTap);
+ok(
+  'something swallowed the tap on ⧉, so it no longer opens a tab',
+  !newTabTap.defaultPrevented,
+);
+
+// ------------------------------------------------- a window per project
+/*
+ * A home-screen icon per project, which on Android is the only way to have two
+ * projects open at once.
+ *
+ * A phone gives an installed web app exactly one window and no API opens a second,
+ * so the lever is app *identity*: a manifest with an unfamiliar `id` is a distinct
+ * application even when served from the same URL, and a distinct application is a
+ * distinct icon with its own task. chat-service/manifest-test.js covers the ids
+ * themselves; what is checked here is the half that lives in the page, and every
+ * one of these fails silently on a phone if it is wrong:
+ *
+ *   the link is in *this* document, because the manifest a browser installs is the
+ *   one linked from the page you install from, and this page is code-server's;
+ *
+ *   exactly one link survives, because the first one found is the one installed;
+ *
+ *   `use-credentials`, because a manifest is fetched with credentials omitted by
+ *   default and the route serving it is behind the session gate — without it the
+ *   fetch is a 401 and the install offer never appears at all;
+ *
+ *   `beforeinstallprompt` is captured rather than left alone, because the offer
+ *   belongs next to the project it is about, not in a strip across the workbench.
+ */
+const links = [...doc.head.querySelectorAll('link[rel="manifest"]')];
+ok(
+  'more than one manifest is linked, and the browser installs whichever comes ' +
+    'first — the foreign one was left in front of this project’s',
+  links.length === 1,
+);
+ok(
+  'the linked manifest is not this project’s, so installing gives another icon for ' +
+    'whatever that one describes',
+  links[0]?.getAttribute('href') === '/chat/manifest.webmanifest?project=demo',
+);
+ok(
+  'the manifest is linked without use-credentials — it is fetched with credentials ' +
+    'omitted by default, so the gated route answers 401 and nothing is installable',
+  links[0]?.getAttribute('crossorigin') === 'use-credentials',
+);
+
+const openSwitcher = async () => {
+  doc.getElementById('cmo-projects').dispatchEvent(new w.MouseEvent('click', { bubbles: true }));
+  await new Promise((resolve) => setTimeout(resolve, 20));
+};
+
+ok(
+  'the switcher does not offer this project its own window, which is the whole ' +
+    'feature — and the only place it can be offered is next to the project list',
+  doc.getElementById('cmo-install'),
+);
+ok(
+  'the install button does not name the project it would install, so it reads as ' +
+    '"install this website"',
+  /demo/.test(doc.getElementById('cmo-install')?.textContent ?? ''),
+);
+ok(
+  'the sheet does not explain that a phone gives one window per installed app — ' +
+    'without it, an icon per project looks like clutter rather than the answer',
+  /one window/.test(doc.getElementById('cmo-panel')?.textContent ?? ''),
+);
+
+/*
+ * With no `beforeinstallprompt` in hand there is nothing to prompt with — the app
+ * is already installed, or this is a browser that never fires it (every one on
+ * iOS). The manifest is linked either way, so the browser's own menu installs the
+ * same thing, and saying so is the whole job of the button in that state.
+ */
+doc.getElementById('cmo-install').dispatchEvent(new w.MouseEvent('click', { bubbles: true }));
+await new Promise((resolve) => setTimeout(resolve, 10));
+ok(
+  'a browser with no install event was told nothing, so the button looks broken on ' +
+    'every iPhone',
+  /Home screen/i.test(doc.getElementById('cmo-install-status')?.textContent ?? ''),
+);
+
+// Chrome's event, as far as this feature can tell one from the real thing.
+let prompts = 0;
+const installEvent = new w.Event('beforeinstallprompt', { cancelable: true });
+installEvent.prompt = () => {
+  prompts += 1;
+  return Promise.resolve();
+};
+installEvent.userChoice = Promise.resolve({ outcome: 'accepted' });
+w.dispatchEvent(installEvent);
+ok(
+  'the mini-infobar was left to appear across the workbench, where there is no room ' +
+    'for it and no explanation of what it is offering',
+  installEvent.defaultPrevented,
+);
+
+await openSwitcher();
+doc.getElementById('cmo-install').dispatchEvent(new w.MouseEvent('click', { bubbles: true }));
+await new Promise((resolve) => setTimeout(resolve, 10));
+ok('the install button never showed the browser’s own prompt', prompts === 1);
+ok(
+  'an accepted install said nothing, so there is no way to tell it worked from ' +
+    'inside the window it was done from',
+  /home screen/i.test(doc.getElementById('cmo-install-status')?.textContent ?? ''),
+);
+
+// Re-queried, because the sheet has been drawn again since `currentItem` was found
+// and a tap on the node it replaced proves nothing about the sheet on screen.
+const openRow = [...doc.querySelectorAll('.cmo-item')].find((el) => el.dataset.open === '1');
+openRow?.dispatchEvent(new w.MouseEvent('click', { bubbles: true }));
 ok(
   'tapping the already-open project did not just close the sheet — it reloads the ' +
     'editor for nothing',
-  !sheet.classList.contains('cmo-open'),
+  openRow && !sheet.classList.contains('cmo-open'),
 );
 
 // ----------------------------------------------------------- dictation drafts

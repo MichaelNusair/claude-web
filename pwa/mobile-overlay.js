@@ -214,9 +214,19 @@
   .cmo-item {
     display: block; width: 100%; text-align: left; padding: 14px 12px;
     background: none; border: none; border-bottom: 1px solid #34342f;
-    color: #f5f4ef; font: 15px inherit; cursor: pointer;
+    color: #f5f4ef; font: 15px inherit; cursor: pointer; text-decoration: none;
   }
   .cmo-item:active { background: #272725; }
+  /* A project and its "open in a new tab" control share one row, so the divider
+     between projects belongs to the row rather than to either control. */
+  .cmo-item-row { display: flex; align-items: stretch; border-bottom: 1px solid #34342f; }
+  .cmo-item-row .cmo-item { flex: 1 1 auto; width: auto; border-bottom: none; }
+  .cmo-item-new {
+    flex: 0 0 auto; display: flex; align-items: center; padding: 0 15px;
+    border-left: 1px solid #34342f; color: #a3a099; font-size: 18px;
+    text-decoration: none; cursor: pointer;
+  }
+  .cmo-item-new:active { background: #272725; }
   .cmo-input {
     width: 100%; box-sizing: border-box; margin-bottom: 8px;
     background: #272725; color: #f5f4ef;
@@ -801,6 +811,92 @@
     }
   }
 
+  // -------------------------------------------------- a window per project
+  /**
+   * The project a workspace folder belongs to: its last path segment, which is the
+   * name the rest of the service validates and lists. `folder()` — declared with
+   * the status chip below, and hoisted — is the one reader of `?folder=`.
+   */
+  function projectOf(path) {
+    return path ? path.replace(/\/+$/, '').split('/').pop() : '';
+  }
+
+  /*
+   * A home-screen icon for this project, which on Android is the only way to give
+   * a project a window of its own.
+   *
+   * Chrome gives an installed web app exactly one window on a phone — its own docs
+   * say mobile "only support single clients" where desktop "support multiple
+   * windows" — and no API opens a second one. What does work is app *identity*: a
+   * manifest with an unfamiliar `id` describes a distinct application "even if it
+   * is served from the same URL as another application", and a distinct
+   * application on Android is a distinct icon with its own task in the recents
+   * switcher. So the way to get project B beside project A is to install project
+   * B's manifest, once.
+   *
+   * The link has to be in this document, because the manifest a browser installs
+   * is the one linked from the page you install *from* — and this page is
+   * code-server's, which ships no manifest of its own. `use-credentials` is not
+   * optional: a manifest is fetched with credentials omitted by default, and the
+   * route serving it is behind the session gate like everything else.
+   */
+  function linkProjectManifest() {
+    const project = projectOf(folder());
+    if (!project) return; // an empty window belongs to no project
+    // Replace rather than append: a browser installs the first manifest it finds,
+    // so leaving a foreign one in front of this would silently install the wrong app.
+    document.querySelectorAll('link[rel="manifest"]').forEach((el) => el.remove());
+    const link = document.createElement('link');
+    link.rel = 'manifest';
+    link.href = `/chat/manifest.webmanifest?project=${encodeURIComponent(project)}`;
+    link.crossOrigin = 'use-credentials';
+    document.head.appendChild(link);
+  }
+
+  /*
+   * Chrome's own install prompt, kept for a button.
+   *
+   * `preventDefault` suppresses the mini-infobar so the offer appears where the
+   * rest of the project controls are, instead of as a strip the workbench has no
+   * room for. The event fires per page load and only while this project is not
+   * installed — which is exactly the condition under which offering it is useful,
+   * so its absence is the signal to fall back to the browser's menu.
+   */
+  let installPrompt = null;
+  window.addEventListener('beforeinstallprompt', (event) => {
+    event.preventDefault();
+    installPrompt = event;
+  });
+
+  linkProjectManifest();
+
+  async function addToHomeScreen() {
+    const status = panel.querySelector('#cmo-install-status');
+    const say = (text) => {
+      if (status) status.textContent = text;
+    };
+    if (!installPrompt) {
+      // Either it is already installed, or this browser does not offer the event
+      // (every iOS browser, for one). The manifest is linked either way, so the
+      // browser's own menu installs the same thing.
+      say('Use the browser menu → “Add to Home screen”. It picks up this project.');
+      return;
+    }
+    try {
+      await installPrompt.prompt();
+      const choice = await installPrompt.userChoice;
+      // One shot per page load: the event cannot be prompted twice.
+      installPrompt = null;
+      say(
+        choice?.outcome === 'accepted'
+          ? `${projectOf(folder())} is on your home screen. It opens in its own window.`
+          : 'Not added. The browser menu can still do it later.',
+      );
+    } catch (err) {
+      say(`Could not add it: ${err.message}`);
+    }
+  }
+
   // --------------------------------------------------------- project switcher
   async function openProjects() {
     openSheet('<p class="cmo-title">Open project</p><p class="cmo-hint">Loading…</p>');
@@ -837,19 +933,38 @@
 
     // Which folder this window already has, so tapping it can do nothing instead
     // of reloading the workbench to arrive where it already is.
-    let current = '';
-    try {
-      current = new URLSearchParams(location.search).get('folder') || '';
-    } catch {
-      /* no folder in the URL: an empty window, so nothing is "already open" */
-    }
+    const current = folder();
 
+    /*
+     * A project is a link, not a button, and that is the whole point.
+     *
+     * Switching project used to mean giving up the window you were in: this sheet
+     * assigned `location.href`, so project B replaced project A and the only way
+     * to have both was to remember the URL. The chat app already treats a project
+     * as a window of its own; the editor is the surface where that was missing.
+     *
+     * Three ways out of it, in order of how much a phone can offer:
+     *   - tap the row        -> open it here, exactly as before
+     *   - tap ⧉             -> a new tab, because `target="_blank"` on a real
+     *                            anchor is the one popup iOS never blocks
+     *   - long-press the row -> the browser's own menu, which is the only thing
+     *                            that can open a separate *window* (iPad, desktop)
+     *
+     * All three need the `href` to be real, which is why the same URL is built
+     * once here and used by both anchors.
+     */
     const items = projects
       .map((p) => {
         const open = current !== '' && current === p.path;
+        const path = encodeURIComponent(p.path);
+        const href = `/editor/?folder=${path}`;
         return (
-          `<button class="cmo-item" data-path="${encodeURIComponent(p.path)}"` +
-          `${open ? ' data-open="1"' : ''}>${p.name}${open ? ' — open' : ''}</button>`
+          '<div class="cmo-item-row">' +
+          `<a class="cmo-item" href="${href}" data-path="${path}"` +
+          `${open ? ' data-open="1"' : ''}>${p.name}${open ? ' — open' : ''}</a>` +
+          `<a class="cmo-item-new" href="${href}" target="_blank" rel="noopener"` +
+          ` aria-label="Open ${p.name} in a new tab">&#10697;</a>` +
+          '</div>'
         );
       })
       .join('');
@@ -861,13 +976,34 @@
         <button class="cmo-action" id="cmo-new-project">+ New project</button>
         <button class="cmo-action cmo-alt" id="cmo-close-projects">Close</button>
       </div>
-      <p class="cmo-hint">Opens in this tab. Each project is a separate
-      workspace, so Claude's session history follows the folder.</p>`);
+      ${
+        projectOf(current)
+          ? `<div class="cmo-row">
+        <button class="cmo-action cmo-alt" id="cmo-install">&#8962; Give ${projectOf(current)} its own window</button>
+      </div>
+      <p class="cmo-status" id="cmo-install-status"></p>`
+          : ''
+      }
+      <p class="cmo-hint">Tap to open here, &#10697; for a new tab, long-press for
+      the browser's own menu. A phone's installed app only ever has one window, so
+      the way to run two projects side by side there is to give each one its own
+      home-screen icon — same app, same login, its own window in the app switcher.
+      Each project is a separate workspace, so Claude's session history follows the
+      folder.</p>`);
 
     panel.querySelector('#cmo-close-projects').addEventListener('click', closeSheet);
     panel.querySelector('#cmo-new-project').addEventListener('click', openNewProject);
+    panel.querySelector('#cmo-install')?.addEventListener('click', addToHomeScreen);
+    // Only the row itself. The ⧉ anchor next to it is deliberately left to the
+    // browser: `target="_blank"` with no JavaScript in the way is what makes it a
+    // navigation iOS trusts rather than a popup it blocks. The sheet stays open
+    // behind it, so several projects can be opened in a row.
     panel.querySelectorAll('.cmo-item').forEach((btn) => {
-      btn.addEventListener('click', () => {
+      btn.addEventListener('click', (event) => {
+        // The row carries a real href for the long-press menu, but a plain tap
+        // still means "open it here" — so the navigation stays this file's
+        // decision, and the two branches below keep working as they did.
+        event.preventDefault();
         // Already this folder. Navigating would reload the entire workbench, kill
         // the extension host and take an unsent message in the Claude panel with
         // it — to end up exactly here. The switcher is also the natural thing to

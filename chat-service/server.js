@@ -20,6 +20,7 @@ import { SessionManager, PROJECTS_ROOT, DEFAULT_MODEL } from './session-manager.
 import { transcribe, voiceStatus, resetConfigCache } from './transcribe.js';
 import { polish } from './polish.js';
 import { claudeStatus } from './claude-status.js';
+import { manifestForProject } from './manifest.js';
 import { createAdmin } from './admin.js';
 import {
   AUTH_MODE,
@@ -279,6 +280,42 @@ const server = http.createServer(async (req, res) => {
 
     if (pathname === '/api/projects' && req.method === 'GET') {
       json(res, 200, { projects: await manager.listProjects(), defaultModel: DEFAULT_MODEL });
+      return;
+    }
+
+    /*
+     * A manifest per project, which is how a project gets a window of its own.
+     *
+     * Android gives an installed web app one window and no API changes that, so
+     * "another window" there has to be another installed app — and app identity is
+     * the manifest `id`. Serving a different id per project turns one add-to-home-
+     * screen into a second icon with its own task in the recents switcher. See
+     * manifest.js.
+     *
+     * Gated like everything else, which is why the `<link rel="manifest">` that
+     * points here carries `crossorigin="use-credentials"`: a manifest is fetched
+     * with credentials omitted by default, and this route answers 401 to that.
+     * The overlay injects the link; index.html has carried the same attribute
+     * since the chat app was installable.
+     *
+     * Matched before the static handler, and only with `?project=`, so
+     * /manifest.webmanifest still serves the chat app's own file.
+     */
+    if (pathname === '/manifest.webmanifest' && url.searchParams.has('project')) {
+      let manifest;
+      try {
+        manifest = await manifestForProject(url.searchParams.get('project'));
+      } catch (err) {
+        json(res, err.code === 'ENOPROJECT' ? 404 : 400, { error: err.message });
+        return;
+      }
+      res.writeHead(200, {
+        'Content-Type': 'application/manifest+json',
+        // Chrome re-reads the manifest to decide whether an installed app changed.
+        // A cached copy would pin a project's window to a stale start_url.
+        'Cache-Control': 'no-cache',
+      });
+      res.end(JSON.stringify(manifest));
       return;
     }
 
