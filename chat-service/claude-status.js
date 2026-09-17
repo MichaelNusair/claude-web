@@ -46,8 +46,37 @@ const BROKER_SOCKET =
  */
 const TAIL_WINDOWS = [256 * 1024, 4 * 1024 * 1024];
 
+/*
+ * One window, and a small one, for the other conversations in the project.
+ *
+ * They are listed so that the answer can be checked rather than trusted — see
+ * `claudeStatus` — and a list needs one line each, not the whole message. A
+ * conversation whose last message is not in 64KB simply contributes no preview.
+ */
+const SUMMARY_WINDOW = [64 * 1024];
+
+/** How many conversations to describe. A project's history is unbounded; this is not. */
+const LIST_LIMIT = 6;
+
 /** Bounded so a status request cannot outlive the patience of the thing asking. */
 const BROKER_TIMEOUT_MS = 400;
+
+/*
+ * How quiet a stream must be before the transcript is allowed to overrule a
+ * broker that says "working".
+ *
+ * A turn in flight is not silent: text arrives in deltas, tools announce
+ * themselves. So a session whose stream has said nothing for this long, whose
+ * transcript ends with a *finished* assistant turn, is not working — whatever the
+ * broker's in-flight flag says. This matters for two reasons: a broker predating
+ * the input-side turn detection latches that flag on for good (11 of 13 sessions,
+ * measured), and even a correct one can only miss a `result`, never invent one.
+ *
+ * The bound exists to protect the opposite race: a message sent a moment ago, not
+ * yet on disk, whose transcript still ends with the previous turn. That stream is
+ * busy, so it never reaches this threshold.
+ */
+const OVERRIDE_QUIET_MS = 10 * 1000;
 
 /**
  * Ask the broker what it is running.
@@ -159,10 +188,10 @@ const textOf = (message) => {
  * "the last line" is the wrong thing to look at, and this filters by type rather
  * than by position.
  */
-async function lastExchange(file) {
+async function lastExchange(file, windows = TAIL_WINDOWS) {
   let meta = null;
 
-  for (const bytes of TAIL_WINDOWS) {
+  for (const bytes of windows) {
     let tail;
     try {
       tail = await readTail(file, bytes);
@@ -174,6 +203,7 @@ async function lastExchange(file) {
     const lines = tail.text.split('\n');
     let state = null;
     let last = null;
+    let title = null;
 
     for (let i = lines.length - 1; i >= 0; i -= 1) {
       if (!lines[i].trim()) continue;
@@ -183,6 +213,13 @@ async function lastExchange(file) {
       } catch {
         continue; // the leading fragment, or a partially written line
       }
+
+      // What Claude Code called this conversation. Written as an `ai-title` entry
+      // and rewritten as the conversation grows, so it is usually in the tail —
+      // usually, not always, which is why every caller has a fallback label.
+      if (!title && entry.type === 'ai-title' && typeof entry.title === 'string') {
+        title = entry.title.trim() || null;
+      }
       if (entry.type !== 'assistant' && entry.type !== 'user') continue;
 
       // The nearest message decides the state, even if it carries no text of its
@@ -190,43 +227,69 @@ async function lastExchange(file) {
       if (!state) state = inferState(entry);
 
       const text = textOf(entry.message).trim();
-      if (entry.type === 'assistant' && text) {
+      if (!last && entry.type === 'assistant' && text) {
         last = { role: 'assistant', text, at: entry.timestamp || null };
-        break;
       }
+      // Both answers found; the rest of the window is history.
+      if (last && title) break;
     }
 
-    if (last || tail.complete) return { state: state || 'idle', last, ...meta };
+    if (last || tail.complete) return { state: state || 'idle', last, title, ...meta };
     // Nothing sayable in this window and there is more file behind it: widen.
   }
 
-  return { state: 'unknown', last: null, ...meta };
+  return { state: 'unknown', last: null, title: null, ...meta };
 }
 
-/** Newest transcript in a project directory — the conversation being looked at. */
-async function newestSession(cwd) {
+/** Every conversation in a project, newest first. One `stat` each, no reads. */
+async function transcripts(cwd) {
   const dir = join(CLAUDE_HOME, 'projects', await mangleCwd(cwd));
   let files;
   try {
     files = await readdir(dir);
   } catch {
-    return null;
+    return [];
   }
 
-  let newest = null;
+  const found = [];
   for (const file of files) {
     // `._*` are macOS AppleDouble metadata stubs, not transcripts.
     if (!file.endsWith('.jsonl') || file.startsWith('._')) continue;
     try {
       const info = await stat(join(dir, file));
-      if (!newest || info.mtimeMs > newest.mtimeMs) {
-        newest = { sessionId: file.replace(/\.jsonl$/, ''), mtimeMs: info.mtimeMs };
-      }
+      found.push({ sessionId: file.replace(/\.jsonl$/, ''), mtimeMs: info.mtimeMs, size: info.size });
     } catch {
       /* vanished mid-scan */
     }
   }
-  return newest;
+  return found.sort((a, b) => b.mtimeMs - a.mtimeMs);
+}
+
+/**
+ * The conversation a person is in, when nobody has said which.
+ *
+ * This is a guess, and it has to be, because the panel is a webview that reports
+ * nothing about itself: from outside it there is no way to know which conversation
+ * is on screen. What there is:
+ *
+ *   - a page driving a conversation holds a broker client for it, and the panel
+ *     drops that client when it moves on. On this box, with four live
+ *     conversations in one project, exactly one had a client: the one on screen.
+ *   - among attached conversations, the one spoken to most recently is the one
+ *     being used, where the one whose stream was busiest is merely the one being
+ *     read back — resuming a conversation produces output without anyone typing.
+ *
+ * Everything above is a heuristic, so the answer names the conversation it chose
+ * and lists the others. A wrong guess is then visibly wrong, which is the most
+ * that can honestly be built here; a silently wrong one reads as a stale badge.
+ */
+function guessConversation(candidates) {
+  const attached = candidates.filter((session) => session.clients > 0);
+  const ranked = (attached.length ? attached : []).sort((a, b) => {
+    const spoke = (s) => (s.spokeMs === null || s.spokeMs === undefined ? Infinity : s.spokeMs);
+    return spoke(a) - spoke(b) || a.idleMs - b.idleMs;
+  });
+  return ranked[0] || null;
 }
 
 /**
@@ -244,7 +307,7 @@ async function newestSession(cwd) {
  * no process exists, so nothing can be working, whatever state the transcript was
  * left in.
  */
-export async function claudeStatus(cwd) {
+export async function claudeStatus(cwd, { sessionId: asked = null } = {}) {
   // `cwd` arrives from a browser and ends up in a filesystem path. Reaching this
   // needs a valid session, and anyone with one already has a shell here, so this
   // is hygiene rather than a boundary — but the same hygiene as loadTranscript.
@@ -252,34 +315,112 @@ export async function claudeStatus(cwd) {
     throw new Error('cwd must be inside the projects root');
   }
 
+  const dir = join(CLAUDE_HOME, 'projects', await mangleCwd(cwd));
   const live = await brokerSessions();
-  const mine = live
-    // A session with no id has never been spoken to — the panel opens one such
-    // probe per page load and never writes to it. It holds no conversation.
-    ?.filter((session) => session.cwd === cwd && session.sessionId)
-    .sort((a, b) => a.idleMs - b.idleMs)[0];
+  // A session with no id has never been spoken to — the panel opens such probes
+  // and never sends them a message. They hold no conversation.
+  const candidates = live?.filter((s) => s.cwd === cwd && s.sessionId) || [];
+  const liveFor = (id) => candidates.find((s) => s.sessionId === id) || null;
 
-  const sessionId = mine?.sessionId || (await newestSession(cwd))?.sessionId || null;
+  const files = await transcripts(cwd);
+  const sessionId = asked || guessConversation(candidates)?.sessionId || files[0]?.sessionId || null;
+  const mine = sessionId ? liveFor(sessionId) : null;
+
   const transcript = sessionId
-    ? await lastExchange(join(CLAUDE_HOME, 'projects', await mangleCwd(cwd), `${sessionId}.jsonl`))
+    ? await lastExchange(join(dir, `${sessionId}.jsonl`))
     : null;
 
-  // Present, but not the source of the verdict when the broker answered.
-  const inferred = transcript?.state || 'unknown';
+  /*
+   * The verdict, and which of the two sources it came from.
+   *
+   * A broker answer wins, including when the broker reports no session for this
+   * conversation at all — that is a *definite* idle, because no process exists to
+   * be working, whatever state the transcript was left in.
+   *
+   * The exception is a broker that says "working" about a stream that has gone
+   * quiet while the transcript shows the turn finished. Then the transcript is
+   * right: see OVERRIDE_QUIET_MS.
+   */
+  const quiet = mine ? mine.idleMs > OVERRIDE_QUIET_MS : false;
+  const spokeQuiet = !mine || mine.spokeMs === null || mine.spokeMs === undefined
+    ? true
+    : mine.spokeMs > OVERRIDE_QUIET_MS;
+  const overruled = Boolean(mine?.working) && quiet && spokeQuiet && transcript?.state === 'idle';
+
+  let state;
+  let source;
+  if (!live) {
+    state = transcript?.state || 'unknown';
+    source = 'transcript';
+  } else if (overruled) {
+    state = 'idle';
+    source = 'transcript';
+  } else {
+    state = mine?.working ? 'working' : 'idle';
+    source = 'broker';
+  }
 
   return {
     cwd,
     sessionId,
-    state: live ? (mine?.working ? 'working' : 'idle') : inferred,
-    source: live ? 'broker' : 'transcript',
+    // What this conversation is called, so an answer about the wrong one can be
+    // recognised as such. Null when no title has been written yet.
+    title: transcript?.title || null,
+    state,
+    source,
+    // Whether a process for this conversation exists at all. Null when the broker
+    // could not be asked, which is not the same as "no".
+    live: live ? Boolean(mine) : null,
     // How many pages are driving it. 0 with a live session is the case this whole
     // service exists for: a conversation nobody is watching, still running.
     clients: mine?.clients ?? null,
+    idleMs: mine?.idleMs ?? null,
+    spokeMs: mine?.spokeMs ?? null,
     last: transcript?.last || null,
     transcriptAt: transcript?.mtimeMs || null,
     // Why the panel is slow, in one number the client can show instead of
     // guessing. The wait scales with this.
     bytes: transcript?.size || null,
+    // Every other conversation in this project, so that the guess above can be
+    // checked rather than taken on trust — and so that switching conversations
+    // does not mean waiting out the panel again to find out where you are.
+    conversations: await summarise(dir, files.slice(0, LIST_LIMIT), { liveFor, live, sessionId }),
     at: Date.now(),
   };
+}
+
+/**
+ * One line about each conversation in the project: what it is called, what it
+ * last said, and whether anything is running it.
+ *
+ * Small windows and no widening. This is a list, not the answer — the chosen
+ * conversation is read properly above, and a preview that costs as much as the
+ * answer would defeat the point of the whole file.
+ */
+async function summarise(dir, files, { liveFor, live, sessionId }) {
+  return Promise.all(
+    files.map(async (file) => {
+      const running = liveFor(file.sessionId);
+      const tail = await lastExchange(join(dir, `${file.sessionId}.jsonl`), SUMMARY_WINDOW);
+      const quiet = running ? running.idleMs > OVERRIDE_QUIET_MS : false;
+      return {
+        sessionId: file.sessionId,
+        title: tail?.title || null,
+        // Deliberately one line: enough to recognise a conversation by, not enough
+        // to be a second copy of the message.
+        said: tail?.last?.text ? tail.last.text.replace(/\s+/g, ' ').slice(0, 140) : null,
+        state: !live
+          ? tail?.state || 'unknown'
+          : running?.working && !(quiet && tail?.state === 'idle')
+            ? 'working'
+            : 'idle',
+        live: live ? Boolean(running) : null,
+        clients: running?.clients ?? null,
+        at: file.mtimeMs,
+        bytes: file.size,
+        // Which one of these the answer above is about.
+        current: file.sessionId === sessionId,
+      };
+    }),
+  );
 }

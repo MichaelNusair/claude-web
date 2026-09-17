@@ -206,6 +206,154 @@ status = await claudeStatus(CWD);
 ok(status.state === 'working' && status.sessionId === SESSION,
   'the panel’s never-spoken-to probe is not mistaken for the conversation');
 
+section('Which conversation the answer is about, when a project holds several:');
+/*
+ * The staleness that prompted all of this. A project on this box has four live
+ * conversations in it; the first version of this file answered per *project* —
+ * least-idle live session wins — and never said which conversation it meant. So
+ * switching conversations inside the panel left a badge confidently describing a
+ * different one, and there was no way to tell from the outside.
+ *
+ * Which conversation is on screen is not knowable from out here: the panel is a
+ * vendor webview that reports nothing about itself and fires no navigation when
+ * you switch. What is knowable is that a page driving a conversation holds a
+ * broker client for it, and that among attached conversations the one spoken to
+ * most recently is the one being used. That is a guess, so the answer carries the
+ * name of what it chose and a list of the alternatives — a wrong guess is then
+ * visibly wrong instead of silently stale.
+ */
+const OTHER = 'b2c3d4e5-1111-4000-8000-000000000000';
+const OTHER_FILE = path.join(PROJECT_DIR, `${OTHER}.jsonl`);
+const title = (text) => JSON.stringify({ type: 'ai-title', title: text });
+const writeConvo = (file, ...lines) => fs.writeFileSync(file, `${lines.join('\n')}\n`);
+const older = (file) => {
+  const when = new Date(Date.now() - 60 * 1000);
+  fs.utimesSync(file, when, when);
+};
+
+writeConvo(TRANSCRIPT, title('The one on screen'), assistant('what this conversation last said'));
+writeConvo(OTHER_FILE, title('The other one'), assistant('what the other one last said'));
+// The conversation being asked about is deliberately the OLDER file, so that an
+// answer which merely takes the newest transcript fails here.
+older(TRANSCRIPT);
+
+const twoLive = (mine = {}, other = {}) => ({
+  ok: true,
+  v: 1,
+  sessions: [
+    { cwd: CWD, sessionId: SESSION, working: false, clients: 1, idleMs: 400, spokeMs: 900, pid: 3, ...mine },
+    { cwd: CWD, sessionId: OTHER, working: false, clients: 0, idleMs: 5, spokeMs: 50, pid: 4, ...other },
+  ],
+});
+
+brokerReply = twoLive();
+status = await claudeStatus(CWD);
+ok(status.sessionId === SESSION,
+  'the conversation a page is attached to is the one described, not the busiest stream');
+ok(status.title === 'The one on screen',
+  'and it is named, so an answer about the wrong conversation can be recognised as one');
+ok(status.last?.text === 'what this conversation last said', 'the message comes from that conversation');
+ok(status.conversations?.length === 2, 'the others in the project are listed alongside it');
+const listed = (id) => status.conversations.find((c) => c.sessionId === id);
+ok(listed(SESSION)?.current === true && listed(OTHER)?.current === false,
+  'exactly one of them is marked as the one the answer is about');
+ok(listed(OTHER)?.title === 'The other one' && listed(OTHER)?.said === 'what the other one last said',
+  'each is described well enough to pick out of a list');
+ok(listed(OTHER)?.live === true && listed(OTHER)?.clients === 0,
+  'including a conversation still running with nobody watching it — the case this service exists for');
+
+status = await claudeStatus(CWD, { sessionId: OTHER });
+ok(status.sessionId === OTHER && status.title === 'The other one',
+  'a device that knows which conversation it is in overrides the guess');
+ok(status.last?.text === 'what the other one last said', 'and is answered about that one');
+ok(status.conversations?.find((c) => c.sessionId === OTHER)?.current === true,
+  'the list follows the choice rather than the guess');
+
+// Both attached: the tie-break. `idleMs` is when the stream last produced a byte,
+// which resuming a conversation does with nobody typing, so it identifies the
+// conversation being *read back*. `spokeMs` is when someone last said something.
+brokerReply = twoLive({ spokeMs: 30 * 1000, idleMs: 20 }, { clients: 1, spokeMs: 400, idleMs: 9000 });
+status = await claudeStatus(CWD);
+ok(status.sessionId === OTHER,
+  'among attached conversations the most recently spoken to wins, not the noisiest');
+
+brokerReply = twoLive({ clients: 0, spokeMs: 30 * 1000 }, { clients: 0, working: true });
+status = await claudeStatus(CWD);
+ok(status.sessionId === OTHER && status.state === 'working',
+  'with nothing attached it falls back to the newest transcript, which is the one being written to');
+
+section('A latched "working" is overruled by the transcript, but only on a quiet stream:');
+/*
+ * Two reasons this is not redundant. A broker predating the input-side turn
+ * detection latches `working` on for the life of the process — 11 of 13 sessions
+ * on the box, measured — and restarting it ends every live conversation, so the
+ * client half has to be deployable on its own. And even a correct broker can only
+ * ever *miss* a `result`, never invent one, so the failure mode is always a badge
+ * stuck on "working".
+ *
+ * A turn in flight is not silent: deltas arrive, tools announce themselves. So a
+ * stream that has said nothing for OVERRIDE_QUIET_MS, whose transcript ends with a
+ * finished turn, is not working.
+ */
+writeConvo(TRANSCRIPT, title('The one on screen'), assistant('the finished answer'));
+brokerReply = twoLive({ working: true, idleMs: 60 * 1000, spokeMs: 120 * 1000 });
+status = await claudeStatus(CWD);
+ok(status.state === 'idle' && status.source === 'transcript',
+  'a "working" stream that has been silent for a minute, over a finished turn, is your turn');
+ok(status.conversations?.find((c) => c.sessionId === SESSION)?.state === 'idle',
+  'and the list says the same thing about it, rather than contradicting the answer above');
+
+brokerReply = twoLive({ working: true, idleMs: 200, spokeMs: 120 * 1000 });
+status = await claudeStatus(CWD);
+ok(status.state === 'working' && status.source === 'broker',
+  'a stream that is still producing output is working, whatever the transcript shows');
+
+brokerReply = twoLive({ working: true, idleMs: 60 * 1000, spokeMs: 500 });
+status = await claudeStatus(CWD);
+ok(status.state === 'working',
+  'and so is a message sent a moment ago that has not reached the disk yet');
+
+writeConvo(TRANSCRIPT, title('The one on screen'), assistant('done'), userText('a follow-up with no reply yet'));
+brokerReply = twoLive({ working: true, idleMs: 60 * 1000, spokeMs: 120 * 1000 });
+status = await claudeStatus(CWD);
+ok(status.state === 'working',
+  'a transcript that itself ends mid-turn overrules nothing — both sources agree');
+
+section('One project is never answered with another project’s conversation:');
+/*
+ * The case the user had not tried yet. Sessions are matched on cwd, and this is
+ * the check that says so: a conversation working hard in a different project must
+ * not leak into this answer, in either direction.
+ */
+const CWD2 = path.join(PROJECTS, 'elsewhere');
+const PROJECT_DIR2 = path.join(CLAUDE_HOME, 'projects', CWD2.replace(/[/.]/g, '-'));
+const ELSEWHERE = 'c3d4e5f6-2222-4000-8000-000000000000';
+fs.mkdirSync(CWD2, { recursive: true });
+fs.mkdirSync(PROJECT_DIR2, { recursive: true });
+writeConvo(
+  path.join(PROJECT_DIR2, `${ELSEWHERE}.jsonl`),
+  title('A different project'),
+  assistant('what the other project last said'),
+);
+
+brokerReply = {
+  ok: true,
+  v: 1,
+  sessions: [
+    { cwd: CWD, sessionId: SESSION, working: false, clients: 1, idleMs: 400, spokeMs: 900, pid: 3 },
+    { cwd: CWD2, sessionId: ELSEWHERE, working: true, clients: 1, idleMs: 10, spokeMs: 10, pid: 5 },
+  ],
+};
+status = await claudeStatus(CWD);
+ok(status.sessionId === SESSION && status.state === 'idle',
+  'a busy conversation in another project does not make this one look busy');
+ok(!status.conversations.some((c) => c.sessionId === ELSEWHERE),
+  'nor does it appear in this project’s list');
+status = await claudeStatus(CWD2);
+ok(status.sessionId === ELSEWHERE && status.state === 'working' && status.title === 'A different project',
+  'and that project is answered about its own conversation');
+ok(status.conversations.length === 1, 'with only its own conversations listed');
+
 section('Every way of not knowing falls back rather than guessing:');
 brokerReply = 'silent';
 const slowStart = Date.now();

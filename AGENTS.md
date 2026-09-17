@@ -56,8 +56,8 @@ npm run test:overlay   # 61/61; the editor overlay, its chords, its drafts, its 
 npm run test:polish    # 19/19; the dictation cleanup's bounds, and its failure paths
 npm run test:projects  # 53/53; real git repos, real pushes
 npm run test:admin     # the operations surface, and every refusal it makes
-npm run test:status    # 21/21; what a device is told about a conversation, and from where
-npm run test:broker    # 44/44; one process per conversation, and failing safe without one
+npm run test:status    # 42/42; which conversation a device is told about, and from where
+npm run test:broker    # 51/51; one process per conversation, and what counts as a turn
 cd infra && npx cdk synth --quiet
 ```
 
@@ -711,6 +711,57 @@ Things that have burned people, in this codebase specifically:
   "cannot say" and fall back to the transcript, so the chip degrades to an inferred
   answer rather than a wrong one. That is the intended behaviour, not a bug to fix
   by restarting the unit from a deploy path.
+- **"Claude is working" means a message was sent, not that bytes were written.**
+  The panel runs with `--permission-prompt-tool stdio`, so it writes to the CLI's
+  stdin constantly with nobody typing: `control_request` / `control_response`
+  frames for every tool approval, `set_permission_mode`, `auth_status`. None of
+  them draws a `result`, so the first version of `claude-broker`, which treated any
+  write as the start of a turn, latched `turnInFlight` on and never cleared it —
+  **11 of 13 live sessions on the box reported "working", nine of them processes
+  that had never run a single turn.** `Session#write` therefore parses whole lines
+  out of the input and only claims a turn for `{"type":"user",…}` (see
+  `#noteTurnStart`, and `MAX_INPUT_LINE` for the pasted-file case). Being wrong in
+  the two directions is not symmetrical, which is why it is written this way round:
+  a *missed* message leaves a stale "working", which makes you wait and look again,
+  where a false one makes the badge say "your turn" over a live turn and invites
+  typing over it.
+- **That same flag is what reaps the panel's probes, so do not add `sessionId` to
+  the test.** `detach()` stops a session only when it was never spoken to, which is
+  how the probe the panel spawns on every page load (no `--resume`, never written
+  to) stops costing ~210MB for `IDLE_MS`. It is tempting to also require
+  `!this.sessionId` there — an id looks like proof of a conversation — but **every**
+  process announces one in its own `system`/`init` event, probe included, so that
+  clause silently parks every probe again. `broker-test.js` catches it.
+- **Which conversation is on screen cannot be known from outside the panel, so the
+  answer names its guess.** The panel is a vendor webview: it reports nothing about
+  itself and fires no page event when you switch conversations. The first version of
+  `claude-status.js` answered per *project* — least-idle live session wins — and a
+  project here has four live conversations, so switching left a badge confidently
+  describing a different one. `guessConversation()` now picks among the sessions
+  that hold a broker client (the panel drops the client when it moves on; exactly
+  one of the four had one), breaks ties on `spokeMs` rather than `idleMs` (resuming
+  a conversation produces output with nobody typing, so only `spokeMs` says which
+  one is being *used*), and the reply carries `title`, `sessionId` and every other
+  conversation in the project so the overlay can name the guess and let a tap pin a
+  different one (`&sessionId=`). Keep it that way: a wrong guess that is named is
+  correctable, where a silent one reads as a stale badge. Nothing outside the panel
+  will ever be able to do better than this, so do not "fix" it by removing the list.
+- **A stale "working" is corrected by the transcript, and that override is what
+  makes this deployable.** `OVERRIDE_QUIET_MS` (10s) in `claude-status.js` lets a
+  finished-looking transcript overrule a broker that says "working" — but only when
+  the stream has been silent that long, because a turn in flight is never silent
+  (deltas arrive, tools announce themselves). It exists because the broker's fix
+  above only takes effect when the daemon restarts, and **restarting
+  `claude-broker` ends every live conversation** — so the client half has to be
+  correct on its own against a broker that is still latching. The bound also
+  protects the opposite race: a message sent a moment ago and not yet on disk.
+- **A panel-internal conversation switch fires no page event, so the overlay
+  re-asks on a timer.** `STATUS_HEARTBEAT_MS` (15s, visible tabs only, skipped
+  while the 4s working poll is running) plus a silent refresh on window `focus`.
+  Without them nothing re-checked after a switch, which is what "the status is
+  stale when you switch conversation" was. A silent refresh only puts the chip back
+  when the conversation changed or a turn finished — never merely because the timer
+  fired, or a dismissed chip would return every fifteen seconds.
 - **A deploy cannot apply an `infra/userdata/bootstrap.sh` edit to a running
   instance.** cloud-init runs `scripts-user` once per instance *ever*
   (`/var/lib/cloud/instances/<id>/sem/config_scripts_user`), so `/opt/bootstrap.sh`

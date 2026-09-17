@@ -436,9 +436,17 @@ const server = http.createServer(async (req, res) => {
         json(res, 400, { error: 'cwd is required' });
         return;
       }
+      // Optional: which conversation to answer about. Without it the answer is a
+      // guess, because nothing outside the panel knows which one is on screen.
+      // Constrained to the shape of a session id — it becomes a filename.
+      const wanted = url.searchParams.get('sessionId');
+      if (wanted && !/^[a-zA-Z0-9_-]{1,64}$/.test(wanted)) {
+        json(res, 400, { error: 'sessionId is not a session id' });
+        return;
+      }
       let status;
       try {
-        status = await claudeStatus(cwd);
+        status = await claudeStatus(cwd, { sessionId: wanted || null });
       } catch (err) {
         json(res, 400, { error: err.message });
         return;

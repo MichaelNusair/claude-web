@@ -55,13 +55,25 @@ process.stdin.on('data', (c) => {
   buf = lines.pop() || '';
   for (const line of lines) {
     if (!line.trim()) continue;
-    if (line.trim() === 'end-turn') {
+    // The panel's two kinds of input: a user message, and a control frame it
+    // sends without anyone typing. Unwrap the first, ignore the second, and
+    // treat anything unparseable as the plain text the older checks send.
+    let text = line.trim();
+    try {
+      const frame = JSON.parse(line);
+      text = frame.type === 'user' && typeof frame.message?.content === 'string'
+        ? frame.message.content.trim()
+        : '__control__';
+    } catch {
+      /* not JSON: a raw line from a byte-transparency check */
+    }
+    if (text === 'end-turn') {
       process.stdout.write(JSON.stringify({ type: 'result', subtype: 'success' }) + '\\n');
       continue;
     }
     // The same event, one byte per write, so the broker sees it split across
     // chunks. The real CLI does this whenever a flush lands mid-token.
-    if (line.trim() === 'end-turn-slowly') {
+    if (text === 'end-turn-slowly') {
       const event = JSON.stringify({ type: 'result', subtype: 'success' }) + '\\n';
       let i = 0;
       const tick = setInterval(() => {
@@ -140,6 +152,38 @@ const send = (client, text) =>
   client.sock.write(
     `${JSON.stringify({ s: 'in', d: Buffer.from(text).toString('base64') })}\n`,
   );
+
+/**
+ * Say something, the way the panel says it: a `user` frame in stream-json.
+ *
+ * The distinction between this and `send` is the whole of the turn-detection fix.
+ * The panel writes to stdin constantly without anybody typing — permission
+ * requests, mode changes, auth checks — so "bytes were written" is not "a turn
+ * began", and treating it as one latched every session on this box into
+ * "working" and stopped the never-spoken-to probes from ever being reaped.
+ */
+const say = (client, text) =>
+  send(
+    client,
+    `${JSON.stringify({ type: 'user', message: { role: 'user', content: text } })}\n`,
+  );
+
+/** What the panel sends unprompted. Written to stdin; not a turn. */
+const CONTROL_FRAMES = [
+  { type: 'control_request', request_id: '1', request: { subtype: 'set_permission_mode', mode: 'default' } },
+  { type: 'control_response', response: { subtype: 'success', request_id: '1' } },
+  { type: 'control_request', request_id: '2', request: { subtype: 'auth_status' } },
+  // The awkward one: a permission answer quoting a path with `user` in it, so a
+  // substring test for the word would call this a message.
+  {
+    type: 'control_response',
+    response: {
+      subtype: 'success',
+      request_id: '3',
+      response: { behaviour: 'allow', updatedInput: { file_path: '/home/user/notes.md' } },
+    },
+  },
+];
 
 /**
  * Ask the broker what it is running, the way chat-service/claude-status.js does.
@@ -351,25 +395,51 @@ async function main() {
    * marker in the .jsonl at all — so a device that has just opened a conversation
    * cannot work out whether to wait for the history or simply reply. This process
    * holds the stream, so it is the only thing that knows.
-   *
-   * Session `a` above was written to and never answered with a `result`, which is
-   * exactly what a turn in flight looks like.
    */
   const startsBeforeStatus = starts();
-  const working = await status();
-  const mine = (working.sessions || []).find((s) => s.cwd === TMP);
-  ok(working.ok === true && Array.isArray(working.sessions), 'the broker answers a status request');
-  ok(mine?.sessionId === 'S1', 'it names the conversation the way a device would ask for it');
-  ok(mine?.working === true, 'a conversation that was sent a message and has not answered is working');
-  ok(mine?.clients === 1, 'the page driving it is counted');
-  ok(starts() === startsBeforeStatus, 'asking for status started no process');
+  const mineNow = async () => ((await status()).sessions || []).find((s) => s.cwd === TMP);
 
-  send(a, 'end-turn\n');
+  const answered = await status();
+  const mine = (answered.sessions || []).find((s) => s.cwd === TMP);
+  ok(answered.ok === true && Array.isArray(answered.sessions), 'the broker answers a status request');
+  ok(mine?.sessionId === 'S1', 'it names the conversation the way a device would ask for it');
+  ok(starts() === startsBeforeStatus, 'asking for status started no process');
+  ok(mine?.clients === 1, 'the page driving it is counted');
+  // Plenty of bytes have crossed this session by now — the echo checks above sent
+  // them — and none of them was a message.
+  ok(mine?.working === false, 'bytes crossing the stream are not, by themselves, a turn');
+  ok(mine?.spokeMs === null, 'and nothing is claimed about when it was last spoken to');
+
+  /*
+   * The bug this section exists for, and the reason the badge read "working" on
+   * conversations nobody had touched.
+   *
+   * The panel writes to stdin without anybody typing: it runs with
+   * `--permission-prompt-tool stdio`, so every tool approval, permission-mode
+   * change and auth check is a `control_request`/`control_response` frame going
+   * the same way a message goes. None of them draws a `result`, so a broker that
+   * counted any write as the start of a turn latched "working" on and never
+   * cleared it. Measured on the box before this fix: 11 of 13 live sessions
+   * claimed to be working, nine of them processes that had never run a turn.
+   */
+  for (const frame of CONTROL_FRAMES) send(a, `${JSON.stringify(frame)}\n`);
   await sleep(400);
-  const idle = await status();
-  const after = (idle.sessions || []).find((s) => s.cwd === TMP);
+  const controlled = await mineNow();
+  ok(controlled?.working === false, 'the panel’s own control frames do not put a conversation to work');
+  ok(controlled?.spokeMs === null, 'nor are they mistaken for somebody typing');
+
+  say(a, 'a-real-question');
+  await sleep(400);
+  const asked = await mineNow();
+  ok(asked?.working === true, 'a user message does — which is what "working" is supposed to mean');
+  ok(typeof asked?.spokeMs === 'number', 'and the time since it is reported, so a stale flag can be caught');
+
+  say(a, 'end-turn');
+  await sleep(400);
+  const after = await mineNow();
   ok(after?.working === false, 'and it is not working once the turn has ended');
-  ok(after?.clients === 1, 'asking twice did not attach the reader as a page');
+  ok(after?.clients === 1, 'asking three times did not attach the reader as a page');
+  ok(typeof after?.spokeMs === 'number', 'the last message is still remembered after the answer');
   // Nothing is claimed about `env`: it is the editor's whole environment, it only
   // reaches this daemon because the wrapper has to pass it through, and a status
   // reader has no business seeing it.
@@ -378,16 +448,28 @@ async function main() {
     'status does not hand out the environment the panel was launched with',
   );
 
+  // A message need not arrive in one write. The panel's frames are large — a
+  // pasted file is one `user` frame — and the socket splits where it likes, so a
+  // detector that only looks at whole chunks would miss the turn and leave the
+  // badge saying "your turn" while Claude is answering: the direction that makes
+  // you type over live work.
+  const message = `${JSON.stringify({
+    type: 'user',
+    message: { role: 'user', content: 'split-across-writes' },
+  })}\n`;
+  send(a, message.slice(0, 14));
+  await sleep(200);
+  ok((await mineNow())?.working === false, 'half a message is not yet a turn');
+  send(a, message.slice(14));
+  await sleep(300);
+  ok((await mineNow())?.working === true, 'and the rest of it makes one, across the seam');
+
   // A `result` arriving a byte at a time is invisible to any single chunk, and the
   // symptom of missing it is a badge stuck on "working" until the next turn ends —
   // which is precisely when nobody would think to look at this code.
-  send(a, 'a-new-question\n');
-  await sleep(300);
-  ok(((await status()).sessions || []).find((s) => s.cwd === TMP)?.working === true,
-    'a fresh message puts it back to working');
-  send(a, 'end-turn-slowly\n');
+  say(a, 'end-turn-slowly');
   await sleep(900);
-  const dribbled = ((await status()).sessions || []).find((s) => s.cwd === TMP);
+  const dribbled = await mineNow();
   ok(dribbled?.working === false, 'a result split across chunks still ends the turn');
 
   section('A process nobody ever spoke to is not parked for twelve hours:');
@@ -403,16 +485,22 @@ async function main() {
   await sleep(500);
   const probePid = lastPid();
   ok(probe.hello?.ok === true && alive(probePid), 'the probe runs while its page is open');
+  // The frames the panel really does send such a process — and the reason this
+  // reaping stopped working when "spoken to" meant "written to". Nine probes were
+  // parked on the box at ~210MB each, every one of them held alive by traffic
+  // nobody typed.
+  for (const frame of CONTROL_FRAMES) send(probe, `${JSON.stringify(frame)}\n`);
+  await sleep(300);
   // Destroyed rather than detached politely: a torn-down extension host is how
   // this actually happens.
   probe.sock.destroy();
   await sleep(800);
-  ok(!alive(probePid), 'and is stopped when that page goes away, not held until IDLE_MS');
+  ok(!alive(probePid), 'and is stopped when that page goes away, control frames and all');
 
   const spoken = await connect({ resume: null, cwd: ALT });
   await sleep(500);
   const spokenPid = lastPid();
-  send(spoken, 'a-real-first-message\n');
+  say(spoken, 'a-real-first-message');
   await sleep(400);
   spoken.sock.destroy();
   await sleep(800);

@@ -60,6 +60,31 @@ const IDLE_MS = Number(process.env.CLAUDE_BROKER_IDLE_MS || 12 * 60 * 60 * 1000)
  */
 const RESULT_EVENT = '"type":"result"';
 
+/*
+ * The start of a turn: a user message, and ONLY a user message.
+ *
+ * The panel's stdin carries far more than what someone typed. It launches Claude
+ * with `--permission-prompt-tool stdio`, `--enable-auth-status` and
+ * `--setting-sources`, and every permission decision, mode change and auth probe
+ * comes back down this same pipe as a `control_request`/`control_response` frame.
+ *
+ * Treating any write as the beginning of a turn therefore latched `turnInFlight`
+ * on permanently, because a control frame draws no `result` to clear it. Measured
+ * on the box before this fix: 11 of 13 live sessions reported "working", nine of
+ * them processes that had never run a single turn. A badge that says "working"
+ * about everything answers nothing.
+ *
+ * So the input side is parsed by line, unlike the output side. It can afford to
+ * be: this is what a person typed, not what the model produced.
+ */
+const USER_MESSAGE = '"type":"user"';
+
+/*
+ * A single input line is normally tiny, but a pasted file is one line and can be
+ * megabytes. Past this, stop waiting for the newline and decide on what is here.
+ */
+const MAX_INPUT_LINE = 256 * 1024;
+
 const log = (...args) => console.log(new Date().toISOString(), ...args);
 
 /** Sessions by merge key, plus a lookup by the id the CLI reports. */
@@ -80,17 +105,28 @@ class Session {
     this.sessionId = null;
     this.lastActivity = Date.now();
     this.exited = false;
-    // Whether anyone has ever sent this process a message. A session that has
-    // not been spoken to holds no conversation: nothing was asked, nothing is
-    // running, and its transcript is empty. See `detach`.
+    // Whether anyone has ever sent this process a MESSAGE — not merely bytes. A
+    // session that has not been spoken to holds no conversation: nothing was
+    // asked, nothing is running, and its transcript is empty. See `detach`, and
+    // see USER_MESSAGE for why the distinction is not academic: the panel writes
+    // control frames to the probes it never uses, and counting those as being
+    // spoken to parked nine of them on this box at ~210MB each.
     this.spokenTo = false;
-    // Whether Claude owes an answer: set when a page sends something, cleared by
+    // Whether Claude owes an answer: set by a user message going in, cleared by
     // the `result` event that ends the turn. This is the stop-button-vs-send-button
     // bit, and the reason anything asks this service for status at all.
     this.turnInFlight = false;
     // Trailing bytes of the last chunk, so a `result` split across two chunks is
     // still seen. Copied rather than kept as a view into a stream buffer.
     this.turnTail = Buffer.alloc(0);
+    // Partial input line, so a message split across two writes is still seen as
+    // one frame. See #noteTurnStart.
+    this.inputBuffer = '';
+    // When someone last actually said something to this conversation, as opposed
+    // to when the CLI last wrote a byte. This is what identifies the conversation
+    // a person is in: a resumed one emits output while being read back, but only
+    // the one being used is spoken to.
+    this.spokeAt = null;
     // Only used to spot the init event; forwarding never waits on it.
     this.lineBuffer = '';
 
@@ -212,6 +248,43 @@ class Session {
       : Buffer.concat([this.turnTail, chunk]).subarray(-span);
   }
 
+  /**
+   * Whether these bytes contain the start of a turn.
+   *
+   * Line-buffered and parsed, rather than matched as a substring the way the
+   * output side is, because the difference that matters here is between a frame
+   * whose `type` is `user` and a control frame that merely mentions one — a
+   * permission response carrying a tool input, say. A substring match on the
+   * whole stream would call that a turn and latch the badge on, which is the bug
+   * this replaces.
+   */
+  #noteTurnStart(chunk) {
+    this.inputBuffer += chunk.toString();
+    const lines = this.inputBuffer.split('\n');
+    this.inputBuffer = lines.pop() || '';
+
+    if (this.inputBuffer.length > MAX_INPUT_LINE) {
+      // A very long line: decide on what has arrived and stop accumulating. A
+      // false positive here costs a badge that says "working" until the turn that
+      // is almost certainly starting anyway ends.
+      const looksLikeMessage = this.inputBuffer.includes(USER_MESSAGE);
+      this.inputBuffer = '';
+      if (looksLikeMessage) return true;
+    }
+
+    for (const line of lines) {
+      // Cheap gate before parsing: every frame this cares about contains the
+      // word, and the ones it does not care about are the common case.
+      if (!line.includes('user')) continue;
+      try {
+        if (JSON.parse(line).type === 'user') return true;
+      } catch {
+        /* not a frame we can read; not a turn we can claim */
+      }
+    }
+    return false;
+  }
+
   #send(client, frame) {
     if (client.destroyed) return;
     client.write(`${JSON.stringify(frame)}\n`);
@@ -253,7 +326,22 @@ class Session {
     // Deliberately keyed on input rather than on the `pending:` key, because it
     // must never abort work. A session that WAS spoken to may have a turn in
     // flight, so it stays until IDLE_MS even when nothing can name it.
-    if (this.clients.size === 0 && !this.spokenTo && !this.exited) {
+    //
+    // `spokenTo` now means a real message rather than any byte, and
+    // `turnInFlight` is belt and braces around that narrowing: a turn in flight
+    // is work, so a message this parser somehow failed to recognise still has to
+    // trip the second test before the process can be stopped.
+    //
+    // What deliberately is NOT tested here is `sessionId`. It is tempting — an
+    // id looks like proof of a conversation — but every process announces one in
+    // its own `system`/`init` event, probe included, so requiring the absence of
+    // one would park every probe again and undo the whole of this.
+    if (
+      this.clients.size === 0 &&
+      !this.spokenTo &&
+      !this.turnInFlight &&
+      !this.exited
+    ) {
       log(`session ${this.key} never spoken to; stopping rather than parking it`);
       this.stop();
     }
@@ -261,13 +349,16 @@ class Session {
 
   write(data) {
     this.lastActivity = Date.now();
-    this.spokenTo = true;
-    // Anything a page sends is treated as starting a turn. A control line that
-    // draws no `result` would leave this set until the next turn ends — a stale
-    // badge, which is the right direction to be wrong in: "working" makes you
-    // wait and look again, "idle" makes you type over a running turn.
-    this.turnInFlight = true;
-    this.turnTail = Buffer.alloc(0);
+    // Only a message starts a turn; the panel's control traffic does not. The
+    // remaining way to be wrong is a missed `result`, which leaves a stale
+    // "working" — still the right direction to be wrong in, because "working"
+    // makes you wait and look again where "idle" makes you type over a live turn.
+    if (this.#noteTurnStart(data)) {
+      this.spokenTo = true;
+      this.turnInFlight = true;
+      this.turnTail = Buffer.alloc(0);
+      this.spokeAt = Date.now();
+    }
     if (this.proc.stdin.writable) this.proc.stdin.write(data);
   }
 
@@ -360,6 +451,11 @@ function statusSnapshot() {
       working: session.turnInFlight,
       clients: session.clients.size,
       idleMs: now - session.lastActivity,
+      // How long since anyone said anything to this conversation, as opposed to
+      // since the CLI last wrote a byte. Null if nobody ever has. This is what
+      // tells "the conversation being used" from "a conversation being read
+      // back": resuming one produces output without anyone typing.
+      spokeMs: session.spokeAt === null ? null : now - session.spokeAt,
       pid: session.proc.pid,
     }));
 }
