@@ -228,7 +228,7 @@ Know this before answering any question about long-running work:
 | Surface | Who owns `claude` | Survives closing the app | Shared live across devices |
 | --- | --- | --- | --- |
 | Chat (`/`) | `claude-chat` systemd service | yes | yes — `getBySession` hands both sockets the same process |
-| `cc` / tmux — **the editor's default** | tmux server, parented to systemd | yes | yes — multiple tmux clients, one session |
+| `cc` / tmux — **the editor's default** | the tmux server, owned by `claude-tmux.service` | yes | yes — multiple tmux clients, one session |
 | VS Code extension panel | extension host, tied to the browser | **no — dies in ~5s** | **no — it forks** |
 
 That 5 seconds is measured, not guessed: a probe on a live box recorded
@@ -255,6 +255,18 @@ Claude button opens an editor terminal running `cc <folder>`, not the panel. One
 tmux session per project, so every device attaches to the same process instead of
 forking it. Verified on the box: two simultaneous clients, one session, one
 `claude`, and the session still alive after both detached.
+
+**A tmux session is only as durable as the cgroup its server is in.** Sessions are
+forked by the tmux server, so they inherit *its* cgroup, and a server first
+started by `cc` from an editor terminal is inside `code-server.service` — which is
+`KillMode=control-group`, systemd's default. So `systemctl restart code-server`,
+which every deploy does, kills the sessions: being detached from the terminal is
+not enough. Observed 2026-09-17, a task running in tmux dying mid-deploy, which is
+the exact failure tmux was introduced to prevent. Hence `claude-tmux.service` owns
+the server, with `exit-empty off` so it stays alive with no sessions — otherwise
+the next `cc` quietly starts a replacement in the wrong cgroup and durability is
+lost with nothing to see. `cc` warns when it finds a server outside that unit.
+Never `systemctl restart claude-tmux` from a deploy path; `enable --now` only.
 
 Do not "simplify" this back to opening the panel by default. The fork is not a bug
 in this repo and cannot be fixed here — the conversation lives inside the

@@ -112,7 +112,9 @@ any terminal or page:
 - closing the editor, the browser, or your laptop changes nothing
 - **attaching from a second device joins the same live session** — same screen,
   same scrollback, mid-turn — rather than starting a second Claude
-- it survives a reload, a dropped connection, a code-server restart and a redeploy
+- it survives a reload, a dropped connection, a code-server restart and a
+  redeploy — the tmux server is its own systemd service, so restarting the editor
+  cannot take your session down with it
 
 Verified on a live box: two clients attached at once, one session, one `claude`
 process, and the session still running after both detached.

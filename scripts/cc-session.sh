@@ -84,6 +84,22 @@ else
   tmux set-option -t "$session" window-size latest >/dev/null 2>&1 || true
 fi
 
+# Being detached from the terminal is not by itself enough to survive a deploy.
+# tmux sessions are forked by the tmux server, so they inherit its cgroup, and a
+# server first started from an editor terminal sits inside code-server.service —
+# which is KillMode=control-group, so `systemctl restart code-server` takes the
+# sessions with it. Observed 2026-09-17, mid-deploy, on a running task. The fix is
+# claude-tmux.service owning the server (see infra/userdata/bootstrap.sh); all
+# this can do is say so, because an unprivileged `cc` cannot move a process
+# between cgroups. A warning rather than a refusal: the session works, it is only
+# fragile, and refusing to open Claude would be the worse outcome.
+server_pid="$(tmux display-message -p '#{pid}' 2>/dev/null || true)"
+if [ -n "$server_pid" ] && [ -r "/proc/$server_pid/cgroup" ] &&
+  ! grep -q claude-tmux "/proc/$server_pid/cgroup"; then
+  printf '\033[1;33mNote:\033[0m this tmux server is not claude-tmux.service, so a deploy or a\n' >&2
+  printf '      code-server restart will end this session. Check: systemctl status claude-tmux\n' >&2
+fi
+
 # Deliberately no `-d`: that would detach other clients. Allowing several means
 # a phone and a laptop can watch the same run at once, which is the point — and
 # `window-size latest` above is what keeps the one you are typing on from being

@@ -37,9 +37,12 @@ DATA_MNT="/workspace"
 # tmux is load-bearing, not a convenience: it is what makes a Claude session
 # outlive the browser. code-server tears the extension host down within seconds
 # of the last WebSocket closing (measured: 5s, mid-turn, work lost), and the
-# extension's CLI dies with it. A session started under tmux is parented to
-# systemd instead, so it survives closing the editor, a code-server restart, and
-# a redeploy — and several devices can attach to the same live session at once.
+# extension's CLI dies with it. A session started under tmux belongs to the tmux
+# server instead, so it survives closing the editor, a code-server restart, and a
+# redeploy — and several devices can attach to the same live session at once.
+# That server gets its own systemd unit further down; being merely detached from
+# the terminal is not enough, because a server started from an editor terminal
+# still sits in code-server's cgroup and dies when that unit restarts.
 # zsh is the interactive shell for this box (see the User section below). It is
 # in the required list rather than the optional one because the login shell is
 # set to it: a missing zsh would leave the user with no working shell at all.
@@ -761,8 +764,12 @@ MAINCONF
 cat > /etc/systemd/system/code-server.service <<SVC
 [Unit]
 Description=code-server with Claude Code
-After=network.target $DATA_MNT.mount
+After=network.target $DATA_MNT.mount claude-tmux.service
 Requires=$DATA_MNT.mount
+# Not Requires: the editor is still useful if the session server is down, but it
+# must come up second, or the first `cc` from an editor terminal starts a tmux
+# server of its own inside this unit's cgroup and loses its durability.
+Wants=claude-tmux.service
 
 [Service]
 Type=simple
@@ -813,7 +820,46 @@ RestartSec=5
 WantedBy=multi-user.target
 SVC
 
+# The tmux server that holds the Claude sessions, owned by its own unit.
+#
+# It has to be its own unit. tmux sessions are forked by the tmux *server*, so
+# they inherit the server's cgroup — and a server started by the first `cc` is
+# started from an editor terminal, which puts it inside code-server.service.
+# That unit is KillMode=control-group (systemd's default), so `systemctl restart
+# code-server` kills the whole tree and takes the Claude sessions with it. Every
+# deploy restarts code-server. Observed 2026-09-17: a task running in tmux died
+# mid-deploy, which is the exact failure tmux was introduced to prevent.
+#
+# `exit-empty off` is load-bearing: without it the server exits when its last
+# session is killed, and the next `cc` would quietly start a replacement inside
+# code-server's cgroup again — durability lost with nothing to see. `cc` warns
+# if it ever finds itself talking to a server outside this unit.
+#
+# The socket is the default one (/tmp/tmux-<uid>/default) so that plain `tmux`
+# in an SSM shell is the same server. That means no PrivateTmp here, ever.
+cat > /etc/systemd/system/claude-tmux.service <<SVC
+[Unit]
+Description=Long-lived tmux server for Claude sessions
+After=network.target $DATA_MNT.mount
+Requires=$DATA_MNT.mount
+
+[Service]
+Type=forking
+User=$USER_NAME
+Environment=HOME=/home/$USER_NAME
+WorkingDirectory=$DATA_MNT/projects
+ExecStart=/bin/sh -c 'tmux start-server \; set-option -s exit-empty off'
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+SVC
+
 systemctl daemon-reload
+# `enable --now`, never `restart`: this script re-runs on every deploy, and
+# restarting this unit is precisely the thing that would kill live sessions.
+systemctl enable --now claude-tmux
 systemctl enable --now code-server
 if [ -f /opt/claude-web/chat-service/server.js ]; then
   (cd /opt/claude-web/chat-service && npm install --omit=dev)
