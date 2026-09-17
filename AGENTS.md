@@ -7,6 +7,9 @@ so does the README.
 Read [docs/SECURITY.md](docs/SECURITY.md) before changing anything under
 `chat-service/` or `infra/`. It explains why the code is shaped the way it is.
 
+**Then read ["Finishing" is committed, pushed, and deployed](#finishing-is-committed-pushed-and-deployed).
+It is not optional, and it is the instruction agents here have most often skipped.**
+
 ## What this project is, in one paragraph
 
 A self-hosted web front end for Claude Code, running on one EC2 instance in the
@@ -17,6 +20,72 @@ over the real `claude` CLI: one long-lived process per conversation, driven over
 rather than a series of one-shot commands. Claude runs with
 `--permission-mode bypassPermissions` by default, so it executes shell commands
 without prompting.
+
+## "Finishing" is committed, pushed, and deployed
+
+**A change that is green on this box and nowhere else is not finished. It is a
+change the user has to chase you for.**
+
+Work in this repository is done when all three of these are true, in this order:
+
+```bash
+npm test                       # all of it, not just the part you touched
+git add -A && git commit       # see the message rules below
+git push origin main           # the open-source repo: github.com/MichaelNusair/claude-web
+./deploy.sh                    # the user's own deployment. It re-runs the tests
+                               # and refuses to ship if any of them fail.
+```
+
+Do all three without being asked. Do not stop after the tests and describe what
+*could* be shipped; do not leave the commit for the user; do not say "ready to
+deploy" as if that were the finish line. If you were asked to build something, you
+were asked to put it live — this box *is* production, there is no staging, and an
+uncommitted change is one editor crash away from being gone.
+
+**It does not matter who left it.** This is a sweep of the repository, not of your
+diff. If you find uncommitted changes, commits that never got pushed, or a tree
+that is ahead of what is actually running, finish them too — the user's
+instruction is that nothing in here is left built-but-not-live, regardless of
+which agent or which session built it. So start by looking:
+
+```bash
+git status --short              # anything uncommitted, from any session
+git fetch origin && git status -sb   # "ahead N" means commits nobody else has
+```
+
+Read what you find before you ship it, and say whose it is (see below). The only
+thing that stops you is work you can see is *broken*, not work that is merely
+someone else's.
+
+Five things that are still true while you do it:
+
+- **Say what you are shipping.** `deploy.sh` ships the whole working tree, not your
+  diff. More than one agent works in this repository at a time, so run `git status`
+  first and, if there is work in there that is not yours, say so in the commit
+  message and in what you tell the user. Ship it — but named, never quietly. And
+  never commit `claude-web.config.json` or `infra/cdk.context.json` (both
+  gitignored; keep it that way).
+- **Someone else's file may be mid-edit.** The suite is the arbiter: if `npm test`
+  is green with their work in the tree, ship it and say you did. If it is red
+  *because* of their work, do not fix it by reverting them and do not weaken the
+  test — commit your own files by name, push, deploy that, and say plainly what
+  you left behind and why.
+- **Green first, always.** `deploy.sh` runs the suite itself and refuses on
+  failure, and that refusal is a feature. Never pass a flag, skip a test, or weaken
+  an assertion to get past it.
+- **A deploy is visible to the user.** It restarts `claude-chat` and `code-server`,
+  so editor pages reconnect and any tmux server *not* owned by
+  `claude-tmux.service` dies with the old cgroup. It never restarts
+  `claude-broker`, which is why conversations in the panel survive it — keep that
+  true (see the broker's cgroup note below).
+- **Report what actually happened.** The commit hash, that the push landed, and
+  the deploy's own verdict. If the deploy failed, say that plainly and leave it
+  failed rather than describing the change as done.
+
+If you genuinely must not deploy — the user said not to, or the tree holds work
+that is known broken — then say so explicitly, in one sentence, as part of
+reporting the work. Silence reads as "deployed", and that is the failure this
+section exists to prevent.
 
 ## The one thing you must not get wrong
 
@@ -846,6 +915,10 @@ Things that have burned people, in this codebase specifically:
   it makes one leaked password into AWS account takeover.
 - Do not weaken `auth.js` to make a test pass. Fix the test or the caller.
 - Do not add a caching service worker.
+- Do not end a piece of work uncommitted, unpushed, or undeployed without saying
+  so. See ["Finishing" is committed, pushed, and
+  deployed](#finishing-is-committed-pushed-and-deployed) — it is the first thing
+  in this file for a reason.
 
 ## Verifying your work
 
@@ -871,3 +944,8 @@ the instance and fails the deploy if the config is invalid.
 Be honest about what you did and did not verify. "Synthesizes and passes the auth
 tests, not deployed" is a useful, accurate statement. "Works" is not, unless you
 watched it work.
+
+And "not deployed" is a statement about an unfinished job, not a resting place:
+verifying is the step before shipping, never instead of it. Go back to ["Finishing"
+is committed, pushed, and
+deployed](#finishing-is-committed-pushed-and-deployed) and finish.
