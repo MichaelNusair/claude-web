@@ -60,6 +60,12 @@ w.fetch = (url, options = {}) => {
     return new Promise((resolve) =>
       setTimeout(() => resolve({ ok: true, json: () => Promise.resolve({ text }) }), delay));
   }
+  // Polled every few seconds for the tab dots and the list badges. Answered
+  // properly rather than left to the fallback below, because a boot that throws
+  // in the poller is exactly the kind of break this file exists to catch.
+  if (String(url).includes('/api/live')) {
+    return Promise.resolve({ ok: true, json: () => Promise.resolve({ sessions: [] }) });
+  }
   const body = String(url).includes('/api/projects')
     ? {
         projects: [
@@ -116,9 +122,18 @@ if (!listBody.includes('a past chat')) {
 
 // A resumed conversation arrives as one `history` frame. Assert the client can
 // render it — this path is what a phone hits when opening an existing chat.
+// Everything that renders now belongs to a pane, so one has to be open first;
+// pane-test.js covers what happens with several of them.
 const handler = w.__handleEventForTest;
-if (typeof handler === 'function') {
+const panesHooks = w.__panesForTest;
+let chat = null;
+if (typeof handler === 'function' && panesHooks) {
   try {
+    chat = panesHooks.openChat({
+      cwd: '/workspace/projects/demo',
+      title: 'a past chat',
+      resumeSessionId: 'abc123',
+    });
     handler({
       type: 'history',
       truncated: 340,
@@ -127,17 +142,21 @@ if (typeof handler === 'function') {
         { type: 'assistant_text', text: 'an **answer** with `code`' },
         { type: 'tool_use', id: 't1', name: 'Read', input: { file_path: '/a/b.txt' } },
       ],
-    });
-    const thread = w.document.querySelector('#thread')?.innerHTML ?? '';
+    }, chat);
+    const thread = chat.thread?.innerHTML ?? '';
     if (!thread.includes('a question')) failures.push('history: user message not rendered');
     if (!thread.includes('answer')) failures.push('history: assistant message not rendered');
     if (!thread.includes('class="tool"')) failures.push('history: tool card not rendered');
     if (!thread.includes('340 earlier')) failures.push('history: truncation notice missing');
+    // The thread is the pane's own element, not a fixed one in index.html.
+    if (chat.thread?.parentElement?.id !== 'threads') {
+      failures.push("history: the pane's thread is not inside #threads");
+    }
   } catch (err) {
     failures.push(`history render threw: ${err.message}`);
   }
 } else {
-  failures.push('client did not expose handleEvent for testing');
+  failures.push('client did not expose handleEvent and the pane hooks for testing');
 }
 
 // Dictation that stops on its own must never do so quietly: the bug this guards
@@ -444,8 +463,9 @@ if (typeof handler === 'function') {
     // send must not race the pass and ship the unpunctuated version.
     idle();
     const sent = [];
-    const chat = w.__draftForTest.state;
-    chat.ws = { readyState: 1, send: (frame) => sent.push(JSON.parse(frame)) };
+    // The socket belongs to the pane the composer is pointing at, which is the
+    // one opened above.
+    if (chat) chat.ws = { readyState: 1, send: (frame) => sent.push(JSON.parse(frame)) };
     box.value = RAW;
     hooks.voice.anchor = 0;
     hooks.voice.committed = RAW;
@@ -455,7 +475,7 @@ if (typeof handler === 'function') {
     if (sent[0]?.text !== CLEAN) {
       failures.push(`sending mid-cleanup sent ${JSON.stringify(sent[0]?.text)}, want the punctuated text`);
     }
-    chat.ws = null;
+    if (chat) chat.ws = null;
     polishReply = null;
   }
 }
@@ -588,18 +608,19 @@ if (typeof handler === 'function') {
 // restore are driven directly, which is also the only way to assert the scoping.
 {
   const drafts = w.__draftForTest;
-  if (!drafts) {
+  if (!drafts || !chat) {
     failures.push('client did not expose the draft hooks for testing');
   } else {
     const box = drafts.input;
-    const chat = { cwd: '/workspace/projects/demo', sessionId: 'abc123' };
     // Typing happens with a chat open, and which chat is what the draft records.
-    drafts.state.cwd = chat.cwd;
-    drafts.state.sessionId = chat.sessionId;
+    // The pane opened above is the one on screen, so it is the one the composer
+    // and every draft written below belong to.
+    panesHooks.activatePane(chat);
+    const key = drafts.draftKeyFor(chat);
 
     box.value = 'a paragraph of dictated code';
     drafts.saveDraft({ now: true });
-    if (!w.localStorage.getItem(drafts.DRAFT_KEY)) {
+    if (!w.localStorage.getItem(key)) {
       failures.push('typing left no draft behind to recover');
     }
 
@@ -639,7 +660,7 @@ if (typeof handler === 'function') {
     // next reload puts an already-sent message back.
     box.value = '';
     drafts.saveDraft({ now: true });
-    if (w.localStorage.getItem(drafts.DRAFT_KEY)) {
+    if (w.localStorage.getItem(key)) {
       failures.push('an emptied composer left a stale draft behind');
     }
   }

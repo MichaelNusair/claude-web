@@ -49,11 +49,13 @@ itself is not something you will do on an internet-facing deployment.
 ### Before you finish any change to auth, routing, or the stack
 
 ```bash
-npm run test:auth      # must be 41/41 or better; never fewer checks than before
+npm run test:auth      # must be 48/48 or better; never fewer checks than before
 npm run test:client
+npm run test:panes     # several chats at once; what closing a tab must not do
 npm run test:overlay   # 45/45; the editor overlay, its chords, its drafts, its clipboard
 npm run test:polish    # 19/19; the dictation cleanup's bounds, and its failure paths
 npm run test:projects  # 53/53; real git repos, real pushes
+npm run test:admin     # the operations surface, and every refusal it makes
 cd infra && npx cdk synth --quiet
 ```
 
@@ -69,6 +71,10 @@ chat-service/            The chat backend + PWA client. The security boundary.
   server.js              HTTP routes, static files, WebSocket upgrade gate.
   session-manager.js     One `claude` process per conversation; transcripts;
                          the project lifecycle (create, clone, remove).
+  admin.js               The operations surface: what is running on all four
+                         surfaces, what is wrong with it, and stopping one thing
+                         at a time. Reads the broker's processes from outside
+                         with ps, and refuses far more than it does.
   transcribe.js          Voice: local whisper.cpp, optional Azure override.
   polish.js              Makes a finished dictation readable: punctuation,
                          capitals, misheard names. Bedrock Haiku, one bounded
@@ -82,7 +88,14 @@ chat-service/            The chat backend + PWA client. The security boundary.
                          keybinding, so this is what checks both.
   project-test.js        Project removal against real git repos. Deletes trees,
                          so the refusals are what this tests hardest.
-  public/                index.html, app.js, style.css, login.html.
+  admin-test.js          Both halves of /chat/admin against a fake box having
+                         every failure this project has had, at once. What it
+                         refuses to signal is the code under test.
+  pane-test.js           Several chat tabs at once: a background conversation
+                         rendering off screen, the live cap, and that closing a
+                         tab stops nothing.
+  public/                index.html, app.js, style.css, login.html, and
+                         admin.html + admin.js for the operations surface.
 
 claude-broker/           Keeps the editor panel's `claude` alive and shared
                          between devices. No dependencies beyond node.
@@ -179,6 +192,23 @@ message says so. That is correct behaviour, not a crash — find out why
 `server.js` routes → `session-manager.js` for anything touching the `claude`
 process → `public/app.js` for UI. Client requests go through the `api()` wrapper
 so a 401 redirects to login; use it rather than bare `fetch`.
+
+**In the client there is no "the chat" any more.** A conversation is a *pane* —
+its socket, its thread element, the bubble being streamed into, the tool cards
+still waiting for their results — and several are open at once as tabs. Every
+render function takes the pane it draws into, because a background conversation
+keeps rendering while you are looking at a different one; that is the whole reason
+tabs exist. `activePane()` is the one on screen and the only thing the composer,
+the header and the mic belong to. If you reach for "the thread" or "the socket" as
+a module-level thing, that is the bug the pane model exists to make impossible.
+
+Three panes hold a socket (`MAX_LIVE`); past that the least recently used *idle*
+one is cooled to a tab — socket closed, thread dropped, nothing stopped. Cooling
+is never applied to a pane that is working: the cap is exceeded and the user told
+instead, because a tab going quiet while the box is still spending on it is the
+one outcome worse than four sockets. Closing a tab is not stopping either; ending
+a conversation is `/chat/admin`'s job, on purpose. `pane-test.js` holds all of
+that down and `deploy.sh` runs it.
 
 ### "Delete a project I'm done with"
 
@@ -353,6 +383,44 @@ exactly as with `claude-tmux`. A restart ends every live conversation, which is 
 failure the service exists to prevent, so a change to `broker.js` lands at the next
 deliberate restart, chosen at a moment when losing the running work is acceptable.
 
+### Seeing all four at once: `/chat/admin`
+
+Every note in the section above was found with an SSM shell, `ps` and
+`journalctl` — ten forgotten probes at ~205 MB each, three `claude` processes
+against one project, a tmux server in the wrong cgroup. None of it was visible
+from any of the app's own surfaces. [`chat-service/admin.js`](chat-service/admin.js)
+is that shell, on a phone: what is running on each surface, what is wrong with it,
+and stopping one thing at a time. Four decisions in it are load-bearing.
+
+**It is a screen inside the chat service, not an app of its own.** A second app
+would be a second authentication implementation, and this repository's founding bug
+was auth living in the wrong place. It is behind the same gate as `/ws` and adds no
+authority the caller did not already have — that gate hands out a shell with
+`bypassPermissions`. Every one of its routes is in the `guarded` list in
+`auth-test.js`; unauthenticated, `/api/admin/overview` would be a remote inventory
+of the box and `/api/admin/kill` a remote kill.
+
+**It is served at `/chat/admin`** because nginx already routes `/chat/` to the
+service with the prefix stripped. A new nginx location would mean editing
+`bootstrap.sh`, which `--app-only` cannot apply and a full deploy may answer by
+replacing the instance.
+
+**The broker is inspected from the outside, with `ps` and `/proc`.** Adding a
+list/kill op to `broker.js` is the obvious move and the wrong one: its
+conversations are its children, so the change would only take effect at a restart,
+and a restart ends every live conversation. Their argv already carries
+`--resume <session id>`, so today's broker needs no change at all. The same argv is
+what tells a real conversation from the panel's never-written-to probe.
+
+**Every stop is a refusal first.** `AdminBlocked` → 409 with a reason, which the
+client turns into a specific question, exactly as a project removal does. `force`
+is the answer to that question: never a default, never inferred. And a pid from the
+client is only ever signalled after being re-found in a freshly-read process table
+under the parent we expected — the one thing this file must never become is a way
+to turn a caller-supplied string into a signal for an arbitrary process.
+`admin-test.js` tests the refusals hardest, and `deploy.sh` will not deploy without
+it.
+
 ## Gotchas that look like bugs
 
 Things that have burned people, in this codebase specifically:
@@ -387,6 +455,23 @@ Things that have burned people, in this codebase specifically:
   already on disk, and the new one only arrives through UserData. Check with
   `cdk diff` — if the instance would be replaced, that part needs a full deploy
   from somewhere else.
+- **A deploy ends every chat conversation, and only the chat's.** `deploy.sh` runs
+  `systemctl restart claude-chat`, and a conversation is a child of that unit, so
+  its cgroup takes all of them with it — the cgroup rule above, seen from the other
+  side. The broker's and tmux's conversations survive exactly because no deploy path
+  restarts those units. Nothing is corrupted (the transcripts are on disk and every
+  session is still offered in the chat list) but a turn in flight is lost, and the
+  client's tabs come back attached to fresh processes. So say so rather than being
+  clever about it when someone asks to deploy mid-task, and put long work on the
+  editor panel or `cc`. `/chat/admin` prints this under the chat's own conversations
+  for the same reason.
+- **`/api/projects` reads every transcript, so nothing may poll it.** It stats and
+  opens each `.jsonl` to build the titles — fine once per screen, ruinous every few
+  seconds. Anything that needs to know what is *running* asks `/api/live`, which is
+  a walk of the in-memory conversation map, and the client updates the list's badges
+  in place from that rather than redrawing the list. If you add ambient state to the
+  UI, add it to `/api/live`; do not reach for the list route because it already has
+  a field you want.
 - **The CDK CLI reads a narrower slice of `~/.aws/config` than the AWS CLI.** A
   profile whose credentials come from `credential_source = Ec2InstanceMetadata`
   fails the CDK step with "Unable to resolve AWS account to use" while every `aws`
@@ -593,7 +678,8 @@ Things that have burned people, in this codebase specifically:
 There is no staging environment, so local verification is what you have:
 
 ```bash
-npm test                                   # auth + client + project lifecycle + broker
+npm test                                   # auth + client + panes + project lifecycle
+                                           # + operations surface + broker
 cd infra && npx cdk synth --quiet          # stack compiles
 bash -n deploy.sh migrate.sh infra/userdata/bootstrap.sh claude-broker/install.sh
 node --check chat-service/server.js

@@ -80,6 +80,14 @@ your-domain.com
   and full output. Failures auto-expand.
 - **Live streaming** text, with a typing indicator while Claude works.
 - **Stop button** while a turn is running.
+- **Several chats at once** — open conversations sit in a tab strip above the
+  thread, each with a dot for what it is doing: working, idle, or reconnecting.
+  Switching tabs takes the composer, the draft and the title with it, while the
+  chats behind carry on streaming; when one of them finishes, it buzzes and says so
+  by name. Three stay connected at a time and the rest wait as tabs, which is what
+  keeps six open conversations from costing a phone six live threads — tapping one
+  rejoins it exactly as another device would. Closing a tab never stops the
+  conversation behind it.
 - **Drafts survive the app going away** — a half-typed or half-dictated message is
   saved as you write it and restored with the conversation, because a phone browser
   reloads a backgrounded tab whenever it likes and a paragraph of dictation exists
@@ -140,6 +148,30 @@ Verified on a live box: two clients attached at once, one session, one `claude`
 process, and the session still running after both detached. Set
 `claudeMobile.claudeSurface` to `tmux` to make the Claude button open that instead
 of the panel.
+
+## What is running on the box
+
+`/chat/admin` — reachable from the **Box** tab at the bottom of the chat — is a task
+manager for the instance. It exists because every hard-won fact in this README was
+found the same way: an SSM shell, `ps` and `journalctl`. None of it was visible from
+the app itself.
+
+- **Every conversation on every surface** — the chat's, the editor panel's through
+  the broker, and each tmux session — with the project it is in, how long it has been
+  idle, and how much memory it is holding.
+- **The services the deployment is made of**, live, with memory for the box and disk
+  for the workspace volume.
+- **What is wrong, in words.** An editor panel that has forked. Processes the panel
+  started and never spoke to (ten of those were once holding 2 GB of 7.8 GB). A tmux
+  server in a cgroup the next deploy will kill. Each one says what it costs, and the
+  ones with a safe fix have a button.
+- **Stopping one thing.** Anything that might be mid-turn refuses the first tap and
+  says what you would lose; confirming is a deliberate answer to that question rather
+  than a default. Killing a whole service is not offered — that is `systemctl`'s job,
+  over SSM, where you can see the output.
+
+It is a screen inside the chat service rather than a second app, so there is one
+login, one authentication implementation, and nothing new exposed to the internet.
 
 ## Voice
 
@@ -349,7 +381,8 @@ rules that matter, and the gotchas that have burned people. Contributions welcom
 — see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ```bash
-npm test                              # auth + client + overlay + dictation + projects + broker
+npm test                              # auth + client + chat tabs + overlay + dictation
+                                      # + projects + operations surface + broker
 cd infra && npx cdk synth --quiet     # stack compiles
 ```
 

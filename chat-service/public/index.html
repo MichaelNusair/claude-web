@@ -30,6 +30,11 @@
   <nav class="tabbar">
     <button class="tab active">Chats</button>
     <a class="tab" href="/editor/" target="_blank" rel="noopener">Editor</a>
+    <!-- A full navigation rather than a screen in this shell: the page you open
+         when the chat is misbehaving must not depend on the chat's own JS. It is
+         reached through /chat/ so that nginx already routes it — see
+         chat-service/admin.js. -->
+    <a class="tab" href="/chat/admin">Box</a>
   </nav>
 </section>
 
@@ -93,7 +98,15 @@
     </button>
   </header>
 
-  <div id="thread" class="thread"></div>
+  <!-- Open conversations. Tabs rather than tiles: two 190px columns on a phone
+       make both chats unreadable, and what a second window is actually for is
+       switching without losing state and seeing what the other one is doing. -->
+  <div id="tabs" class="tabs hidden"></div>
+
+  <!-- One .thread per open chat, only the active one displayed. They stay in the
+       DOM so switching back is instant and nothing has to be re-rendered — see
+       the panes section of app.js for what that costs and how it is bounded. -->
+  <div id="threads" class="threads"></div>
 
   <!-- Dictation state, in words, directly above the composer.
        A tinted mic button is not enough: the failure this exists for is the

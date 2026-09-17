@@ -100,6 +100,14 @@ html, body {
   border-radius: 9px; font-size: 11px; font-weight: 600;
   background: var(--accent-dim); color: #fff; vertical-align: 1px;
 }
+.row-live.busy { background: var(--accent); }
+/* Already a tab on this device, so tapping the row switches to it rather than
+   opening the same conversation a second time. */
+.row-open {
+  display: inline-block; margin-left: 4px; padding: 1px 6px;
+  border-radius: 9px; font-size: 11px; font-weight: 600;
+  background: var(--bg-input); color: var(--text-dim); vertical-align: 1px;
+}
 .avatar {
   width: 42px; height: 42px; border-radius: 50%;
   background: var(--accent-dim); color: #fff;
@@ -135,12 +143,66 @@ html, body {
 }
 .tab.active { color: var(--accent); font-weight: 600; }
 
+/* --- tabs: several chats open at once --- */
+/* A strip of chips rather than split panes. At 390px two columns make both
+   conversations unreadable; what a second window is for here is switching without
+   losing state and seeing what the other one is doing, and this costs no width. */
+.tabs {
+  flex: 0 0 auto;
+  display: flex; gap: 6px; padding: 6px 8px;
+  overflow-x: auto; -webkit-overflow-scrolling: touch;
+  background: var(--bg-raised); border-bottom: 1px solid var(--border);
+  scrollbar-width: none;
+}
+.tabs::-webkit-scrollbar { display: none; }
+
+/* Two controls, so a div with buttons inside: a button inside a button is not
+   valid HTML and browsers recover from it unpredictably. Same reason as .row-wrap. */
+.chip {
+  display: flex; align-items: center; flex: 0 0 auto; min-width: 0;
+  background: var(--bg-input); border: 1px solid transparent; border-radius: 999px;
+}
+.chip.active { background: var(--bg); border-color: var(--accent-dim); }
+.chip-main {
+  display: flex; align-items: center; gap: 7px; min-width: 0;
+  padding: 6px 4px 6px 10px;
+  border: none; background: none; color: var(--text-dim);
+  font: inherit; font-size: 13px; cursor: pointer;
+}
+.chip.active .chip-main { color: var(--text); font-weight: 600; }
+.chip-name { max-width: 108px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* The dot is the whole point of the strip: what that chat is doing right now. */
+.chip-dot { width: 7px; height: 7px; flex: 0 0 auto; border-radius: 50%; background: #4c9a6a; }
+.chip.busy .chip-dot { background: var(--accent); animation: blink 1.3s infinite both; }
+/* Cooled: still a conversation on the box, just not one this device is holding
+   a socket and a thread for. Hollow, because tapping it is a reconnect. */
+.chip.cold .chip-dot { background: transparent; box-shadow: inset 0 0 0 1.5px var(--text-dim); }
+.chip.trouble .chip-dot { background: var(--error); box-shadow: none; }
+/* Finished while you were reading something else. */
+.chip.unread { box-shadow: 0 0 0 2px rgba(217, 119, 87, .35); }
+.chip.unread .chip-main { color: var(--text); }
+.chip-x {
+  flex: 0 0 auto; padding: 6px 9px 6px 3px;
+  border: none; background: none; color: var(--text-dim);
+  font: inherit; font-size: 12px; cursor: pointer;
+}
+.chip-add {
+  flex: 0 0 auto; width: 34px;
+  border: 1px dashed var(--border); border-radius: 999px;
+  background: none; color: var(--text-dim);
+  font: inherit; font-size: 17px; line-height: 1; cursor: pointer;
+}
+
 /* --- thread --- */
+/* One .thread per open chat, all in the DOM, one displayed. Switching is a class
+   change, so coming back to a long conversation re-renders nothing. */
+.threads { flex: 1; min-height: 0; display: flex; }
 .thread {
-  flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch;
+  flex: 1; min-width: 0; overflow-y: auto; -webkit-overflow-scrolling: touch;
   padding: 16px 12px 8px;
   display: flex; flex-direction: column; gap: 10px;
 }
+.thread:not(.active) { display: none; }
 
 .msg { max-width: 86%; padding: 10px 14px; border-radius: var(--radius); white-space: pre-wrap; word-wrap: break-word; }
 .msg.user {
@@ -363,3 +425,96 @@ html, body {
 .fact-list li.at-risk span:last-child { color: var(--accent); }
 .danger { background: var(--error); }
 .subtle { background: var(--bg-input); color: var(--text); }
+
+/* --- admin (/chat/admin) --- */
+/* Same variables, same row shape, same bar: this is a screen of the app, not a
+   second app. See chat-service/admin.js for why it lives in this process. */
+
+/* Findings sit above the inventory and are the only coloured thing on the page,
+   so that "is anything wrong" is answered before you read a single number. */
+.finding {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px;
+  margin: 10px 12px; padding: 11px 13px;
+  border-radius: 12px; border-left: 3px solid var(--text-dim);
+  background: var(--bg-raised); font-size: 13.5px;
+}
+.finding-text { flex: 1; min-width: 0; font-weight: 600; }
+.finding-detail { flex-basis: 100%; color: var(--text-dim); font-size: 12.5px; line-height: 1.4; }
+.finding.error { border-left-color: var(--error); background: rgba(224, 82, 82, .12); }
+.finding.warn { border-left-color: var(--accent); }
+.finding.info { border-left-color: var(--border); }
+
+/* Host numbers. Four at a time on a phone reads better as a 2×2 grid than as
+   four rows that push the session lists below the fold. */
+.cards {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 8px;
+  padding: 0 12px;
+}
+.card {
+  padding: 11px 13px; border-radius: 12px;
+  background: var(--bg-raised); border: 1px solid var(--border);
+}
+.card-label {
+  font-size: 11px; font-weight: 600; text-transform: uppercase;
+  letter-spacing: .06em; color: var(--text-dim);
+}
+.card-value { font-size: 22px; font-weight: 600; margin: 2px 0 6px; }
+.card-note {
+  font-size: 11.5px; color: var(--text-dim);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.meter { height: 4px; margin-bottom: 6px; border-radius: 999px; background: var(--bg-input); overflow: hidden; }
+.meter span { display: block; height: 100%; background: var(--accent-dim); }
+.meter span.hot { background: var(--error); }
+
+/* One line per unit — five of them, and the whole question is which dot is off. */
+.units { margin: 0 12px; border: 1px solid var(--border); border-radius: 12px; overflow: hidden; }
+.unit {
+  display: flex; align-items: center; gap: 9px;
+  padding: 10px 12px; font-size: 13.5px;
+  background: var(--bg-raised); border-bottom: 1px solid var(--border);
+}
+.unit:last-child { border-bottom: none; }
+.unit .dot { width: 8px; height: 8px; flex: 0 0 auto; border-radius: 50%; background: #4c9a6a; }
+.unit.down .dot { background: var(--error); }
+.unit-name {
+  flex: 1; min-width: 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.unit-state { color: var(--text-dim); font-size: 12.5px; }
+.unit.down .unit-state { color: var(--error); }
+.unit-mem { color: var(--text-dim); font-size: 12px; min-width: 52px; text-align: right; }
+
+/* A session row. `.row` is written for the chat list's <button>s; these are divs
+   with their own button inside, so the affordances that would imply the whole row
+   is tappable are taken back off. */
+.admin-row { cursor: default; }
+.admin-row:active { background: none; }
+.admin-row .row-sub {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px;
+}
+.row-badges { display: flex; flex-wrap: wrap; gap: 4px; justify-content: flex-end; flex: 0 0 auto; }
+.pill {
+  padding: 1px 7px; border-radius: 9px;
+  font-size: 11px; font-weight: 600;
+  background: var(--bg-input); color: var(--text-dim);
+}
+.pill.hot { background: var(--accent-dim); color: #fff; }
+.pill.warn { background: rgba(224, 82, 82, .16); color: var(--error); }
+
+/* Destructive, so it looks it — but not a full-width red button, because on this
+   page most rows are healthy and the button is not the point of the row. */
+.kill-btn {
+  flex: 0 0 auto; margin-left: 4px;
+  padding: 7px 11px; border: 1px solid var(--border); border-radius: 10px;
+  background: var(--bg-input); color: var(--error);
+  font: inherit; font-size: 12.5px; font-weight: 600; cursor: pointer;
+}
+.kill-btn:active { background: rgba(224, 82, 82, .16); }
+
+.empty.small { padding: 16px; text-align: left; font-size: 13px; }
+.label-note { font-weight: 400; text-transform: none; letter-spacing: 0; }
+.label-note code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px;
+}
+#admin-footer { padding: 20px 16px calc(24px + env(safe-area-inset-bottom)); line-height: 1.45; }

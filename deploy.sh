@@ -108,6 +108,19 @@ step "Checking the client boots"
 ) || { echo "client smoke test failed — not deploying." >&2; exit 1; }
 
 # ---------------------------------------------------------------------------
+step "Checking several chats at once"
+# ---------------------------------------------------------------------------
+# Everything a second chat tab is for happens where no browser can show it: in a
+# thread that is off screen. What this holds down is the part that would cost work
+# rather than pixels — closing a tab must not stop the conversation behind it, the
+# tab limit must not silence a chat that is still working, and no session id may
+# ever be held by two panes at once.
+(
+  cd chat-service
+  node pane-test.js
+) || { echo "multi-chat tests failed — not deploying." >&2; exit 1; }
+
+# ---------------------------------------------------------------------------
 step "Checking the editor overlay"
 # ---------------------------------------------------------------------------
 # Nothing but nginx loads this file, so a load-time error removes the mic, the
@@ -130,6 +143,19 @@ step "Checking the project lifecycle"
   cd chat-service
   node project-test.js
 ) || { echo "project lifecycle tests failed — not deploying." >&2; exit 1; }
+
+# ---------------------------------------------------------------------------
+step "Checking the operations surface"
+# ---------------------------------------------------------------------------
+# /chat/admin can signal processes, so what it *refuses* is the code under test:
+# nothing stopped mid-turn without an answered question, no pid signalled that has
+# not just been re-found under the broker, and no session name handed to tmux
+# unvalidated. Runs the page in a DOM too, since this is the surface you would be
+# opening to find out why something else is broken.
+(
+  cd chat-service
+  node admin-test.js
+) || { echo "admin tests failed — not deploying." >&2; exit 1; }
 
 # ---------------------------------------------------------------------------
 step "Checking the Claude broker"

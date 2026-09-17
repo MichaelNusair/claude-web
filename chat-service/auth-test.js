@@ -161,6 +161,16 @@ const guarded = [
   // well as a private one.
   ['POST', '/api/polish'],
   ['POST', '/api/client-error'],
+  // The operations surface. `/admin` is the reason this list matters most: it
+  // enumerates every process on the box and can signal three of them, so an
+  // unauthenticated hit here would be a remote inventory *and* a remote kill.
+  ['GET', '/admin'],
+  ['GET', '/admin.html'],
+  ['GET', '/admin.js'],
+  ['GET', '/api/admin/overview'],
+  ['POST', '/api/admin/kill'],
+  ['POST', '/api/admin/reap'],
+  ['GET', '/api/live'],
   ['GET', '/app.js'],
   ['GET', '/'],
 ];

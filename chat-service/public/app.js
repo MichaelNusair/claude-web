@@ -84,44 +84,67 @@ function loadSettings() {
   }
 }
 
-// The chat that was open when this device last had the app in the foreground.
-// Persisted so a refresh, an app-switch on iOS, or reopening the PWA resumes
-// the same conversation instead of dropping back to the list and starting over.
-const OPEN_CHAT_KEY = 'claude-chat-open';
+/*
+ * Which chats this device has open, and which one it was looking at.
+ *
+ * Persisted so a refresh, an app-switch on iOS, or reopening the PWA comes back
+ * to the same set of conversations instead of dropping to the list and starting
+ * over. Only chats that have a session id are written down: that id is the
+ * durable, cross-device name for a conversation, and one without it cannot be
+ * rejoined by anybody — including this device a second later.
+ */
+const OPEN_PANES_KEY = 'claude-chat-panes';
+// The single-chat key this replaced. Read once at boot so upgrading does not drop
+// the conversation the user had open, and never written again.
+const LEGACY_OPEN_CHAT_KEY = 'claude-chat-open';
+// More tabs than this is a scrolling strip nobody reads, and every one of them is
+// a conversation to keep track of. The oldest fall off the end; their processes
+// keep running and they are still in the list.
+const MAX_TABS = 6;
 
-function saveOpenChat(chat) {
+function saveOpenPanes() {
   try {
-    if (chat) localStorage.setItem(OPEN_CHAT_KEY, JSON.stringify(chat));
-    else localStorage.removeItem(OPEN_CHAT_KEY);
+    const open = [...panes.values()]
+      .filter((p) => p.sessionId && !p.closed)
+      .slice(-MAX_TABS)
+      .map((p) => ({ cwd: p.cwd, title: p.title, sessionId: p.sessionId }));
+    if (!open.length) {
+      localStorage.removeItem(OPEN_PANES_KEY);
+      return;
+    }
+    localStorage.setItem(
+      OPEN_PANES_KEY,
+      JSON.stringify({ panes: open, activeKey: state.activeKey }),
+    );
   } catch {
     /* private mode; device-switching still works via the session id */
   }
 }
-function loadOpenChat() {
+
+function loadOpenPanes() {
   try {
-    return JSON.parse(localStorage.getItem(OPEN_CHAT_KEY) || 'null');
+    const saved = JSON.parse(localStorage.getItem(OPEN_PANES_KEY) || 'null');
+    if (saved?.panes?.length) {
+      return { panes: saved.panes.slice(-MAX_TABS), activeKey: saved.activeKey || null };
+    }
+    const legacy = JSON.parse(localStorage.getItem(LEGACY_OPEN_CHAT_KEY) || 'null');
+    if (legacy?.cwd && legacy?.sessionId) {
+      return { panes: [legacy], activeKey: paneKey(legacy.cwd, legacy.sessionId) };
+    }
   } catch {
-    return null;
+    /* fall through to a cold start, which is always safe */
   }
+  return { panes: [], activeKey: null };
 }
 
 const state = {
-  ws: null,
-  conversationId: null,
-  // The CLI's own session id: the durable, cross-device name for this chat.
-  // `conversationId` only identifies the process to this browser, so it is
-  // useless after a refresh and meaningless on another device.
-  sessionId: null,
-  cwd: null,
-  title: null,
   projects: [],
-  busy: false,
-  streamingEl: null,     // the assistant bubble currently being appended to
-  typingEl: null,
-  toolEls: new Map(),    // tool_use id -> card element, so results can attach
-  echoedMessages: new Set(), // locally-rendered sends, to drop the server echo
   settings: loadSettings(),
-  reconnectDelay: 500,
+  // Which pane is on screen. Everything else about a conversation lives in the
+  // pane itself — see the panes section — because a conversation now keeps
+  // running, and keeps rendering, while you are looking at a different one.
+  activeKey: null,
+  newPaneSeq: 0,
 };
 function saveSettings() {
   localStorage.setItem('claude-chat', JSON.stringify(state.settings));
@@ -146,9 +169,12 @@ function back() {
   const target = navStack[navStack.length - 1] || 'list';
   for (const s of screens) $(`#screen-${s}`).classList.toggle('active', s === target);
   if (target === 'list') {
-    // Deliberately leaving the chat, so don't reopen it on the next launch.
-    // The server process keeps running; the chat is still in the list.
-    saveOpenChat(null);
+    // Deliberately looking away from every chat, so the next launch lands on the
+    // list. The panes stay open and their sockets stay up — that is how a chat
+    // left working still announces itself — but none of them is on screen now.
+    saveDraft({ now: true });
+    state.activeKey = null;
+    saveOpenPanes();
     refreshList();
   }
 }
@@ -202,24 +228,64 @@ async function refreshList() {
   for (const { project, session } of rows) {
     const row = document.createElement('button');
     row.className = 'row';
+    // The key the pane map and /api/live both use, so the badges below can be
+    // kept honest by polling without re-reading every transcript to redraw a list.
+    row.dataset.key = paneKey(project.path, session.sessionId);
     // A chat that is still live on the server is labelled, so it's clear that
     // opening it joins the running session — including one left working on
     // another device.
-    const status = session.busy
-      ? '<span class="row-live">working…</span>'
-      : session.live
-        ? '<span class="row-live">live</span>'
-        : '';
     row.innerHTML = `
       <div class="avatar">${escapeHtml(project.name.slice(0, 2).toUpperCase())}</div>
       <div class="row-main">
         <div class="row-title">${escapeHtml(session.title)}</div>
-        <div class="row-sub">${escapeHtml(project.name)} · ${relTime(session.mtime)} ${status}</div>
+        <div class="row-sub">${escapeHtml(project.name)} · ${relTime(session.mtime)}
+          <span class="row-live hidden"></span><span class="row-open hidden">open</span>
+        </div>
       </div>`;
     row.addEventListener('click', () =>
       openChat({ cwd: project.path, title: session.title, resumeSessionId: session.sessionId }),
     );
     body.appendChild(row);
+  }
+  paintRowBadges(liveByKey(rows));
+}
+
+/**
+ * What the server said about each session, keyed the way the rows are.
+ *
+ * `/api/projects` already carries `live` and `busy`, so the first paint after a
+ * list load uses that rather than waiting up to a poll interval to look right.
+ */
+function liveByKey(rows) {
+  const map = new Map();
+  for (const { project, session } of rows) {
+    if (!session.live && !session.busy) continue;
+    map.set(paneKey(project.path, session.sessionId), { busy: Boolean(session.busy) });
+  }
+  return map;
+}
+
+/**
+ * Update the list's badges in place.
+ *
+ * In place, rather than by redrawing the list, because redrawing means
+ * `/api/projects` — which stats and reads every transcript to build titles. This
+ * runs every few seconds; that route cannot.
+ */
+function paintRowBadges(byKey) {
+  for (const row of document.querySelectorAll('#list-body .row[data-key]')) {
+    const live = byKey.get(row.dataset.key);
+    const badge = row.querySelector('.row-live');
+    const open = row.querySelector('.row-open');
+    if (badge) {
+      const text = live?.busy ? 'working…' : live ? 'live' : '';
+      badge.textContent = text;
+      badge.classList.toggle('hidden', !text);
+      badge.classList.toggle('busy', Boolean(live?.busy));
+    }
+    // Already a tab on this device: tapping the row switches to it rather than
+    // opening the same conversation twice.
+    if (open) open.classList.toggle('hidden', !panes.has(row.dataset.key));
   }
 }
 
@@ -473,8 +539,11 @@ async function removeProjectFromMachine(force) {
         : `Pushed and deleted "${project.name}".`,
       5000,
     );
-    // The open chat may have been in the project that just went away.
-    if (state.cwd === project.path) saveOpenChat(null);
+    // Any open chat may have been in the project that just went away. Its
+    // directory no longer exists, so the tab cannot be reconnected or resumed.
+    for (const pane of [...panes.values()]) {
+      if (pane.cwd === project.path) closePane(pane, { quiet: true });
+    }
     await refreshList();
     renderProjectPicker();
   } catch (err) {
@@ -529,58 +598,347 @@ $('#form-project').addEventListener('submit', async (e) => {
   }
 });
 
-// --- chat -------------------------------------------------------------------
-function openChat({ cwd, title, resumeSessionId }) {
-  state.cwd = cwd;
-  state.title = title || 'Claude';
-  // Not a handle on anything yet — the server assigns one on attach. The
-  // session id is what carries identity across refreshes and devices.
-  state.conversationId = null;
-  state.sessionId = resumeSessionId || null;
-  state.toolEls.clear();
-  state.echoedMessages.clear();
-  state.streamingEl = null;
-  $('#chat-title').textContent = state.title;
-  $('#thread').innerHTML = '';
-  setBusy(false);
-  show('chat');
-  // Whatever was typed here and not sent before the page last went away. Safe to
-  // reach the composer from here for the same reason `back()` can reach `voice`:
-  // this only runs from a click or from boot(), long after the script is
-  // evaluated.
-  restoreDraft({ cwd, sessionId: state.sessionId });
-  // Remember it now, so a crash or a force-quit before the first reply still
-  // leaves this device able to rejoin.
-  if (resumeSessionId) saveOpenChat({ cwd, title: state.title, sessionId: resumeSessionId });
-  connect({ cwd, resumeSessionId });
+// --- panes ------------------------------------------------------------------
+/*
+ * Several conversations open at once, on a phone.
+ *
+ * A pane is one conversation and everything that draws it: its socket, its thread
+ * element, the bubble currently being streamed into, the tool cards still waiting
+ * for their results. It exists because the thing that makes a second window worth
+ * having is that the first one keeps working while you are not looking at it — so
+ * events have to land in a thread that is off screen, which cannot happen while
+ * there is exactly one of everything.
+ *
+ * Tabs, not tiles. Two 190px columns on a 390px phone make both conversations
+ * unreadable; what a second window is actually for here is switching without
+ * losing state and knowing what the other one is doing, and a strip of chips with
+ * a status dot gives both for no width at all.
+ *
+ * Only MAX_LIVE panes hold a socket and a thread. Past that the least recently
+ * used *idle* pane is cooled: socket closed, thread dropped, tab kept. Nothing is
+ * lost — the process keeps running on the box and the transcript is on disk, so
+ * coming back is the same join another device would do — and it is what stops six
+ * open tabs from being six threads of several hundred bubbles in a phone's
+ * memory. A working pane is never cooled: being told when it lands is the point.
+ */
+const MAX_LIVE = 3;
+const panes = new Map();
+
+/** The durable name for a conversation, and the key everything else agrees on. */
+function paneKey(cwd, sessionId) {
+  return `${cwd}|${sessionId || ''}`;
 }
 
-function connect({ cwd, resumeSessionId }) {
-  setSub('connecting…');
+function activePane() {
+  return panes.get(state.activeKey) || null;
+}
+
+function makePane({ cwd, title, sessionId }) {
+  // A chat with no session id yet has no durable name, so it gets a private one
+  // until the CLI assigns the real one and `rememberSession` re-keys it.
+  const key = sessionId ? paneKey(cwd, sessionId) : `${cwd}|new:${++state.newPaneSeq}`;
+  const pane = {
+    key,
+    cwd,
+    title: title || 'Claude',
+    // The CLI's own session id: the durable, cross-device name for this chat.
+    // `conversationId` only identifies the process to this browser, so it is
+    // useless after a refresh and meaningless on another device.
+    sessionId: sessionId || null,
+    conversationId: null,
+    ws: null,
+    thread: null,          // created on activation; null while cold
+    chip: null,
+    cold: true,            // no socket, no thread: a tab and a session id
+    closed: false,         // the tab is gone; never reconnect
+    trouble: false,        // socket could not be established or the session ended
+    busy: false,
+    sub: 'connecting…',
+    unread: false,
+    touchedAt: Date.now(),
+    streamingEl: null,     // the assistant bubble currently being appended to
+    typingEl: null,
+    toolEls: new Map(),    // tool_use id -> card element, so results can attach
+    echoedMessages: new Set(), // locally-rendered sends, to drop the server echo
+    reconnectDelay: 500,
+    draft: '',
+  };
+  panes.set(key, pane);
+  return pane;
+}
+
+function openChat({ cwd, title, resumeSessionId }) {
+  // One pane per conversation, always. Two panes on one session id would be two
+  // sockets appending to one transcript — the divergence this project has already
+  // had once, and the reason the server keys conversations by cwd|sessionId.
+  const existing = resumeSessionId ? panes.get(paneKey(cwd, resumeSessionId)) : null;
+  const pane = existing || makePane({ cwd, title, sessionId: resumeSessionId });
+  activatePane(pane);
+  return pane;
+}
+
+/** Put a pane on screen. The composer, the header and the draft follow it. */
+function activatePane(pane) {
+  if (!pane || pane.closed) return;
+  const previous = activePane();
+  if (previous && previous !== pane) {
+    // The composer belongs to whichever pane is on screen, so what is in it goes
+    // back to the pane being left — including a dictation in progress, which is
+    // why the mic stops here rather than following the switch. Safe to reach
+    // `voice` for the same reason `back()` can: this only runs from a tap or from
+    // boot(), never during initialisation.
+    if (voice.active) stopVoice();
+    else hideDictationBar();
+    saveDraft({ now: true });
+    previous.draft = input.value;
+  }
+
+  state.activeKey = pane.key;
+  pane.unread = false;
+  pane.touchedAt = Date.now();
+
+  // Belt and braces rather than relying on `previous`: with no pane active (after
+  // going back to the list) there is nobody to take the class off.
+  for (const el of document.querySelectorAll('#threads .thread.active')) {
+    el.classList.remove('active');
+  }
+  if (!pane.thread) {
+    pane.thread = document.createElement('div');
+    pane.thread.className = 'thread';
+    pane.thread.dataset.key = pane.key;
+    $('#threads').appendChild(pane.thread);
+  }
+  pane.thread.classList.add('active');
+
+  $('#chat-title').textContent = pane.title;
+  setSub(pane, pane.sub);
+  setBusy(pane, pane.busy);
+  input.value = pane.draft || '';
+  autosize();
+  // Whatever was typed here and not sent before the page last went away.
+  restoreDraft(pane);
+  renderTabs();
+  show('chat');
+  saveOpenPanes();
+  if (pane.cold) reheat(pane);
+  scrollDown(pane, true);
+}
+
+/**
+ * Give a cold tab a socket again.
+ *
+ * Exactly what another device joining would do: connect, adopt the running
+ * process if there is one, rebuild the thread from the server's history. That
+ * path is the one this app has always used for a refresh, so a cooled tab is not
+ * a new kind of state to get wrong.
+ */
+function reheat(pane) {
+  if (!makeRoomFor(pane)) {
+    toast(`${MAX_LIVE} chats are already working — this one makes ${MAX_LIVE + 1}.`);
+  }
+  pane.cold = false;
+  pane.conversationId = null;
+  pane.reconnectDelay = 500;
+  connect(pane);
+  renderTabs();
+}
+
+/**
+ * Cool a pane down to a tab.
+ *
+ * Deliberately not a stop: the conversation keeps running on the box, which is
+ * why coming back to it costs nothing but a reconnect. Killing it would be a
+ * choice for /chat/admin to offer, not something a tab limit does quietly.
+ */
+function coolPane(pane) {
+  pane.cold = true;
+  pane.conversationId = null;
+  const ws = pane.ws;
+  pane.ws = null;
+  try {
+    ws?.close();
+  } catch {
+    /* already gone, which is the outcome anyway */
+  }
+  pane.thread?.remove();
+  pane.thread = null;
+  pane.toolEls.clear();
+  pane.echoedMessages.clear();
+  pane.streamingEl = null;
+  pane.typingEl = null;
+  renderTabs();
+}
+
+/**
+ * Make room under the live cap, cooling the least recently used idle pane.
+ *
+ * Returns false when every other live pane is working. Cooling one of those would
+ * be a lie — the tab would go quiet while the box was still spending on it — so
+ * the cap is exceeded instead and the caller says so.
+ */
+function makeRoomFor(pane) {
+  const live = () => [...panes.values()].filter((p) => !p.cold && !p.closed && p !== pane);
+  while (live().length >= MAX_LIVE) {
+    const idle = live()
+      .filter((p) => !p.busy)
+      .sort((a, b) => a.touchedAt - b.touchedAt)[0];
+    if (!idle) return false;
+    coolPane(idle);
+  }
+  return true;
+}
+
+/**
+ * Close a tab.
+ *
+ * The conversation is not stopped: it stays in the list, stays on /chat/admin, and
+ * keeps working if it was working. Nothing here can lose a turn, so nothing here
+ * asks — the one thing worth saying is that closing was not stopping.
+ */
+function closePane(pane, { quiet = false } = {}) {
+  const wasBusy = pane.busy;
+  pane.closed = true;
+  coolPane(pane);
+  panes.delete(pane.key);
+  if (wasBusy && !quiet) toast(`${pane.title} keeps working — reopen it from the list.`);
+
+  if (state.activeKey === pane.key) {
+    state.activeKey = null;
+    const next = [...panes.values()].pop();
+    if (next) {
+      activatePane(next);
+      return;
+    }
+    renderTabs();
+    saveOpenPanes();
+    if ($('#screen-chat').classList.contains('active')) back();
+    return;
+  }
+  renderTabs();
+  saveOpenPanes();
+}
+
+// --- tab strip ---------------------------------------------------------------
+/*
+ * Rebuilt only when the set of tabs changes. A conversation streaming tokens
+ * updates its own chip through `paintChip`, because rebuilding this strip on every
+ * delta would be a DOM teardown per word.
+ */
+function renderTabs() {
+  const bar = $('#tabs');
+  bar.innerHTML = '';
+  const open = [...panes.values()];
+  bar.classList.toggle('hidden', open.length === 0);
+
+  for (const pane of open) {
+    const chip = document.createElement('div');
+    chip.className = 'chip';
+    chip.dataset.key = pane.key;
+
+    const main = document.createElement('button');
+    main.type = 'button';
+    main.className = 'chip-main';
+    main.innerHTML = '<span class="chip-dot"></span><span class="chip-name"></span>';
+    main.querySelector('.chip-name').textContent = pane.title;
+    main.addEventListener('click', () => activatePane(pane));
+
+    const close = document.createElement('button');
+    close.type = 'button';
+    close.className = 'chip-x';
+    close.setAttribute('aria-label', `Close ${pane.title}`);
+    close.textContent = '✕';
+    close.addEventListener('click', () => closePane(pane));
+
+    chip.append(main, close);
+    bar.appendChild(chip);
+    pane.chip = chip;
+    paintChip(pane);
+  }
+
+  // The only way to open a second chat from inside the first. Without it the
+  // feature is reachable only by going back to the list, which is the flow tabs
+  // exist to replace.
+  const add = document.createElement('button');
+  add.type = 'button';
+  add.className = 'chip-add';
+  add.setAttribute('aria-label', 'Open another chat');
+  add.textContent = '+';
+  add.addEventListener('click', async () => {
+    await refreshList();
+    renderProjectPicker();
+    $('#repo-picker').innerHTML = '';
+    $('#clone-status').textContent = '';
+    show('new');
+  });
+  bar.appendChild(add);
+}
+
+/** One chip's state: which tab you are on, and what the others are doing. */
+function paintChip(pane) {
+  const chip = pane.chip;
+  if (!chip) return;
+  chip.classList.toggle('active', pane.key === state.activeKey);
+  chip.classList.toggle('busy', pane.busy);
+  chip.classList.toggle('cold', pane.cold);
+  chip.classList.toggle('unread', pane.unread && pane.key !== state.activeKey);
+  chip.classList.toggle('trouble', pane.trouble);
+  chip.querySelector('.chip-name').textContent = pane.title;
+}
+
+/**
+ * A background conversation reached the end of a turn.
+ *
+ * This is the payoff for having tabs at all: send a task in one chat, read
+ * another, and find out when the first lands without going to look. Deliberately
+ * a toast and a buzz rather than a web notification — those need a permission
+ * prompt and a service worker, and this app unregisters its worker on purpose
+ * because a wedged one has no user-side escape.
+ */
+function announce(pane, text) {
+  pane.unread = true;
+  paintChip(pane);
+  toast(`${pane.title}: ${text}`);
+  try {
+    navigator.vibrate?.(120);
+  } catch {
+    /* iOS has no vibrate; the toast is the fallback */
+  }
+}
+
+// --- chat -------------------------------------------------------------------
+function connect(pane) {
+  setSub(pane, 'connecting…');
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   const ws = new WebSocket(`${proto}//${location.host}/ws`);
-  state.ws = ws;
+  pane.ws = ws;
+  // Every handler below asks this first. A cooled or closed pane's socket is
+  // still in flight for a moment, and a reconnect from it would be a second
+  // process handle for a conversation this device is no longer showing.
+  const stale = () => pane.ws !== ws || pane.closed;
 
   ws.addEventListener('open', () => {
-    state.reconnectDelay = 500;
-    if (state.conversationId) {
+    if (stale()) return;
+    pane.reconnectDelay = 500;
+    pane.trouble = false;
+    paintChip(pane);
+    if (pane.conversationId) {
       // Same page, same socket generation: the fast path.
-      ws.send(JSON.stringify({ type: 'reattach', conversationId: state.conversationId }));
+      ws.send(JSON.stringify({ type: 'reattach', conversationId: pane.conversationId }));
     } else {
-      // No process handle — either a refresh, or another device. `start` with a
-      // session id adopts the running process if there is one, so this is a
-      // join, not a restart. The thread is rebuilt from scratch, so clear it to
+      // No process handle — a refresh, a cooled tab, or another device. `start`
+      // with a session id adopts the running process if there is one, so this is
+      // a join, not a restart. The thread is rebuilt from scratch, so clear it to
       // avoid duplicating what is already on screen.
-      const sessionId = resumeSessionId || state.sessionId;
-      if (sessionId) {
-        $('#thread').innerHTML = '';
-        state.toolEls.clear();
-        state.streamingEl = null;
+      if (pane.sessionId) {
+        if (pane.thread) pane.thread.innerHTML = '';
+        pane.toolEls.clear();
+        pane.streamingEl = null;
+        pane.typingEl = null;
       }
       ws.send(JSON.stringify({
         type: 'start',
-        cwd,
-        resumeSessionId: sessionId,
+        cwd: pane.cwd,
+        resumeSessionId: pane.sessionId,
         model: state.settings.model,
         permissionMode: state.settings.permissionMode,
         effort: state.settings.effort,
@@ -589,35 +947,50 @@ function connect({ cwd, resumeSessionId }) {
   });
 
   ws.addEventListener('message', (e) => {
+    if (stale()) return;
     let msg;
     try {
       msg = JSON.parse(e.data);
     } catch {
       return;
     }
-    handleEvent(msg);
+    handleEvent(msg, pane);
   });
 
   // If the socket neither opens nor errors (captive portal, dead cell data),
   // give up rather than spin forever.
   const openTimer = setTimeout(() => {
+    if (stale()) return;
     if (ws.readyState === WebSocket.CONNECTING) {
-      setSub('connection failed');
-      toast("Couldn't reach the server — check your connection.");
+      setSub(pane, 'connection failed');
+      pane.trouble = true;
+      paintChip(pane);
+      // Only the chat being looked at gets to interrupt. A background tab says it
+      // on its own dot instead of talking over the conversation in front of you.
+      if (pane === activePane()) toast("Couldn't reach the server — check your connection.");
       ws.close();
     }
   }, 15000);
   ws.addEventListener('open', () => clearTimeout(openTimer));
 
-  ws.addEventListener('error', () => setSub('connection error'));
+  ws.addEventListener('error', () => {
+    if (!stale()) setSub(pane, 'connection error');
+  });
 
   ws.addEventListener('close', () => {
     clearTimeout(openTimer);
-    setSub('reconnecting…');
-    // The server keeps the claude process alive, so reattaching resumes the
-    // same conversation — important when a phone locks mid-task.
+    if (stale()) return;
+    setSub(pane, 'reconnecting…');
+    // The server keeps the claude process alive, so reattaching resumes the same
+    // conversation — important when a phone locks mid-task.
     setTimeout(async () => {
-      if (!$('#screen-chat').classList.contains('active')) return;
+      if (stale() || pane.cold) return;
+      // Deliberately not gated on the chat screen being active: a background tab
+      // has to stay connected, because being told when it finishes is the whole
+      // reason it is still open. Gated on the page being visible instead — a
+      // phone in a pocket must not retry in a loop — and `visibilitychange`
+      // reconnects every live pane on the way back.
+      if (document.visibilityState !== 'visible') return;
       // A rejected upgrade closes the socket with the same code as a dropped
       // network, so ask an authenticated route which one it was. Without this an
       // expired session shows "reconnecting…" forever with no way to sign in.
@@ -630,108 +1003,151 @@ function connect({ cwd, resumeSessionId }) {
       } catch {
         /* offline: fall through and retry, which is the right move */
       }
-      connect({ cwd, resumeSessionId });
-    }, state.reconnectDelay);
-    state.reconnectDelay = Math.min(state.reconnectDelay * 2, 8000);
+      connect(pane);
+    }, pane.reconnectDelay);
+    pane.reconnectDelay = Math.min(pane.reconnectDelay * 2, 8000);
   });
 }
 
-/** Record the durable session id and make this device able to rejoin later. */
-function rememberSession(sessionId) {
-  state.sessionId = sessionId;
-  saveOpenChat({ cwd: state.cwd, title: state.title, sessionId });
+/**
+ * Record the durable session id and make this device able to rejoin later.
+ *
+ * A brand-new chat is keyed privately until this arrives, so the pane is re-keyed
+ * here — along with its draft, which was saved under the private key and would
+ * otherwise be orphaned the moment the first reply came back.
+ */
+function rememberSession(pane, sessionId) {
+  if (!sessionId) return;
+  const previousKey = pane.key;
+  pane.sessionId = sessionId;
+  const key = paneKey(pane.cwd, sessionId);
+  if (key !== previousKey) {
+    const clash = panes.get(key);
+    // Two panes on one session id would diverge. A fresh id cannot collide, but
+    // if it ever did the older tab goes rather than both appending to one
+    // transcript.
+    if (clash && clash !== pane) closePane(clash, { quiet: true });
+    panes.delete(previousKey);
+    pane.key = key;
+    panes.set(key, pane);
+    if (pane.thread) pane.thread.dataset.key = key;
+    if (pane.chip) pane.chip.dataset.key = key;
+    if (state.activeKey === previousKey) state.activeKey = key;
+    // Deliberately not `previousKey`: a draft is keyed by the conversation it was
+    // typed in, and a chat with no session id yet has no name but its directory —
+    // so that is where the draft is, not under the pane's private `new:` key. A
+    // message typed before the first reply is the common case for a brand-new
+    // chat, and getting this wrong orphans exactly that one.
+    moveDraft(paneKey(pane.cwd, null), key);
+  }
+  saveOpenPanes();
 }
 
-function handleEvent(msg) {
+function handleEvent(msg, pane) {
   switch (msg.type) {
     case 'ready':
       // Server acknowledged the socket; the start/reattach we sent on open is
       // in flight. Nothing to do but stop looking stalled.
-      setSub('starting…');
+      setSub(pane, 'starting…');
       return;
 
     case 'history':
-      renderHistory(msg.messages, msg.truncated);
+      renderHistory(pane, msg.messages, msg.truncated);
       return;
 
     case 'attached':
-      state.conversationId = msg.conversationId;
-      if (msg.sessionId) rememberSession(msg.sessionId);
-      setBusy(msg.busy);
-      if (!msg.busy) setSub('ready');
+      pane.conversationId = msg.conversationId;
+      if (msg.sessionId) rememberSession(pane, msg.sessionId);
+      setBusy(pane, msg.busy);
+      if (!msg.busy) setSub(pane, 'ready');
       return;
 
     case 'session':
       // A new session's id arrives here; persist it so this chat is now
       // reachable from any other device and survives a refresh.
-      if (msg.sessionId) rememberSession(msg.sessionId);
-      setSub(state.busy ? 'working…' : 'ready');
+      rememberSession(pane, msg.sessionId);
+      setSub(pane, pane.busy ? 'working…' : 'ready');
       return;
 
     case 'joined':
       // Attached to a process that was already running, possibly started on
       // another device. Reflect its real state rather than assuming idle.
-      setBusy(msg.busy);
-      setSub(msg.busy ? 'working…' : 'ready');
+      setBusy(pane, msg.busy);
+      setSub(pane, msg.busy ? 'working…' : 'ready');
       return;
 
     case 'user_message':
       // Skip the server's echo of a message we already rendered locally.
-      if (state.echoedMessages.delete(msg.text)) return;
-      addBubble('user', msg.text);
+      if (pane.echoedMessages.delete(msg.text)) return;
+      addBubble(pane, 'user', msg.text);
       return;
 
     case 'delta':
-      appendStream(msg.text);
+      appendStream(pane, msg.text);
       return;
 
     case 'assistant_text':
       // The final text for a block; replaces whatever the deltas built so the
       // bubble matches the authoritative content exactly.
-      finalizeStream(msg.text);
+      finalizeStream(pane, msg.text);
       return;
 
     case 'tool_use':
-      addToolCard(msg);
+      addToolCard(pane, msg);
       return;
 
     case 'tool_result':
-      attachToolResult(msg);
+      attachToolResult(pane, msg);
       return;
 
     case 'turn_complete':
-      setBusy(false);
-      state.streamingEl = null;
-      setSub(msg.costUsd ? `ready · $${msg.costUsd.toFixed(3)}` : 'ready');
+      setBusy(pane, false);
+      pane.streamingEl = null;
+      setSub(pane, msg.costUsd ? `ready · $${msg.costUsd.toFixed(3)}` : 'ready');
+      if (pane !== activePane()) announce(pane, 'finished');
       return;
 
     case 'interrupted':
-      setBusy(false);
-      addBubble('system', 'Stopped.');
+      setBusy(pane, false);
+      addBubble(pane, 'system', 'Stopped.');
       return;
 
     case 'error':
-      setBusy(false);
-      addBubble('error', msg.message);
+      setBusy(pane, false);
+      addBubble(pane, 'error', msg.message);
+      if (pane !== activePane()) announce(pane, msg.message);
       return;
 
     case 'exit':
-      setBusy(false);
-      setSub('session ended');
+      setBusy(pane, false);
+      setSub(pane, 'session ended');
+      pane.trouble = true;
+      paintChip(pane);
       return;
   }
 }
 
 // --- rendering --------------------------------------------------------------
-function threadEl() { return $('#thread'); }
-
-function atBottom() {
-  const t = threadEl();
+/*
+ * Everything here takes the pane it draws into. Not a convenience: a background
+ * conversation streams tokens into a thread that is not on screen, so "the
+ * thread" and "the streaming bubble" cannot be things the module looks up.
+ *
+ * A pane being cooled has no thread at all, and its socket can still deliver a
+ * frame or two before it closes, so each of these tolerates a missing one rather
+ * than throwing inside a socket handler where nothing would catch it.
+ */
+function atBottom(pane) {
+  const t = pane.thread;
+  if (!t) return true;
   return t.scrollHeight - t.scrollTop - t.clientHeight < 120;
 }
-function scrollDown(force) {
-  const t = threadEl();
-  if (force || atBottom()) t.scrollTop = t.scrollHeight;
+function scrollDown(pane, force) {
+  const t = pane.thread;
+  // Scroll position is meaningless for a thread nobody is looking at, and reading
+  // scrollHeight on a display:none element is a layout for nothing.
+  if (!t || pane.key !== state.activeKey) return;
+  if (force || atBottom(pane)) t.scrollTop = t.scrollHeight;
 }
 
 /**
@@ -741,7 +1157,8 @@ function scrollDown(force) {
  * individually forces a layout per node, which locks up a phone long enough
  * that the UI looks broken and later messages never paint.
  */
-function renderHistory(messages, truncated) {
+function renderHistory(pane, messages, truncated) {
+  if (!pane.thread) return;
   const frag = document.createDocumentFragment();
 
   if (truncated > 0) {
@@ -757,12 +1174,12 @@ function renderHistory(messages, truncated) {
     } else if (m.type === 'assistant_text') {
       frag.appendChild(makeBubble('claude', m.text));
     } else if (m.type === 'tool_use') {
-      frag.appendChild(makeToolCard(m, false));
+      frag.appendChild(makeToolCard(pane, m, false));
     }
   }
 
-  threadEl().appendChild(frag);
-  scrollDown(true);
+  pane.thread.appendChild(frag);
+  scrollDown(pane, true);
 }
 
 /** Build a bubble without touching the DOM tree. */
@@ -774,41 +1191,43 @@ function makeBubble(kind, text) {
   return el;
 }
 
-function addBubble(kind, text) {
-  const stick = atBottom();
+function addBubble(pane, kind, text) {
+  if (!pane.thread) return null;
+  const stick = atBottom(pane);
   const el = document.createElement('div');
   el.className = `msg ${kind}`;
   if (kind === 'claude') el.innerHTML = renderMarkdown(text);
   else el.textContent = text;
-  threadEl().appendChild(el);
-  scrollDown(stick);
+  pane.thread.appendChild(el);
+  scrollDown(pane, stick);
   return el;
 }
 
-function appendStream(text) {
-  hideTyping();
-  const stick = atBottom();
-  if (!state.streamingEl) {
-    state.streamingEl = document.createElement('div');
-    state.streamingEl.className = 'msg claude';
-    state.streamingEl.dataset.raw = '';
-    threadEl().appendChild(state.streamingEl);
+function appendStream(pane, text) {
+  hideTyping(pane);
+  if (!pane.thread) return;
+  const stick = atBottom(pane);
+  if (!pane.streamingEl) {
+    pane.streamingEl = document.createElement('div');
+    pane.streamingEl.className = 'msg claude';
+    pane.streamingEl.dataset.raw = '';
+    pane.thread.appendChild(pane.streamingEl);
   }
-  state.streamingEl.dataset.raw += text;
-  state.streamingEl.innerHTML = renderMarkdown(state.streamingEl.dataset.raw);
-  scrollDown(stick);
+  pane.streamingEl.dataset.raw += text;
+  pane.streamingEl.innerHTML = renderMarkdown(pane.streamingEl.dataset.raw);
+  scrollDown(pane, stick);
 }
 
-function finalizeStream(text) {
-  hideTyping();
-  if (state.streamingEl) {
-    state.streamingEl.innerHTML = renderMarkdown(text);
-    state.streamingEl.dataset.raw = text;
-    state.streamingEl = null;
+function finalizeStream(pane, text) {
+  hideTyping(pane);
+  if (pane.streamingEl) {
+    pane.streamingEl.innerHTML = renderMarkdown(text);
+    pane.streamingEl.dataset.raw = text;
+    pane.streamingEl = null;
   } else {
-    addBubble('claude', text);
+    addBubble(pane, 'claude', text);
   }
-  scrollDown(false);
+  scrollDown(pane, false);
 }
 
 const TOOL_ICONS = {
@@ -828,7 +1247,7 @@ function toolSummary(name, input) {
 }
 
 /** Build a tool card. `track` registers it so a later result can attach. */
-function makeToolCard({ id, name, input }, track = true) {
+function makeToolCard(pane, { id, name, input }, track = true) {
   const card = document.createElement('div');
   card.className = 'tool';
   card.innerHTML = `
@@ -842,22 +1261,23 @@ function makeToolCard({ id, name, input }, track = true) {
       <pre>${escapeHtml(JSON.stringify(input, null, 2))}</pre>
     </div>`;
   card.querySelector('.tool-head').addEventListener('click', () => card.classList.toggle('open'));
-  if (track && id) state.toolEls.set(id, card);
+  if (track && id) pane.toolEls.set(id, card);
   return card;
 }
 
-function addToolCard(msg) {
-  hideTyping();
+function addToolCard(pane, msg) {
+  hideTyping(pane);
   // A tool call ends the current text block.
-  state.streamingEl = null;
+  pane.streamingEl = null;
+  if (!pane.thread) return;
 
-  const stick = atBottom();
-  threadEl().appendChild(makeToolCard(msg));
-  scrollDown(stick);
+  const stick = atBottom(pane);
+  pane.thread.appendChild(makeToolCard(pane, msg));
+  scrollDown(pane, stick);
 }
 
-function attachToolResult({ toolUseId, content, isError }) {
-  const card = state.toolEls.get(toolUseId);
+function attachToolResult(pane, { toolUseId, content, isError }) {
+  const card = pane.toolEls.get(toolUseId);
   if (!card) return;
   if (isError) card.classList.add('failed');
   const body = card.querySelector('.tool-body');
@@ -867,27 +1287,48 @@ function attachToolResult({ toolUseId, content, isError }) {
   if (isError) card.classList.add('open');
 }
 
-function showTyping() {
-  if (state.typingEl) return;
-  state.typingEl = document.createElement('div');
-  state.typingEl.className = 'typing';
-  state.typingEl.innerHTML = '<span></span><span></span><span></span>';
-  threadEl().appendChild(state.typingEl);
-  scrollDown(true);
+function showTyping(pane) {
+  if (pane.typingEl || !pane.thread) return;
+  pane.typingEl = document.createElement('div');
+  pane.typingEl.className = 'typing';
+  pane.typingEl.innerHTML = '<span></span><span></span><span></span>';
+  pane.thread.appendChild(pane.typingEl);
+  scrollDown(pane, true);
 }
-function hideTyping() {
-  state.typingEl?.remove();
-  state.typingEl = null;
-}
-
-function setBusy(busy) {
-  state.busy = busy;
-  $('#btn-send').classList.toggle('hidden', busy);
-  $('#btn-stop').classList.toggle('hidden', !busy);
-  if (busy) { setSub('working…'); showTyping(); } else hideTyping();
+function hideTyping(pane) {
+  pane.typingEl?.remove();
+  pane.typingEl = null;
 }
 
-function setSub(text) {
+/**
+ * Whether this conversation is working, which is now two different UIs: the
+ * send/stop button for the pane on screen, and a dot on the tab for the ones that
+ * are not. The pane's own flag is what both read, and what the tab strip and the
+ * cooling policy consult later.
+ */
+function setBusy(pane, busy) {
+  pane.busy = busy;
+  paintChip(pane);
+  if (pane.key === state.activeKey) {
+    $('#btn-send').classList.toggle('hidden', busy);
+    $('#btn-stop').classList.toggle('hidden', !busy);
+  }
+  if (busy) {
+    setSub(pane, 'working…');
+    showTyping(pane);
+  } else {
+    hideTyping(pane);
+  }
+}
+
+/**
+ * The line under the title. Remembered on the pane whether or not it is on
+ * screen, so switching back shows this conversation's state rather than the last
+ * thing any conversation said.
+ */
+function setSub(pane, text) {
+  pane.sub = text;
+  if (pane.key !== state.activeKey) return;
   const el = $('#chat-sub');
   el.textContent = text;
   el.classList.toggle('busy', text === 'working…');
@@ -940,27 +1381,69 @@ function autosize() {
  * different conversation, and dropped after a day so a forgotten one does not
  * ambush a chat months later.
  */
-const DRAFT_KEY = 'claude-chat-draft';
+const DRAFT_PREFIX = 'claude-chat-draft:';
+// The single-draft key this replaced. One composer served one chat, so there was
+// one draft; now there is one per tab. Read once per pane so an upgrade
+// mid-sentence does not drop what was in the box.
+const LEGACY_DRAFT_KEY = 'claude-chat-draft';
 const DRAFT_MAX_AGE = 24 * 60 * 60 * 1000;
 let draftTimer = null;
+
+function draftKeyFor(chat) {
+  return `${DRAFT_PREFIX}${paneKey(chat.cwd, chat.sessionId)}`;
+}
 
 function writeDraft() {
   clearTimeout(draftTimer);
   draftTimer = null;
+  const pane = activePane();
+  if (!pane) return;
+  // Held on the pane as well as on disk: switching tabs is not a page load, and
+  // the in-memory copy is what makes coming back instant.
+  pane.draft = input.value;
   try {
+    const key = draftKeyFor(pane);
     if (!input.value.trim()) {
-      localStorage.removeItem(DRAFT_KEY);
+      localStorage.removeItem(key);
       return;
     }
-    localStorage.setItem(DRAFT_KEY, JSON.stringify({
-      cwd: state.cwd,
-      sessionId: state.sessionId,
+    localStorage.setItem(key, JSON.stringify({
+      cwd: pane.cwd,
+      sessionId: pane.sessionId,
       text: input.value,
       at: Date.now(),
     }));
   } catch {
     /* private mode: a draft is a safety net, not a reason to break the composer */
   }
+}
+
+/** Follow a pane that has just been given its real session id. */
+function moveDraft(fromKey, toKey) {
+  try {
+    const saved = localStorage.getItem(DRAFT_PREFIX + fromKey);
+    localStorage.removeItem(DRAFT_PREFIX + fromKey);
+    if (saved) localStorage.setItem(DRAFT_PREFIX + toKey, saved);
+  } catch {
+    /* private mode */
+  }
+}
+
+function readDraft(chat) {
+  try {
+    const own = JSON.parse(localStorage.getItem(draftKeyFor(chat)) || 'null');
+    if (own) return own;
+    // A legacy draft has no pane to belong to, so it is claimed by directory and
+    // then removed — it can only ever be adopted once.
+    const legacy = JSON.parse(localStorage.getItem(LEGACY_DRAFT_KEY) || 'null');
+    if (legacy?.cwd === chat.cwd) {
+      localStorage.removeItem(LEGACY_DRAFT_KEY);
+      return legacy;
+    }
+  } catch {
+    return null;
+  }
+  return null;
 }
 
 // Debounced while typing — localStorage is synchronous and this is a phone — and
@@ -971,15 +1454,14 @@ function saveDraft({ now = false } = {}) {
 }
 
 function restoreDraft({ cwd, sessionId }) {
-  // Never overwrite something already in the box: back-then-into-another-chat
-  // keeps the composer's contents, and that text is more current than a draft.
+  // Never overwrite something already in the box: switching tabs, or back and
+  // into another chat, keeps what is in the composer, and that text is more
+  // current than anything on disk.
   if (input.value) return false;
-  let draft = null;
-  try {
-    draft = JSON.parse(localStorage.getItem(DRAFT_KEY) || 'null');
-  } catch {
-    return false;
-  }
+  const draft = readDraft({ cwd, sessionId });
+  // The per-pane key already scopes this, so the checks below only bite for a
+  // draft adopted from the single-draft era — but that one was written by a
+  // different version of this file, so it is checked rather than trusted.
   if (!draft?.text?.trim() || draft.cwd !== cwd) return false;
   if (Date.now() - (draft.at || 0) > DRAFT_MAX_AGE) return false;
   // A draft saved before the CLI had assigned a session id belongs to whichever
@@ -1042,28 +1524,32 @@ async function sendMessage() {
 
   const text = input.value.trim();
   if (!text) return;
+  // The composer always belongs to the pane on screen. There is one of it, and
+  // this is the only place that decides which conversation a message goes to.
+  const pane = activePane();
+  if (!pane) return;
   hideDictationBar();
-  if (state.ws?.readyState !== WebSocket.OPEN) {
+  if (pane.ws?.readyState !== WebSocket.OPEN) {
     toast('Still connecting — try again in a second.');
     return;
   }
-  state.ws.send(JSON.stringify({ type: 'message', text }));
+  pane.ws.send(JSON.stringify({ type: 'message', text }));
   // Echo immediately. The server also echoes it back, but waiting for that
   // round trip makes a slow connection look like the tap did nothing.
-  addBubble('user', text);
-  state.echoedMessages.add(text);
+  addBubble(pane, 'user', text);
+  pane.echoedMessages.add(text);
   input.value = '';
   autosize();
   // It is on its way to the server now, so the draft has done its job. Written
   // through immediately rather than debounced: a reload a moment later must not
   // put a sent message back in the box.
   saveDraft({ now: true });
-  setBusy(true);
+  setBusy(pane, true);
 }
 
 $('#btn-send').addEventListener('click', sendMessage);
 $('#btn-stop').addEventListener('click', () => {
-  state.ws?.send(JSON.stringify({ type: 'interrupt' }));
+  activePane()?.ws?.send(JSON.stringify({ type: 'interrupt' }));
 });
 
 // --- voice ------------------------------------------------------------------
@@ -2319,6 +2805,48 @@ if (polishHint) {
   }
 })();
 
+// --- ambient state ----------------------------------------------------------
+/*
+ * What every conversation on the box is doing, whether or not this device is
+ * showing it.
+ *
+ * A pane with a socket hears about its own turns; this is for the ones without —
+ * a cooled tab, and every row in the list. It is `/api/live` rather than
+ * `/api/projects` because that route stats and reads every transcript to build
+ * titles, which is fine once per screen and ruinous every few seconds.
+ *
+ * Only while the page is visible. A phone in a pocket with this app open must not
+ * keep waking the box.
+ */
+const LIVE_POLL_MS = 6000;
+
+async function pollLive() {
+  if (document.visibilityState !== 'visible' || redirecting) return;
+  let sessions;
+  try {
+    const res = await api('/api/live');
+    if (!res.ok) return;
+    ({ sessions } = await res.json());
+  } catch {
+    // A failed poll is a badge that is a few seconds stale. Nothing to say.
+    return;
+  }
+
+  const byKey = new Map((sessions || []).map((s) => [paneKey(s.cwd, s.sessionId), s]));
+  for (const pane of panes.values()) {
+    if (!pane.cold) continue;
+    const live = byKey.get(pane.key);
+    const wasBusy = pane.busy;
+    pane.busy = Boolean(live?.busy);
+    // A cooled tab whose process has gone can still be reopened — the transcript
+    // is on disk — but it will be a fresh process, so the dot says so.
+    pane.trouble = !live;
+    if (wasBusy && !pane.busy) announce(pane, 'finished');
+    paintChip(pane);
+  }
+  paintRowBadges(byKey);
+}
+
 // --- boot -------------------------------------------------------------------
 // Actively tear down any previously-registered worker. We no longer register
 // one: this is a live WebSocket client, caching buys nothing, and a wedged
@@ -2334,7 +2862,16 @@ if ('serviceWorker' in navigator) {
 }
 
 // Exposed so smoke-test.js can exercise event rendering without a live socket.
-window.__handleEventForTest = handleEvent;
+// Defaults to the pane on screen, which is what a caller without a pane means.
+window.__handleEventForTest = (msg, pane) => handleEvent(msg, pane || activePane());
+// Several conversations open at once cannot be driven from a desktop browser
+// either: what has to be proved is that a background pane keeps rendering into its
+// own thread, that switching carries the composer with it, and that the tab cap
+// cools an idle chat rather than a working one.
+window.__panesForTest = {
+  panes, state, openChat, activatePane, closePane, coolPane, makeRoomFor,
+  renderTabs, paintChip, pollLive, paneKey, activePane, MAX_LIVE,
+};
 // The silent-dictation failure can't be reproduced from a desktop browser, so
 // the test drives the interruption path directly instead.
 window.__voiceForTest = {
@@ -2349,9 +2886,13 @@ window.__voiceForTest = {
 // display sleeps is invisible to the page. The tests drive the reconciler.
 // Losing a draft needs a page that goes away, which jsdom cannot do, so the test
 // drives the save/restore pair directly instead.
-// `state` comes along because which chat a draft belongs to is the half of this
-// that can go wrong quietly.
-window.__draftForTest = { saveDraft, restoreDraft, writeDraft, DRAFT_KEY, input, state };
+// `draftKeyFor` comes along because which chat a draft belongs to is the half of
+// this that can go wrong quietly — one key per pane, and a draft that surfaces
+// under the wrong one puts somebody's words into a conversation they were not
+// written for.
+window.__draftForTest = {
+  saveDraft, restoreDraft, writeDraft, draftKeyFor, moveDraft, LEGACY_DRAFT_KEY, input,
+};
 window.__screenForTest = {
   syncWakeLock, setKeepAwake, wakeLockHeld, wantsScreenAwake,
   get wanted() { return keepAwakeWanted; },
@@ -2372,37 +2913,46 @@ document.addEventListener('visibilitychange', () => {
     return;
   }
 
-  if (!$('#screen-chat').classList.contains('active')) {
-    refreshList();
-    return;
-  }
-
-  const ws = state.ws;
-  const dead = !ws || ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING;
-  if (dead) {
+  // Every live pane, not just the one on screen: a background chat that lost its
+  // socket while the phone was locked is exactly the one being waited on.
+  for (const pane of panes.values()) {
+    if (pane.cold || pane.closed) continue;
+    const ws = pane.ws;
+    const dead = !ws || ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING;
+    if (!dead) continue;
     // Drop the stale process handle: it may belong to a reaped conversation.
     // Rejoining by session id adopts whatever is actually running.
-    state.conversationId = null;
-    state.reconnectDelay = 500;
-    connect({ cwd: state.cwd, resumeSessionId: state.sessionId });
+    pane.conversationId = null;
+    pane.reconnectDelay = 500;
+    connect(pane);
   }
+
+  pollLive();
+  if (!$('#screen-chat').classList.contains('active')) refreshList();
 });
 
-// Restore the chat this device had open, so a refresh or a cold PWA launch
-// lands back in the conversation rather than on the list. If the same chat is
-// still running on the server — including work started from another device —
-// this rejoins it.
+// Restore the chats this device had open, so a refresh or a cold PWA launch lands
+// back in the same conversations rather than on the list. Any still running on the
+// server — including work started from another device — are rejoined.
 (function boot() {
   // Before anything else: the display should stop sleeping from the moment the
   // app is on screen, not from the moment a chat is open.
   startKeepAwake();
 
-  const open = loadOpenChat();
-  if (open?.cwd && open?.sessionId) {
-    openChat({ cwd: open.cwd, title: open.title, resumeSessionId: open.sessionId });
-    // Load the list behind the chat so going back is instant.
-    refreshList();
-    return;
+  const saved = loadOpenPanes();
+  // Restored cold, every one of them: a tab, a title and a session id, with no
+  // socket and no thread until it is looked at. A launch that opened six sockets
+  // and rebuilt six transcripts would be the slowest thing this app does, on the
+  // device least able to afford it — and five of them would be for conversations
+  // the user is not reading.
+  for (const chat of saved.panes) {
+    if (chat?.cwd && chat?.sessionId) makePane(chat);
   }
+  const active = saved.activeKey ? panes.get(saved.activeKey) : null;
+  renderTabs();
+  // Load the list behind the chat so going back is instant.
   refreshList();
+  if (active) activatePane(active);
+  pollLive();
+  setInterval(pollLive, LIVE_POLL_MS);
 })();

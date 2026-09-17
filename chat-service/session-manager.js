@@ -671,6 +671,77 @@ export class SessionManager {
   }
 
   /**
+   * Every conversation this service owns, as plain data for the admin surface.
+   *
+   * Deliberately a projection rather than the objects themselves: the caller is a
+   * JSON route, and handing it `Conversation` instances would put the process
+   * handle, the event history and the emitter's listener list one
+   * `JSON.stringify` away from a response body.
+   *
+   * The pid is the interesting field. These processes are children of
+   * `claude-chat.service`, so they are the ones a deploy takes with it, and the
+   * only way to see how much memory they hold is to go and look.
+   */
+  inventory() {
+    return [...this.conversations.values()].map((conv) => ({
+      id: conv.id,
+      cwd: conv.cwd,
+      project: conv.cwd.startsWith(`${PROJECTS_ROOT}/`)
+        ? conv.cwd.slice(PROJECTS_ROOT.length + 1)
+        : conv.cwd,
+      sessionId: conv.sessionId,
+      model: conv.model,
+      permissionMode: conv.permissionMode,
+      effort: conv.effort,
+      busy: conv.busy,
+      exited: conv.exited,
+      pid: conv.proc?.pid ?? null,
+      lastActivity: conv.lastActivity,
+      events: conv.history.length,
+    }));
+  }
+
+  /**
+   * Who is live and who is working, with no disk access at all.
+   *
+   * This is the half of `listProjects()` that can be polled. That one stats every
+   * transcript and reads each file from the start to build a title, which is fine
+   * once per screen and ruinous every few seconds — so a client that wants to keep
+   * a badge honest while the user is looking at something else asks for this
+   * instead. Everything here is already in memory.
+   */
+  liveSummary() {
+    const sessions = [];
+    for (const conv of this.conversations.values()) {
+      if (conv.exited || !conv.sessionId) continue;
+      sessions.push({
+        cwd: conv.cwd,
+        sessionId: conv.sessionId,
+        busy: conv.busy,
+        lastActivity: conv.lastActivity,
+      });
+    }
+    return sessions;
+  }
+
+  /**
+   * Stop one conversation by the id the admin surface shows.
+   *
+   * SIGTERM and forget, which is what `#reap` does to an idle one — so this is the
+   * reaper on demand rather than a new way to end a process. Whether stopping a
+   * *busy* one is allowed is decided by the route, not here: this layer has no way
+   * to ask the user anything.
+   */
+  stopConversation(id) {
+    const conv = this.conversations.get(id);
+    if (!conv) return null;
+    const wasBusy = conv.busy;
+    conv.stop();
+    this.#forget(conv);
+    return { id, cwd: conv.cwd, sessionId: conv.sessionId, wasBusy };
+  }
+
+  /**
    * Create a project: a folder, a git repo, and optionally a GitHub remote.
    *
    * Everything runs as the workspace user so file ownership and git identity

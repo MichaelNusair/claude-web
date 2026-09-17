@@ -19,6 +19,7 @@ import { WebSocketServer } from 'ws';
 import { SessionManager, PROJECTS_ROOT, DEFAULT_MODEL } from './session-manager.js';
 import { transcribe, voiceStatus, resetConfigCache } from './transcribe.js';
 import { polish } from './polish.js';
+import { createAdmin } from './admin.js';
 import {
   AUTH_MODE,
   assertAuthConfig,
@@ -42,6 +43,11 @@ const PORT = Number(process.env.PORT || 9997);
 const PUBLIC_DIR = join(__dirname, 'public');
 
 const manager = new SessionManager();
+// The operations surface. In this process, behind this process's gate: a second
+// app at /admin would mean a second authentication implementation, and the reason
+// this file authenticates at all is that the last thing to own that decision was
+// a proxy comment. See admin.js.
+const admin = createAdmin({ manager });
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -81,7 +87,7 @@ async function readBody(req, limit = 32 * 1024 * 1024) {
 let assetVersion = null;
 async function getAssetVersion() {
   if (assetVersion) return assetVersion;
-  const files = ['app.js', 'style.css'];
+  const files = ['app.js', 'style.css', 'admin.js'];
   let newest = 0;
   for (const f of files) {
     try {
@@ -109,17 +115,22 @@ async function serveStatic(req, res, pathname) {
   try {
     let data = await readFile(file);
 
-    // Rewrite asset references in the shell to include the version stamp.
-    if (file.endsWith('index.html')) {
+    // Rewrite asset references in any of our HTML shells to include the version
+    // stamp. Paths are /chat/-prefixed because nginx routes the chat's assets
+    // there and strips the prefix before it reaches us; the catch-all at /
+    // belongs to code-server.
+    //
+    // Matched by pattern rather than by exact string. There are two shells now
+    // (index.html and admin.html), and the failure mode of the old exact-string
+    // pair was silent — an unstamped asset is only visible as a browser holding a
+    // stale copy days later — so a second copy of that hazard is not worth the
+    // literal it saves.
+    if (file.endsWith('.html')) {
       const v = await getAssetVersion();
-      // Paths are /chat/-prefixed because nginx routes the chat's assets there
-      // and strips the prefix before it reaches us; the catch-all at / belongs
-      // to code-server. Keep these in step with index.html.
       data = Buffer.from(
         data
           .toString()
-          .replace('src="/chat/app.js"', `src="/chat/app.js?v=${v}"`)
-          .replace('href="/chat/style.css"', `href="/chat/style.css?v=${v}"`),
+          .replace(/(src|href)="(\/chat\/[A-Za-z0-9._-]+\.(?:js|css))"/g, `$1="$2?v=${v}"`),
       );
     }
 
@@ -384,6 +395,70 @@ const server = http.createServer(async (req, res) => {
       const names = (await manager.listProjects().catch(() => [])).map((p) => p.name);
       const { text, changed } = await polish(body.text, { vocabulary: names });
       json(res, 200, { text, changed });
+      return;
+    }
+
+    /*
+     * Who is live and who is working, and nothing else.
+     *
+     * The chat list and the tab strip both need to keep a badge honest while the
+     * user is looking at a different conversation, and `GET /api/projects` cannot
+     * be polled for it: that route stats every transcript and reads each file from
+     * the start to build a title. This one touches no disk at all.
+     */
+    if (pathname === '/api/live' && req.method === 'GET') {
+      res.writeHead(200, {
+        'Content-Type': 'application/json; charset=utf-8',
+        'Cache-Control': 'no-store',
+      });
+      res.end(JSON.stringify({ sessions: manager.liveSummary(), at: Date.now() }));
+      return;
+    }
+
+    // --- operations surface -------------------------------------------------
+    // Reachable at /chat/admin through nginx. Deliberately part of this service
+    // rather than an app of its own; see the note next to `admin` above.
+    if (pathname === '/admin' || pathname === '/admin.html') {
+      await serveStatic(req, res, '/admin.html');
+      return;
+    }
+
+    if (pathname === '/api/admin/overview' && req.method === 'GET') {
+      json(res, 200, await admin.overview());
+      return;
+    }
+
+    /*
+     * Stop one conversation, on one surface.
+     *
+     * A refusal comes back as 409 with the reason, exactly as a blocked project
+     * removal does, and the client turns it into a specific question. `force` is
+     * the answer to that question — never a default, and never inferred, because
+     * everything reachable from here may be holding a turn in flight.
+     */
+    if (pathname === '/api/admin/kill' && req.method === 'POST') {
+      const body = JSON.parse((await readBody(req, 4 * 1024)).toString() || '{}');
+      try {
+        const result = await admin.kill({
+          kind: body.kind,
+          target: body.target,
+          force: body.force === true,
+        });
+        console.log(`admin stopped ${body.kind} ${body.target}${body.force ? ' (forced)' : ''}`);
+        json(res, 200, result);
+      } catch (err) {
+        if (!err.blocked) throw err;
+        json(res, 409, { error: err.message, canForce: true, target: err.target });
+      }
+      return;
+    }
+
+    // The never-spoken-to probes the editor panel leaves behind, in one tap. No
+    // `force`: a probe holds no conversation, which is what makes it reapable.
+    if (pathname === '/api/admin/reap' && req.method === 'POST') {
+      const result = await admin.reap();
+      console.log(`admin reaped ${result.stopped} probe(s), ${Math.round(result.freedKb / 1024)} MB`);
+      json(res, 200, result);
       return;
     }
 

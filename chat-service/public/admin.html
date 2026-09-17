@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1, user-scalable=no">
+<meta name="theme-color" content="#141413">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>Claude · box</title>
+<!-- No manifest link: this is a page you open when something is wrong, not a
+     second installable app competing with the chat for the home screen. -->
+<link rel="stylesheet" href="/chat/style.css">
+</head>
+<body>
+
+<section class="screen active">
+  <header class="bar">
+    <a class="icon-btn back" href="/" aria-label="Back to chats">
+      <svg viewBox="0 0 24 24"><path d="M15.4 7.4 14 6l-6 6 6 6 1.4-1.4L10.8 12z"/></svg>
+    </a>
+    <div class="bar-title">
+      <span id="admin-title">This box</span>
+      <span id="admin-sub" class="sub">loading…</span>
+    </div>
+    <button id="btn-refresh" class="icon-btn" aria-label="Refresh">
+      <svg viewBox="0 0 24 24"><path d="M17.6 6.4A8 8 0 1 0 19.7 13h-2.1a6 6 0 1 1-1.5-5.1L13 11h7V4z"/></svg>
+    </button>
+  </header>
+
+  <div class="list-body">
+    <!-- Findings first, and only when there are any. Everything below is an
+         inventory; this is the part that says whether it matters. -->
+    <div id="findings"></div>
+
+    <div class="section-label">Host</div>
+    <div id="host" class="cards"></div>
+
+    <div class="section-label">Services</div>
+    <div id="units" class="units"></div>
+
+    <div class="section-label">Chat conversations</div>
+    <div id="surface-chat"></div>
+
+    <div class="section-label">Editor panel <span class="label-note">via the broker</span></div>
+    <div id="surface-broker"></div>
+
+    <div class="section-label">Terminal <span class="label-note">tmux, <code>cc</code></span></div>
+    <div id="surface-tmux"></div>
+
+    <p class="hint" id="admin-footer"></p>
+  </div>
+</section>
+
+<div id="toast" class="toast hidden"></div>
+
+<script src="/chat/admin.js"></script>
+</body>
+</html>

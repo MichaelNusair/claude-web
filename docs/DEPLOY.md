@@ -270,6 +270,14 @@ the secret without a restart.
 
 ## Operating it
 
+Most of what you would open a shell for is on the **Box** tab of the chat
+(`https://<your-domain>/chat/admin`): every conversation running on every surface,
+the state of each service, memory and disk, and a plain-language list of what is
+wrong — a forked editor panel, processes the editor started and never used, a tmux
+server a deploy is about to kill. It can stop one conversation at a time, and asks
+first if that conversation might be mid-turn. It cannot restart a service; that is
+below.
+
 ```bash
 # Shell in (no SSH port is open)
 aws ssm start-session --target <InstanceId>
@@ -286,6 +294,13 @@ sudo journalctl -u claude-chat | grep -E 'login|failed login'
 # Restart
 sudo systemctl restart claude-chat
 ```
+
+Restarting `claude-chat` ends every conversation open in the chat — they are child
+processes of that service. The transcripts are kept and every session can be resumed
+from the list, but a turn in flight is lost, so check the Box tab first. The editor
+panel's conversations and tmux sessions are owned by their own services and are
+unaffected; never restart `claude-broker` or `claude-tmux` to pick up a change unless
+you mean to end the work inside them.
 
 ### Stop it when idle
 
