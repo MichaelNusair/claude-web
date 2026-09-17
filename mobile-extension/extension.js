@@ -156,19 +156,61 @@ function isFileTab(tab) {
   return FILE_TAB_KINDS.some((name) => vscode[name] && tab.input instanceof vscode[name]);
 }
 
+const isTerminalTab = (tab) =>
+  Boolean(vscode.TabInputTerminal) && tab.input instanceof vscode.TabInputTerminal;
+
 /**
- * The Claude panel's own tab.
+ * Which thing the Claude button opens.
+ *
+ * `tmux` is the default, and the reason is the whole point of this project: the
+ * extension's panel runs `claude` as a child of the extension host, and
+ * code-server creates one extension host **per browser page**. So a second device
+ * — or a plain reload — gets a second extension host, a second `claude`, and a
+ * second copy of the conversation resumed from the transcript on disk, while the
+ * first one keeps running. Two live processes appending to one transcript is what
+ * "I opened it on my laptop and it was idle, and now they tell different
+ * stories" is. Measured on this box: extension hosts 314616 and 319472, three
+ * `claude` processes, one project directory.
+ *
+ * A tmux session is owned by a server that is parented to systemd and attached to
+ * no terminal, so there is exactly one process no matter how many devices are
+ * looking at it, and attaching from the laptop joins the run mid-turn instead of
+ * forking it. `panel` is kept for the extension's richer UI — real diffs, tool
+ * cards — on a single device, and for anyone who prefers it.
+ */
+function claudeSurface() {
+  return vscode.workspace.getConfiguration().get('claudeMobile.claudeSurface', 'tmux') === 'panel'
+    ? 'panel'
+    : 'tmux';
+}
+
+/**
+ * The Claude *panel's* own tab.
  *
  * It is a webview, and the API reports webview tabs by `viewType` — which VS Code
  * namespaces internally (`mainThreadWebview-claudeVSCodePanel`), so this matches
  * loosely rather than on an exact id, and falls back to the tab's label for a
  * build that reports the type differently.
  */
-function isClaudeTab(tab) {
+function isClaudePanelTab(tab) {
   const type = vscode.TabInputWebview && tab.input instanceof vscode.TabInputWebview
     ? String(tab.input.viewType)
     : '';
   return /claude/i.test(type) || /claude/i.test(String(tab.label));
+}
+
+/** The editor terminal holding the tmux session, identified by its tab label. */
+function isClaudeTerminalTab(tab) {
+  return isTerminalTab(tab) && /claude/i.test(String(tab.label));
+}
+
+/**
+ * Whichever of the two is Claude on this surface. Everything that reasons about
+ * the layout goes through here, so switching surfaces does not need a second copy
+ * of the startup schedule or the rescue.
+ */
+function isClaudeTab(tab) {
+  return claudeSurface() === 'tmux' ? isClaudeTerminalTab(tab) : isClaudePanelTab(tab);
 }
 
 /**
@@ -235,6 +277,11 @@ async function closeFileTabs(notify) {
  * off-center or hidden.
  */
 async function focusClaude() {
+  // The tmux surface first, and if it cannot be opened — no folder, or a
+  // directory `cc` does not recognise — fall through to the panel rather than
+  // showing an empty window.
+  const tmux = claudeSurface() === 'tmux' && (await openClaudeTmux());
+
   // Open Claude in the *editor area* rather than a side bar. On a phone the
   // side bars are narrow strips (text wraps a letter per line), and hiding them
   // to reclaim width would hide Claude along with them. The editor area is the
@@ -244,7 +291,7 @@ async function focusClaude() {
   // stacks duplicates on every reload. Skipped entirely when the panel is
   // already open — VS Code restores it across a reload, and asking for it again
   // is what used to make it flash.
-  if (!vscode.window.tabGroups.all.some((g) => g.tabs.some(isClaudeTab))) {
+  if (!tmux && !vscode.window.tabGroups.all.some((g) => g.tabs.some(isClaudePanelTab))) {
     if (!(await run('claude-vscode.editor.openLast'))) {
       await run('claude-vscode.editor.open');
     }
@@ -258,11 +305,18 @@ async function focusClaude() {
   await run('workbench.action.closePanel');
   // Single group, full width — no split leftovers. Only when there is actually
   // something to join: this command moves editors between groups, and moving a
-  // webview re-creates it, taking an unsent message with it.
+  // webview re-creates it, taking an unsent message with it. (On the tmux
+  // surface that particular hazard is gone — the pty belongs to code-server and
+  // the session belongs to tmux, so nothing here can cost a turn — but the
+  // guard is kept, because it is also what stops the layout being rearranged
+  // under someone who deliberately split the window.)
   if (vscode.window.tabGroups.all.length > 1) {
     await run('workbench.action.joinAllGroups');
   }
-  await run('claude-vscode.focus');
+  // Focus last: joining groups can move it. The panel takes a command, the
+  // terminal takes `show()`.
+  if (tmux) claudeTerminal?.show();
+  else await run('claude-vscode.focus');
 }
 
 /**
@@ -285,8 +339,62 @@ let mobileTerminal = null;
 // after a reload can be recognised as the one this button opened.
 const TERMINAL_NAME = 'Terminal';
 
-const isTerminalTab = (tab) =>
-  Boolean(vscode.TabInputTerminal) && tab.input instanceof vscode.TabInputTerminal;
+/** The terminal holding the tmux session, while it is still alive. */
+let claudeTerminal = null;
+const CLAUDE_TERMINAL_NAME = 'Claude';
+// Resolves the project itself: `cc` takes an absolute path as well as a name, so
+// PROJECTS_ROOT stays known in one place — the script — rather than being
+// duplicated here where it could drift.
+const CC = '/usr/local/bin/cc';
+
+/**
+ * Claude in a tmux session, in an editor terminal.
+ *
+ * Reuse is not an optimisation here, it is the feature. Every path into this
+ * function has to end at *one* tmux client per page, because creating a second
+ * terminal per reload would stack attached clients — and while tmux would cope,
+ * the tab pile is what the startup schedule below is trying to avoid.
+ *
+ * Three layers of it, because the thing being reused survives at three different
+ * lifetimes: `claudeTerminal` covers this extension host, the name lookup covers
+ * a terminal code-server kept alive across a page reload (the pty belongs to the
+ * server, not to us), and the tab check covers the window between a reload and
+ * `vscode.window.terminals` being repopulated — the moment when a naive check
+ * sees nothing and opens a duplicate.
+ *
+ * Returns false when there is nothing to attach to, so the caller can fall back
+ * to the panel rather than leaving the screen empty.
+ */
+async function openClaudeTmux() {
+  const folder = vscode.workspace.workspaceFolders?.[0];
+  if (!folder) return false;
+  // A box provisioned before `cc` existed, or a dev machine. Falling back to the
+  // panel is much better than a terminal tab that opens onto "no such file":
+  // `shellPath` failures surface as a dead tab, not an exception we could catch.
+  if (!require('fs').existsSync(CC)) return false;
+
+  if (!claudeTerminal || !vscode.window.terminals.includes(claudeTerminal)) {
+    claudeTerminal = vscode.window.terminals.find((t) => t.name === CLAUDE_TERMINAL_NAME) || null;
+  }
+
+  if (!claudeTerminal) {
+    // A restored terminal whose object has not arrived yet. Leave it alone: a
+    // later pass focuses it, and creating one now is the duplicate this guards.
+    if (vscode.window.tabGroups.all.some((g) => g.tabs.some(isClaudeTerminalTab))) return true;
+    claudeTerminal = vscode.window.createTerminal({
+      name: CLAUDE_TERMINAL_NAME,
+      // `cc` as the shell, not a command typed into one: there is then no shell
+      // prompt behind Claude for a stray keystroke to land in, and the tab is
+      // exactly as long-lived as the attachment. If the tmux session is killed
+      // the tab closes, and the next press starts a fresh one.
+      shellPath: CC,
+      shellArgs: [folder.uri.fsPath],
+      location: vscode.TerminalLocation ? vscode.TerminalLocation.Editor : undefined,
+    });
+  }
+  claudeTerminal.show();
+  return true;
+}
 
 /**
  * A shell, on a surface with no status bar to open one from.
@@ -304,12 +412,15 @@ const isTerminalTab = (tab) =>
  * per press would stack a new shell on every reload and leave the old ones
  * running.
  *
- * Note what this deliberately is not: it is not `cc`. A shell in the editor dies
- * with its tab; long work still belongs in tmux (see `scripts/cc-session.sh`).
+ * Note what this deliberately is not: it is not Claude. This is a scratch shell,
+ * and it dies with its tab. On the tmux surface Claude is *also* an editor
+ * terminal, which is why the check below asks which terminal is in front rather
+ * than whether one is: treating Claude as "the terminal" would make this button
+ * bounce off it and never open a shell at all.
  */
 async function toggleTerminal() {
   const active = vscode.window.tabGroups.activeTabGroup?.activeTab;
-  if (active && isTerminalTab(active)) {
+  if (active && isTerminalTab(active) && !isClaudeTerminalTab(active)) {
     await focusClaude();
     return;
   }
@@ -373,7 +484,7 @@ function activate(context) {
       if (!vscode.window.tabGroups.all.some((g) => g.tabs.length > 0)) {
         await run('workbench.action.focusSideBar');
         vscode.window.showWarningMessage(
-          'Claude panel did not open. Run "Mobile: Open Claude full screen" to retry.',
+          'Claude did not open. Run "Mobile: Open Claude full screen" to retry.',
         );
       }
     }, 9000);

@@ -228,8 +228,8 @@ Know this before answering any question about long-running work:
 | Surface | Who owns `claude` | Survives closing the app | Shared live across devices |
 | --- | --- | --- | --- |
 | Chat (`/`) | `claude-chat` systemd service | yes | yes — `getBySession` hands both sockets the same process |
-| `cc` / tmux | tmux server, parented to systemd | yes | yes — multiple tmux clients, one session |
-| VS Code extension (`/editor/`) | extension host, tied to the browser | **no — dies in ~5s** | no |
+| `cc` / tmux — **the editor's default** | tmux server, parented to systemd | yes | yes — multiple tmux clients, one session |
+| VS Code extension panel | extension host, tied to the browser | **no — dies in ~5s** | **no — it forks** |
 
 That 5 seconds is measured, not guessed: a probe on a live box recorded
 `exthost` and `claude` both `DEAD` five seconds after `ws_conns` hit 0, mid-turn.
@@ -237,7 +237,29 @@ That 5 seconds is measured, not guessed: a probe on a live box recorded
 suggests a 3-hour grace period — it does not apply here. Do not tell someone the
 extension will keep working in the background; it will not.
 
-If a user wants a long autonomous run, point them at `cc <project>`.
+**The panel does not just fail to share — it forks, silently, and that is worse.**
+code-server creates one extension host *per browser page*, so a second device (or
+a plain reload) gets a second extension host, which starts its own `claude` and
+resumes the same session id from the transcript on disk. The first process is
+never told anything and keeps running. Two live processes then append to one
+`.jsonl`, and the two devices diverge from the moment of the fork. Observed on a
+live box, 2026-09-17: extension hosts 314616 (phone) and 319472 (laptop) under one
+code-server, three `claude` processes, one project directory — and an agent whose
+own `CLAUDE_PID` changed from 315100 to 319986 mid-conversation while the phone's
+315100 was still running. What the user sees is "I opened my laptop and Claude was
+idle, and now they're telling different stories".
+
+This is why `claudeMobile.claudeSurface` defaults to `tmux`
+([`mobile-extension/extension.js`](mobile-extension/extension.js)): the editor's
+Claude button opens an editor terminal running `cc <folder>`, not the panel. One
+tmux session per project, so every device attaches to the same process instead of
+forking it. Verified on the box: two simultaneous clients, one session, one
+`claude`, and the session still alive after both detached.
+
+Do not "simplify" this back to opening the panel by default. The fork is not a bug
+in this repo and cannot be fixed here — the conversation lives inside the
+extension host, and nothing supported shares one extension host between two page
+loads. `panel` remains available for its richer UI on a single device.
 
 ## Gotchas that look like bugs
 
@@ -295,10 +317,18 @@ Things that have burned people, in this codebase specifically:
   code-server keeps shells alive across a page reload while the extension host is
   destroyed: creating per press would leave a pile of orphaned shells. A shell in a
   tab still dies with the tab, so long work belongs in `cc`/tmux, not here.
+  Since Claude itself is now an editor terminal by default, this button asks *which*
+  terminal is in front rather than whether one is — `isClaudeTerminalTab` — because
+  treating Claude as "the terminal" made the button bounce off it and never open a
+  shell.
 - **The workbench reloads itself, and a reload of `/editor/` destroys work.** Its
   lifecycle service calls `location.reload()` when the browser restores the page
   from the back/forward cache — on a phone that is every app switch — and a reload
-  restarts the extension host, which is where the Claude conversation lives. So
+  restarts the extension host. On the `panel` surface that is where the Claude
+  conversation lives, so a reload forks it; the `tmux` default is what takes the
+  conversation out of the blast radius, since the tmux server and the pty both
+  outlive the page. Everything else below still applies — a reload still discards
+  typed text and still rearranges the layout. So
   treat *every* extra page load on that surface as damage: it is measurable (the
   remote agent log shows a fresh `ManagementConnection` and "Extension Host Process
   exited with code: 0" per load, and `code-server-data/logs/*/exthost*/` gains a
@@ -338,6 +368,20 @@ Things that have burned people, in this codebase specifically:
 - **Quoted heredocs in `bootstrap.sh` do not expand variables.** `<<'EOF'` is
   intentional in places that write scripts; those use `__PLACEHOLDER__` + `sed`.
   Adding a `$VAR` inside one silently writes a literal `$VAR`.
+- **The login shell is zsh, but the box's environment is still in
+  `/etc/profile.d`.** Bedrock region and model, and the GitHub token resolver, are
+  written there as `.sh` files, and zsh reads them only because AL2023's zsh
+  package does it for us: its `/etc/zshrc` sources `/etc/profile.d/*.sh` for
+  non-login shells (a code-server terminal is one), its `/etc/zprofile` sources
+  `/etc/profile` for login shells. Nothing in this repo enforces that, and the
+  failure is `claude` starting in a terminal without Bedrock credentials. So check
+  it holds before changing distro, and keep adding shell environment as
+  `/etc/profile.d/*.sh` rather than in a zsh-only file.
+  Our own zsh defaults are in `/etc/claude-web-zshrc`, which `bootstrap.sh` owns
+  and rewrites; `~/.zshrc` only sources it, so edits on the box survive a deploy.
+  They cannot move into `/etc/profile.d`: zsh sources those under `emulate -L ksh`,
+  which localises options, so a `setopt` there is reverted as the file finishes
+  loading.
 - **`session-manager.js` mangles the *resolved* path** for transcript lookup, so
   symlinks matter. This is why `migrate.sh` rewrites paths.
 - **The landing page's copy button must show exactly what it copies.** When the

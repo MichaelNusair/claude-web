@@ -91,14 +91,34 @@ your-domain.com
   refuses if anything would be lost (no remote, a stash, a push that failed) and
   says which; overriding is a separate, deliberate tap. Chat history is kept.
 
-## Sessions that outlive the browser
+## Sessions that outlive the browser, and follow you between devices
 
-The VS Code extension is the nicest surface, but its Claude process is a child of
-the extension host — and code-server tears that down within **five seconds** of
-the last browser WebSocket closing. Measured on a live deployment: extension host
-and `claude` both dead, mid-turn, work lost.
+Start something on your phone, arrive home, open the same project on your laptop,
+and keep watching the same run. That works because the editor's Claude runs in a
+**tmux** session rather than inside the browser page.
 
-So for anything long-running, start it under tmux instead:
+It has to. The extension's own panel runs `claude` as a child of the extension
+host, and code-server creates one extension host *per browser page* — then tears
+it down within **five seconds** of the last WebSocket closing. So the panel does
+not hand off between devices; it *forks*. The second device starts its own
+`claude`, resumes the same session from the transcript on disk, and the first one
+carries on running, untouched. Both then append to the same file and diverge. What
+you see is your laptop showing the conversation sitting idle while your phone is
+still working, and the two telling different stories a minute later.
+
+tmux fixes it because the session belongs to a server parented to systemd, not to
+any terminal or page:
+
+- closing the editor, the browser, or your laptop changes nothing
+- **attaching from a second device joins the same live session** — same screen,
+  same scrollback, mid-turn — rather than starting a second Claude
+- it survives a reload, a dropped connection, a code-server restart and a redeploy
+
+Verified on a live box: two clients attached at once, one session, one `claude`
+process, and the session still running after both detached.
+
+The Claude button on the editor does this for you. From a shell, the same thing by
+hand:
 
 ```bash
 cc                      # list live sessions and projects
@@ -106,17 +126,11 @@ cc my-project           # start, or rejoin, a permanent session
 cc my-project --kill    # end it
 ```
 
-That runs the real CLI in a tmux server parented to systemd, so:
-
-- closing the editor, the browser, or your laptop changes nothing
-- it survives a code-server restart and a redeploy
-- **attaching from a second device joins the same live session** — same screen,
-  same scrollback — rather than starting a second Claude
-
 Because it is the real CLI, `/model`, permission modes, `@file` references,
-thinking and tool output are all the genuine thing rather than a copy of it. The
-trade-off: tmux sizes the window to the smallest attached client, so a phone
-constrains a desktop while both are attached.
+thinking and tool output are all the genuine thing rather than a copy of it.
+
+If you would rather have the extension's panel — richer diffs and tool cards, at
+the cost of being single-device — set `claudeMobile.claudeSurface` to `panel`.
 
 ## Voice
 
@@ -206,17 +220,27 @@ if Azure errors. See [docs/DEPLOY.md](docs/DEPLOY.md).
 
 ## The editor on a phone
 
-`/editor/` is real code-server running the real Claude Code extension, with the
-activity bar, status bar and tabs stripped so the panel gets the whole screen. A
-small bar of buttons — dictate, switch project, terminal, fix the layout — floats
-over it; long-press any of them to move the bar to the other edge.
+`/editor/` is real code-server, with the activity bar, status bar and tabs stripped
+so Claude gets the whole screen. A small bar of buttons — dictate, switch project,
+terminal, fix the layout — floats over it; long-press any of them to move the bar
+to the other edge.
 
-The terminal button opens a shell **in the editor area**, so it gets the whole
-window exactly like Claude does, and pressing it again hands the window back —
-with tabs hidden, the two just take turns. It reuses the shell you already had
-rather than opening another, including across a page reload. It is for the quick
-things (`git log`, run a test); a shell in a tab dies with the tab, so anything
-long-running still belongs in `cc` under tmux, above.
+Claude opens **in the editor area**, full width, as the tmux session described
+above — so it is the real CLI, and it is the same session on every device you open
+it from. The Claude Code extension is still installed and its panel is one setting
+away (`claudeMobile.claudeSurface: panel`).
+
+The terminal button opens a second, plain shell, also in the editor area, and
+pressing it again hands the window back to Claude — with tabs hidden, the two just
+take turns. It reuses the shell you already had rather than opening another,
+including across a page reload. It is for the quick things (`git log`, run a test);
+that shell dies with its tab, which is exactly why Claude does not live in one.
+
+That shell is **zsh** — completion, shared history, and a two-line prompt with the
+git branch, so a long path does not leave you three columns to type in on a phone.
+History lives on the workspace volume rather than in `/home`, so a command typed
+on a phone can be recalled on a laptop, and it survives the instance being
+replaced. Your own additions go in `~/.zshrc`, which a deploy leaves alone.
 
 The layout button is there because of one specific way the editor gets stuck: tap
 a file in the transcript and it opens beside the panel, and with no tabs and no

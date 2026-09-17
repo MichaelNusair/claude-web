@@ -51,6 +51,19 @@
     "configuration": {
       "title": "Claude Mobile Shell",
       "properties": {
+        "claudeMobile.claudeSurface": {
+          "type": "string",
+          "enum": [
+            "tmux",
+            "panel"
+          ],
+          "enumDescriptions": [
+            "Claude runs in a tmux session, shown in an editor terminal. One process per project no matter how many devices are looking at it, so a phone and a laptop join the same live run and it survives reloads, disconnects, code-server restarts and redeploys.",
+            "Claude runs in the extension's own panel. Richer UI, but the process is a child of the extension host, so every browser page gets its own copy of the conversation and two devices fork the transcript."
+          ],
+          "default": "tmux",
+          "description": "Where Claude runs. 'tmux' is what makes a session hand off between devices; 'panel' is the extension's UI and is single-device."
+        },
         "claudeMobile.closeFilesOnStartup": {
           "type": "boolean",
           "default": true,

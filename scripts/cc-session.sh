@@ -16,6 +16,13 @@
 # It runs the real CLI, so model switching (/model), permission modes, @file
 # references, thinking and tool output are all the genuine Claude Code UX rather
 # than a reimplementation of it.
+#
+# This is no longer only a power-user command: the editor surface opens Claude
+# through it (see mobile-extension/extension.js), because the extension's own
+# webview cannot survive a page reload — a reload builds a new extension host,
+# and the panel's `claude` is a child of the old one. So the options set below
+# are tuned for a phone attached to a long-lived session, not just for an ssm
+# shell.
 set -euo pipefail
 
 PROJECTS="${PROJECTS_ROOT:-/workspace/projects}"
@@ -35,7 +42,17 @@ if [ -z "$name" ]; then
   exit 0
 fi
 
-dir="$PROJECTS/$name"
+# An absolute path is accepted as well as a project name, because the editor
+# surface calls this with the workspace folder it already has. Resolving it here
+# rather than teaching the extension where PROJECTS_ROOT is keeps that knowledge
+# in one place — this script — and means the two cannot disagree about it.
+if [ "${name#/}" != "$name" ]; then
+  dir="$name"
+  name="$(basename "$dir")"
+else
+  dir="$PROJECTS/$name"
+fi
+
 if [ ! -d "$dir" ]; then
   printf 'No such project: %s\n\nAvailable:\n' "$name" >&2
   ls -1 "$PROJECTS" 2>/dev/null | sed 's/^/  /' >&2
@@ -59,10 +76,16 @@ else
   tmux new-session -d -s "$session" -c "$dir" 'bash -lc claude'
   # Don't let a crashed CLI silently leave an empty shell that looks alive.
   tmux set-option -t "$session" remain-on-exit off >/dev/null 2>&1 || true
+  # Size the window to the client that used it last, not to the smallest one
+  # attached. This is tmux's default from 2.9 on, and is set explicitly anyway
+  # because it is load-bearing here and a ~/.tmux.conf can turn it off: with
+  # `smallest`, a phone left attached in a pocket permanently shrinks the laptop
+  # that just took over, which looks exactly like the handoff being broken.
+  tmux set-option -t "$session" window-size latest >/dev/null 2>&1 || true
 fi
 
 # Deliberately no `-d`: that would detach other clients. Allowing several means
-# a phone and a laptop can watch the same run at once, which is the point.
-# Trade-off worth knowing: tmux sizes the window to the smallest attached
-# client, so a phone will constrain a desktop while both are attached.
+# a phone and a laptop can watch the same run at once, which is the point — and
+# `window-size latest` above is what keeps the one you are typing on from being
+# squeezed by the one you are not.
 exec tmux attach-session -t "$session"
