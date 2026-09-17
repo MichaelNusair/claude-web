@@ -166,6 +166,17 @@
     0%,100% { box-shadow: 0 0 0 0 rgba(224,82,82,.55), 0 4px 14px rgba(0,0,0,.45) }
     50%     { box-shadow: 0 0 0 16px rgba(224,82,82,0), 0 4px 14px rgba(0,0,0,.45) }
   }
+  /*
+   * Speaking has to be visible on the bar, not only in the sheet: the sheet is
+   * dismissed by tapping beside it, and the voice carries on afterwards — so this
+   * button is the only Stop there is at that point. Same pulse as recording, in
+   * the accent colour rather than the recording red.
+   */
+  .cmo-btn.cmo-speaking { background: #d97757; animation: cmo-speak-pulse 1.6s infinite; }
+  @keyframes cmo-speak-pulse {
+    0%,100% { box-shadow: 0 0 0 0 rgba(217,119,87,.55), 0 4px 14px rgba(0,0,0,.45) }
+    50%     { box-shadow: 0 0 0 14px rgba(217,119,87,0), 0 4px 14px rgba(0,0,0,.45) }
+  }
 
   #cmo-sheet {
     position: fixed; inset: 0; z-index: 2147483001;
@@ -255,6 +266,23 @@
     font: 14px/1.5 inherit; white-space: pre-wrap; overflow-wrap: anywhere;
     max-height: 46vh; overflow-y: auto;
   }
+  /*
+   * The other conversations in this project. Rows rather than a select, because
+   * each one carries three things — what it is, what it is doing, and how long ago
+   * — and because a thumb has to hit it on a phone.
+   */
+  .cmo-convos { margin: 6px 0 0; max-height: 34vh; overflow-y: auto; }
+  .cmo-convo {
+    width: 100%; display: grid; gap: 2px 8px;
+    grid-template-columns: auto 1fr; align-items: baseline;
+    margin: 6px 0 0; padding: 9px 11px; border: none; border-radius: 10px;
+    background: #272725; color: #f5f4ef; text-align: left; cursor: pointer;
+    font: 13px/1.4 inherit;
+  }
+  .cmo-convo.cmo-current { background: #34332f; box-shadow: inset 0 0 0 1px #d97757; }
+  .cmo-convo-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .cmo-convo-meta { grid-column: 2; color: #a8a49b; font-size: 12px; }
+  .cmo-convo-back { grid-template-columns: 1fr; color: #a8a49b; }
   `;
   const style = document.createElement('style');
   style.textContent = css;
@@ -270,6 +298,15 @@
     <button class="cmo-btn cmo-secondary" id="cmo-terminal" aria-label="Terminal">&#10095;</button>
     <button class="cmo-btn" id="cmo-mic" aria-label="Dictate">&#127908;</button>`;
   document.body.appendChild(fab);
+
+  /*
+   * Held, not looked up by id. The dictation sheet has a `<p id="cmo-status">` of
+   * its own, so `document.getElementById('cmo-status')` answers with whichever
+   * comes first in document order — the bar, today, by luck of the append order.
+   * This button is repainted while speech is playing, and picking the wrong
+   * element for that would put a Stop control inside the dictation sheet.
+   */
+  const statusBtn = fab.querySelector('#cmo-status');
 
   // The chip is created here but only inserted when there is something to say;
   // an empty pill across the top of the editor is worse than no chip at all.
@@ -290,13 +327,33 @@
     if (e.target === sheet) closeSheet();
   });
 
+  /*
+   * Which sheet is on screen, counted rather than named.
+   *
+   * Three buttons close the sheet a beat *after* they act, so their confirmation
+   * ("Copied — paste into Claude") can be read before it disappears. That delay
+   * outlives the sheet it belongs to: tap Copy and then open the status sheet
+   * within the same second, and the pending close dismisses the sheet you just
+   * opened. Every one of those buttons is on a bar that is always on screen, so
+   * that second tap is not a strange thing to do.
+   */
+  let sheetGeneration = 0;
+
   function openSheet(html) {
+    sheetGeneration += 1;
     panel.innerHTML = html;
     sheet.classList.add('cmo-open');
   }
   function closeSheet() {
     sheet.classList.remove('cmo-open');
     stopRecognition();
+  }
+  /** Close after `ms`, unless a different sheet has been opened by then. */
+  function closeSheetLater(ms) {
+    const generation = sheetGeneration;
+    setTimeout(() => {
+      if (generation === sheetGeneration) closeSheet();
+    }, ms);
   }
 
   // ------------------------------------------------------------- dictation
@@ -542,13 +599,23 @@
       // On the clipboard now, which outlives the page: the copy is the handover,
       // so keeping a second copy here would only resurface it next time.
       clearDictation();
-      setTimeout(closeSheet, 700);
+      closeSheetLater(700);
     });
 
     startDictation(textarea, status);
   }
 
   function startDictation(textarea, status) {
+    /*
+     * A microphone is about to go live, so stop talking.
+     *
+     * Both dictation paths come through here — the recognizer and the whisper
+     * recorder — which makes this the one place that has to know. Left playing,
+     * the recognizer transcribes Claude's own reply into the composer and the
+     * recorder uploads it to be transcribed; either way the user's next message
+     * is Claude quoting itself.
+     */
+    stopSpeech();
     if (!SpeechRecognition) {
       status.textContent = 'Live dictation unavailable — recording instead.';
       recordAndTranscribe(textarea, status);
@@ -1088,12 +1155,12 @@
     panel.querySelector('#cmo-back').addEventListener('click', () => {
       pressChord(KEY_BACK);
       status.textContent = 'Asked the editor to close open files.';
-      setTimeout(closeSheet, 700);
+      closeSheetLater(700);
     });
     panel.querySelector('#cmo-chrome').addEventListener('click', () => {
       pressChord(KEY_CHROME);
       status.textContent = 'Toggled tabs, activity bar and status bar.';
-      setTimeout(closeSheet, 700);
+      closeSheetLater(700);
     });
   }
 
@@ -1183,11 +1250,30 @@
   const STATUS_POLL_LIMIT = 30 * 60 * 1000;
   // Long enough to read a line and decide, short enough not to sit on the editor.
   const CHIP_LINGER_MS = 30000;
+  /*
+   * A slow heartbeat, even when nothing is working.
+   *
+   * Switching conversations inside the panel is invisible from out here: it is one
+   * webview rearranging itself, with no navigation, no visibility change, and
+   * nothing to listen for. Without a heartbeat the answer from page load stands
+   * until something else happens to ask — which is what "the status is stale after
+   * I switch" actually was. A tail read is tens of milliseconds, so this is cheap
+   * enough to run while the tab is watched and stopped the moment it is not.
+   */
+  const STATUS_HEARTBEAT_MS = 15000;
 
   let status = null;
   let statusPollTimer = null;
+  let statusHeartbeat = null;
   let statusPollingSince = 0;
   let chipTimer = null;
+  /*
+   * A conversation the user picked out of the list, which then overrides the
+   * guess. Null means "whichever one you think I am in" — see guessConversation in
+   * chat-service/claude-status.js for how good that guess can be, and why the
+   * answer always names what it chose.
+   */
+  let pinnedSession = null;
 
   function folder() {
     try {
@@ -1207,8 +1293,9 @@
   async function fetchStatus() {
     const cwd = folder();
     if (!cwd) return null;
+    const pin = pinnedSession ? `&sessionId=${encodeURIComponent(pinnedSession)}` : '';
     try {
-      const res = await fetch(`/api/claude-status?cwd=${encodeURIComponent(cwd)}`);
+      const res = await fetch(`/api/claude-status?cwd=${encodeURIComponent(cwd)}${pin}`);
       if (!res.ok) return null;
       return await res.json();
     } catch {
@@ -1225,12 +1312,45 @@
     setTimeout(() => chip.remove(), 450);
   }
 
+  /** How long ago, in words, for a list where exact times would be noise. */
+  function sinceText(at) {
+    if (!at) return '';
+    const mins = Math.round((Date.now() - at) / 60000);
+    if (mins < 1) return 'just now';
+    if (mins < 60) return `${mins} min ago`;
+    const hours = Math.round(mins / 60);
+    return hours < 24 ? `${hours} h ago` : `${Math.round(hours / 24)} d ago`;
+  }
+
+  /**
+   * A name for a conversation.
+   *
+   * Claude Code's own title where there is one — it is written into the transcript
+   * as the conversation grows — and otherwise the opening of what was last said,
+   * which is what people recognise a conversation by anyway.
+   */
+  function nameOf(c) {
+    if (c?.title) return c.title;
+    const said = c?.said || c?.last?.text || '';
+    const line = said.replace(/\s+/g, ' ').trim();
+    return line ? line.slice(0, 48) : 'Untitled conversation';
+  }
+
   /** A single line: what it is doing, or the first of what it said. */
   function chipLine(s) {
-    if (s.state === 'working') return 'Claude is working…';
-    if (s.last?.text) return s.last.text.replace(/\s+/g, ' ').trim();
-    if (s.state === 'unknown') return 'Claude — tap for status';
-    return 'Claude is waiting for you';
+    const line =
+      s.state === 'working'
+        ? 'Claude is working…'
+        : s.last?.text
+          ? s.last.text.replace(/\s+/g, ' ').trim()
+          : s.state === 'unknown'
+            ? 'Claude — tap for status'
+            : 'Claude is waiting for you';
+    // Name the conversation only when the project holds more than one, because
+    // that is the only time it tells you anything — and it is exactly when an
+    // answer about the wrong one is possible. See guessConversation.
+    const many = (s.conversations?.length || 0) > 1;
+    return many && s.title ? `${s.title} · ${line}` : line;
   }
 
   function showChip(s, { linger = true } = {}) {
@@ -1250,30 +1370,46 @@
   }
 
   /**
-   * Poll only while a turn is in flight, and only while the tab is visible.
+   * Ask, and decide whether the answer is worth putting on screen.
    *
-   * The transition from working to idle is the whole point of polling — it is the
-   * moment the answer you were waiting for exists — so the chip is rewritten when
-   * it happens rather than being left saying "working" until the next page load.
+   * `silent` is what makes a heartbeat tolerable: a repeat of what is already
+   * known changes nothing, but two things still speak up. A turn finishing is the
+   * moment the answer exists, and the conversation *changing* — someone switched
+   * conversations in the panel, and this is the first sight of it out here — is the
+   * moment the last message on screen stopped belonging to what is on screen.
+   */
+  async function refreshStatus({ silent = false } = {}) {
+    const next = await fetchStatus();
+    if (!next) return null;
+    const prev = status;
+    status = next;
+
+    const switched = Boolean(prev?.sessionId && next.sessionId && prev.sessionId !== next.sessionId);
+    const finished = prev?.state === 'working' && next.state !== 'working';
+    // A visible chip is always kept current; an absent one is only brought back
+    // for something new. Otherwise a dismissed chip would return every 15s.
+    if (!silent || switched || finished || chip.isConnected) showChip(next);
+
+    if (next.state === 'working') {
+      if (!statusPollTimer) statusPollingSince = Date.now();
+      stopStatusPoll();
+      statusPollTimer = setTimeout(pollStatus, STATUS_POLL_MS);
+    }
+    return next;
+  }
+
+  /**
+   * Poll fast while a turn is in flight, and only while the tab is visible.
+   *
+   * The transition from working to idle is why this is four seconds rather than
+   * the heartbeat's fifteen — it is the moment the answer you were waiting for
+   * exists, and the chip is rewritten when it happens.
    */
   async function pollStatus() {
     stopStatusPoll();
     if (document.visibilityState !== 'visible') return;
     if (Date.now() - statusPollingSince > STATUS_POLL_LIMIT) return;
-
-    const next = await fetchStatus();
-    if (!next) return;
-    const finished = status?.state === 'working' && next.state !== 'working';
-    status = next;
-
-    if (next.state === 'working') {
-      showChip(next);
-      statusPollTimer = setTimeout(pollStatus, STATUS_POLL_MS);
-      return;
-    }
-    // Only announce the finish if this tab watched it happen. Otherwise a page
-    // opened onto an idle conversation would claim a turn just ended.
-    if (finished) showChip(next);
+    await refreshStatus({ silent: true });
   }
 
   /**
@@ -1283,15 +1419,17 @@
    * and being told to tap something while the editor is busy loading is the same
    * wait with an extra step.
    */
-  async function checkStatus() {
-    const next = await fetchStatus();
-    if (!next) return;
-    status = next;
-    showChip(next);
-    if (next.state === 'working') {
-      statusPollingSince = Date.now();
-      statusPollTimer = setTimeout(pollStatus, STATUS_POLL_MS);
-    }
+  const checkStatus = () => refreshStatus();
+
+  /** Notice a switch that this page has no way of being told about. */
+  function startStatusHeartbeat() {
+    if (statusHeartbeat) return;
+    statusHeartbeat = setInterval(() => {
+      if (document.visibilityState !== 'visible') return;
+      // A working turn is already being polled, four times as often.
+      if (statusPollTimer) return;
+      refreshStatus({ silent: true });
+    }, STATUS_HEARTBEAT_MS);
   }
 
   /** The whole of what Claude last said, for when one line was not enough. */
@@ -1311,19 +1449,49 @@
     const when = s.last?.at ? new Date(s.last.at) : null;
     const ago = when ? Math.max(0, Math.round((Date.now() - when.getTime()) / 60000)) : null;
     const size = s.bytes ? `${(s.bytes / (1024 * 1024)).toFixed(1)} MB` : null;
+    const said = s.last?.text || '';
+    // No button when there is nothing to say or nothing to say it with, rather
+    // than a disabled one: this sheet is answering a question, and an inert
+    // control in it reads as something being broken.
+    const canSpeak = Boolean(said) && speechAvailable();
+
+    const others = Array.isArray(s.conversations) ? s.conversations : [];
 
     openSheet(`
       <p class="cmo-title">${working ? 'Claude is working' : 'Your turn'}</p>
+      <p class="cmo-hint" id="cmo-status-name"></p>
       <p class="cmo-hint" id="cmo-status-detail"></p>
       <div class="cmo-said" id="cmo-status-said"></div>
       <div class="cmo-row">
+        ${canSpeak ? `<button class="cmo-action" id="cmo-speak">${
+          speaking ? 'Stop' : 'Read aloud'
+        }</button>` : ''}
+        <button class="cmo-action cmo-alt" id="cmo-status-refresh">Refresh</button>
         <button class="cmo-action cmo-alt" id="cmo-status-close">Close</button>
       </div>
       <p class="cmo-hint">${
         working
           ? 'The panel is still loading the history; the end of it has not been written yet.'
           : 'This is the last thing Claude said. The panel is still rendering the history above it.'
-      }${size ? ` This conversation is ${size} on disk, which is what the panel is reading.` : ''}</p>`);
+      }${size ? ` This conversation is ${size} on disk, which is what the panel is reading.` : ''}</p>
+      ${others.length > 1 ? `
+        <p class="cmo-hint" id="cmo-convo-head"></p>
+        <div id="cmo-convos" class="cmo-convos"></div>` : ''}`);
+
+    /*
+     * Which conversation this is about, said out loud.
+     *
+     * Nothing outside the panel can see which conversation is on screen, so this
+     * answer is a guess whenever it was not asked for by id. Naming it is what
+     * makes a wrong guess correctable instead of merely stale — the list below is
+     * the correction.
+     */
+    panel.querySelector('#cmo-status-name').textContent = [
+      nameOf(s),
+      pinnedSession ? 'following this one' : others.length > 1 ? 'best guess' : null,
+    ]
+      .filter(Boolean)
+      .join(' · ');
 
     // textContent, not innerHTML: this is a message from a model, it routinely
     // contains code and angle brackets, and it is not markup.
@@ -1333,12 +1501,491 @@
       ago === null ? null : ago === 0 ? 'just now' : `${ago} min ago`,
       // Where the verdict came from, because the two are not equally certain: the
       // broker knows, the transcript only shows the state it was left in.
-      s.source === 'broker' ? 'live from the broker' : 'inferred from the transcript',
-      s.clients === 0 ? 'no device attached' : null,
+      s.source === 'broker' ? 'live from the broker' : 'read from the transcript',
+      // Not the same statement as "idle": no process means nothing can be working,
+      // where no device merely means nobody is watching one that is.
+      s.live === false ? 'nothing running it' : s.clients === 0 ? 'no device attached' : null,
     ]
       .filter(Boolean)
       .join(' · ');
     panel.querySelector('#cmo-status-close').addEventListener('click', closeSheet);
+
+    // Ask again, in place. The heartbeat is fifteen seconds and someone reading
+    // this sheet has a more specific question than that.
+    panel.querySelector('#cmo-status-refresh').addEventListener('click', async () => {
+      const button = panel.querySelector('#cmo-status-refresh');
+      button.textContent = 'Refreshing…';
+      await refreshStatus();
+      openStatus();
+    });
+
+    /*
+     * The other conversations in this project.
+     *
+     * This is the honest answer to "which conversation am I in", given that the
+     * panel will not say: show them all, name each, and let a tap decide. Tapping
+     * one pins it, so the chip and this sheet follow that conversation instead of
+     * the guess — which is what someone who has just switched actually wants.
+     */
+    const list = panel.querySelector('#cmo-convos');
+    if (list) {
+      const busy = others.filter((c) => c.state === 'working').length;
+      panel.querySelector('#cmo-convo-head').textContent =
+        `${others.length} conversations here${busy ? `, ${busy} working` : ''} — tap one to follow it`;
+
+      for (const c of others) {
+        const row = document.createElement('button');
+        row.type = 'button';
+        row.className = `cmo-convo${c.current ? ' cmo-current' : ''}`;
+        const dot = document.createElement('span');
+        dot.className = `cmo-dot${c.state === 'working' ? ' cmo-busy' : ''}`;
+        const label = document.createElement('span');
+        label.className = 'cmo-convo-label';
+        // A title and a message are both model output. Never markup.
+        label.textContent = nameOf(c);
+        const meta = document.createElement('span');
+        meta.className = 'cmo-convo-meta';
+        meta.textContent = [
+          c.state === 'working' ? 'working' : 'your turn',
+          sinceText(c.at),
+          c.live === false ? 'not running' : null,
+        ]
+          .filter(Boolean)
+          .join(' · ');
+        row.append(dot, label, meta);
+        row.addEventListener('click', async () => {
+          // Whatever is being read aloud belongs to the conversation being left,
+          // and hearing it under a sheet describing a different one is worse than
+          // silence. Same on the way back.
+          stopSpeech();
+          pinnedSession = c.sessionId;
+          await refreshStatus();
+          openStatus();
+        });
+        list.appendChild(row);
+      }
+
+      if (pinnedSession) {
+        const back = document.createElement('button');
+        back.type = 'button';
+        back.className = 'cmo-convo cmo-convo-back';
+        back.textContent = 'Stop following — go back to the active one';
+        back.addEventListener('click', async () => {
+          stopSpeech();
+          pinnedSession = null;
+          await refreshStatus();
+          openStatus();
+        });
+        list.appendChild(back);
+      }
+    }
+
+    /*
+     * Read aloud, and Stop.
+     *
+     * `speak` is called straight out of the tap with the text already in hand —
+     * no await in front of it — because iOS refuses speech that did not start
+     * inside a gesture. The sheet is left open afterwards rather than closed: the
+     * voice outlives it either way, and dismissing it is how you get back to
+     * watching the panel while it reads.
+     */
+    const speakBtn = panel.querySelector('#cmo-speak');
+    if (speakBtn) {
+      speakBtn.addEventListener('click', () => {
+        if (speaking) {
+          stopSpeech();
+          return;
+        }
+        // Said first, when a turn is still running: otherwise the previous
+        // message is heard as the answer to the thing still being worked on.
+        const started = speak(said, working ? 'Still working. Last message:' : '');
+        if (!started) {
+          panel.querySelector('#cmo-status-detail').textContent =
+            'Nothing was spoken — this browser has no speech, or the mic is live.';
+        }
+      });
+    }
+  }
+
+  // ------------------------------------------------------- reading it aloud
+  /*
+   * Say the last message out loud, when asked to.
+   *
+   * The other half of the mic. Dictation carries a phone-shaped question into
+   * Claude; this carries the answer back out, for the times you are holding the
+   * phone rather than reading it — walking, driving, or waiting on a turn that
+   * has been running for an hour. The final message of a turn is the one worth
+   * hearing: it is where the summary of everything that just happened is.
+   *
+   * It is a button, deliberately, and not something that fires when a turn ends.
+   * A turn can finish while you are mid-sentence with someone, in another app, or
+   * twenty minutes after you stopped waiting for it — and a phone that starts
+   * talking by itself in any of those is worse than one that stays quiet. So
+   * nothing here has a timer or a subscription: it speaks when tapped.
+   *
+   * This cannot be done from the extension, and that is not a limitation of this
+   * repo. The panel is a proprietary webview, and the extension host is a node
+   * process with no audio device — nothing in either can make a sound. The
+   * workbench page can, and it is also the one place that already has the text,
+   * from /api/claude-status. So the overlay speaks, and the panel is untouched.
+   *
+   * Two constraints shape the rest, and both are ones the dictation sheet already
+   * lives with:
+   *
+   *   iOS refuses speech that did not start inside a tap. So the first utterance
+   *   is queued synchronously from the click handler, never after an `await` —
+   *   exactly the rule the clipboard write follows. `openStatus` has already
+   *   refreshed the status, so the text is in hand and nothing is fetched here.
+   *
+   *   Speaking while the recognizer is listening dictates Claude's own words back
+   *   into the composer. So opening the dictation sheet stops the speech, and
+   *   this never starts while dictation is running.
+   */
+
+  // Long enough for the summary a turn ends with; short enough that the wrong
+  // message, or a wall of prose, is over in about a minute rather than five. What
+  // is left is on screen, and the speech says so rather than just stopping.
+  const SPEECH_CAP = 2400;
+  /*
+   * Utterances are queued one at a time, not all at once.
+   *
+   * Two reasons, and the second is the one that matters on this surface: iOS
+   * speaks only the first of a long queue and drops the rest, and a short current
+   * utterance is what makes Stop stop now instead of at the end of the message.
+   */
+  const SPEECH_CHUNK = 220;
+
+  let speechChunks = [];
+  let speaking = false;
+
+  const speechAvailable = () =>
+    typeof window.speechSynthesis !== 'undefined' &&
+    typeof window.SpeechSynthesisUtterance === 'function';
+
+  /**
+   * Markdown as something worth listening to.
+   *
+   * A final message is written to be *read*: bold, bullets, backticks, file
+   * paths, links, and a fenced diff in the middle of it. Spoken literally that is
+   * "asterisk asterisk Done asterisk asterisk", every slash of every path read
+   * out, and a minute of punctuation names. So the markup is removed rather than
+   * pronounced, and the parts that are not prose at all — code blocks, URLs — are
+   * replaced by the fact that they were there, because silently dropping them
+   * would misrepresent the message.
+   *
+   * Deterministic and local, on purpose. A model would do this better, and
+   * `polish.js` is right there — but it would put a network round trip and a bill
+   * between the tap and the first word, and iOS only allows speech that starts
+   * inside the tap. This is the one thing in the app that has to begin
+   * immediately.
+   */
+  function speakable(markdown) {
+    let text = String(markdown == null ? '' : markdown);
+
+    // Code is not listenable and it is on screen anyway; say that it was there.
+    // The unterminated case is a message that ended mid-block, which is a normal
+    // thing to find in a transcript being read while it is still being written.
+    text = text.replace(/```[\s\S]*?```/g, ' Code block. ');
+    text = text.replace(/~~~[\s\S]*?~~~/g, ' Code block. ');
+    text = text.replace(/```[\s\S]*$/g, ' Code block. ');
+
+    // Images say nothing out loud. Links keep their label and lose their target:
+    // the label is the sentence, the URL is unspeakable.
+    text = text.replace(/!\[[^\]]*\]\([^)]*\)/g, ' ');
+    text = text.replace(/\[([^\]]*)\]\([^)]*\)/g, '$1');
+    text = text.replace(/<(https?:\/\/[^>]*)>/g, ' link ');
+    text = text.replace(/\bhttps?:\/\/\S+/g, ' link ');
+
+    // Inline code is usually an identifier, a flag or a filename — all of them
+    // words. It is the backticks that are not.
+    text = text.replace(/`+([^`]*)`+/g, '$1');
+
+    /*
+     * Line-level markers, before the inline ones: a `*` opening a list item and a
+     * `*` opening emphasis are told apart by the space after it, and only while
+     * the line still begins where it began.
+     *
+     * The full stop is added here, on the lines that had a marker, rather than
+     * later on every line. A heading or a bullet ends where it ends whatever
+     * follows it, and this is the last point at which that is still known — after
+     * the marker is gone, a bullet and the second line of a wrapped sentence look
+     * identical, and giving both a full stop invents a sentence break in the
+     * middle of the prose one.
+     */
+    text = text
+      .split('\n')
+      .map((line) => {
+        const stripped = line
+          .replace(/^\s{0,3}#{1,6}\s+/, '')
+          .replace(/^\s{0,3}>\s?/, '')
+          .replace(/^\s{0,3}([-*+]|\d{1,3}[.)])\s+/, '')
+          .replace(/^\s*\[[ xX]\]\s*/, '')
+          .replace(/^\s{0,3}([-*_])(\s*\1){2,}\s*$/, '')
+          .trim();
+        if (stripped === line.trim() || !stripped) return stripped;
+        return /[.!?:;,]$/.test(stripped) ? stripped : `${stripped}.`;
+      })
+      .join('\n');
+
+    // Tables read as prose only if the pipes become pauses; the separator row is
+    // not a row at all. Terminated here for the same reason a bullet is: a row is
+    // one item, and this is the last point at which it is recognisable as one.
+    text = text.replace(/^\s*\|?[\s:|-]*\|[\s:|-]*$/gm, '');
+    text = text.replace(/^\s*\|(.*)\|\s*$/gm, (_m, row) => {
+      const cells = row.split('|').map((cell) => cell.trim()).filter(Boolean).join(', ');
+      return cells && !/[.!?:;,]$/.test(cells) ? `${cells}.` : cells;
+    });
+
+    text = text.replace(/(\*\*|__|~~)/g, '');
+    text = text.replace(/(^|[\s(])[*_]([^\s*_][^*_]*)[*_]($|[\s.,;:!?)])/g, '$1$2$3');
+
+    /*
+     * A path is a word, and the word is its last segment.
+     *
+     * Reading "slash workspace slash projects slash claude dash web slash chat
+     * dash service slash auth dot js" is how a spoken summary becomes unusable,
+     * and the file name is the part that identifies it anyway. Guarded so that
+     * ordinary prose keeps its slashes: it takes either a second slash or a file
+     * extension on the end to count as a path, which leaves "and/or", "24/7" and
+     * "km/h" alone.
+     */
+    text = text.replace(
+      /(^|[\s("'])(\.{0,2}\/?[A-Za-z0-9._~-]+(?:\/[A-Za-z0-9._~-]+)+)/g,
+      (match, pre, candidate) => {
+        const looksLikePath =
+          (candidate.match(/\//g) || []).length >= 2 || /\.[A-Za-z]{1,5}$/.test(candidate);
+        if (!looksLikePath) return match;
+        const segments = candidate.split('/').filter((part) => part && part !== '.' && part !== '..');
+        return pre + (segments[segments.length - 1] || candidate);
+      },
+    );
+    // `auth.js:42` and `auth.js:42-51` are line references, and they are read as
+    // ones. Left as a colon they run the number into the next sentence.
+    text = text.replace(
+      /([A-Za-z0-9._-]+\.[A-Za-z]{1,5}):(\d+)(?:-(\d+))?/g,
+      (_m, file, from, to) => `${file}, line ${from}${to ? ` to ${to}` : ''}`,
+    );
+
+    // Arrows, box drawing, dingbats, check marks and emoji — written as escapes
+    // because this file is injected raw into a page whose charset we do not set.
+    // Deliberately NOT the General Punctuation block (U+2000–U+206F): the dashes
+    // and curly quotes in it are how a sentence is paced, and a synthesiser reads
+    // them as the pauses they are.
+    // U+2300–U+27BF already contains the box-drawing block, hence no range for it.
+    text = text.replace(/[\u2190-\u21FF\u2300-\u27BF\u2B00-\u2BFF\uFE0F]/g, ' ');
+    text = text.replace(/[\u{1F000}-\u{1FAFF}]/gu, ' ');
+
+    /*
+     * A blank line ends a sentence; a single newline does not.
+     *
+     * Which is exactly what those two mean in markdown, and it is also how they
+     * sound. A synthesiser reads a bare newline as nothing at all, so something has
+     * to supply the pauses — but supplying one at every newline breaks prose that
+     * happens to be hard-wrapped, and a full stop in the middle of a sentence is
+     * heard as a real one ("it now reads the mic button's. class instead of"). That
+     * is worse than a missing pause, because it changes what the sentence says.
+     *
+     * The short lines this used to be for — headings, bullets, table rows — are
+     * already terminated above, at the point where their marker was still there to
+     * prove they were one. So they keep their pacing and nothing has to guess.
+     */
+    const paragraphs = [];
+    let broken = false;
+    for (const raw of text.split('\n')) {
+      const line = raw.trim();
+      if (!line) {
+        broken = true;
+        continue;
+      }
+      const previous = paragraphs.length - 1;
+      if (broken && previous >= 0 && !/[.!?:;,]$/.test(paragraphs[previous])) {
+        paragraphs[previous] += '.';
+      }
+      paragraphs.push(line);
+      broken = false;
+    }
+    // The last sentence too, or the voice ends on the rising note of an
+    // unterminated line and sounds like it was cut off.
+    const last = paragraphs.length - 1;
+    if (last >= 0 && !/[.!?]$/.test(paragraphs[last])) {
+      paragraphs[last] = paragraphs[last].replace(/[:;,]$/, '') + '.';
+    }
+    text = paragraphs.join(' ');
+
+    text = text.replace(/\s+/g, ' ').replace(/\s+([.,;:!?])/g, '$1').trim();
+    // Collapse what the two passes above can leave behind: "word.." from a line
+    // that ended in an abbreviation, and " . " from a line that was only markup.
+    text = text.replace(/\.{2,}/g, '.').replace(/(?:\s\.)+/g, '.').trim();
+
+    if (text.length <= SPEECH_CAP) return text;
+    // Cut at the last sentence that fits, so it stops on a full stop rather than
+    // in the middle of a word — and say that there is more, because a summary
+    // that just stops sounds like the answer ended there.
+    const head = text.slice(0, SPEECH_CAP);
+    const lastStop = Math.max(head.lastIndexOf('. '), head.lastIndexOf('! '), head.lastIndexOf('? '));
+    const kept = lastStop > SPEECH_CAP / 3 ? head.slice(0, lastStop + 1) : head;
+    return `${kept.trim()} That is as far as I will read; the rest is on screen.`;
+  }
+
+  /**
+   * Sentences, by scanning rather than by regex.
+   *
+   * A lookbehind (`/(?<=[.!?])\s+/`) is the obvious way to write this and the
+   * wrong one here: it is a *parse* error on a browser that does not support it,
+   * so the whole file fails to load and every button on this bar disappears —
+   * the exact silent failure `overlay-test.js` exists for, except that the test
+   * runs on node, where the syntax is fine, and would never see it.
+   */
+  function splitSentences(text) {
+    const out = [];
+    let start = 0;
+    for (let i = 0; i < text.length; i += 1) {
+      if ('.!?'.indexOf(text[i]) === -1) continue;
+      // Take a run of terminators together ("Really?!"), and only break if
+      // whitespace follows — "3.5" and "auth.js" are not sentence ends.
+      let end = i;
+      while (end + 1 < text.length && '.!?'.indexOf(text[end + 1]) !== -1) end += 1;
+      if (end + 1 < text.length && !/\s/.test(text[end + 1])) {
+        i = end;
+        continue;
+      }
+      out.push(text.slice(start, end + 1));
+      start = end + 1;
+      i = end;
+    }
+    if (start < text.length) out.push(text.slice(start));
+    return out;
+  }
+
+  /**
+   * Split into utterance-sized pieces at sentence boundaries.
+   *
+   * Sentences first, and only then a hard split of any single sentence longer
+   * than the limit — a code-heavy line can be one 900-character "sentence", and
+   * it still has to be said.
+   */
+  function speechPieces(text) {
+    const pieces = [];
+    let current = '';
+
+    const flush = () => {
+      const trimmed = current.trim();
+      if (trimmed) pieces.push(trimmed);
+      current = '';
+    };
+
+    // Trimmed here, not by the scanner: a split leaves the space that followed the
+    // full stop on the front of the next sentence, and joining those with another
+    // space is a double space inside an utterance.
+    for (const piece of splitSentences(text).map((s) => s.trim())) {
+      if (!piece) continue;
+      if (piece.length > SPEECH_CHUNK) {
+        flush();
+        for (const word of piece.split(' ')) {
+          if (current.length + word.length + 1 > SPEECH_CHUNK) flush();
+          current += (current ? ' ' : '') + word;
+        }
+        flush();
+        continue;
+      }
+      if (current.length + piece.length + 1 > SPEECH_CHUNK) flush();
+      current += (current ? ' ' : '') + piece;
+    }
+    flush();
+    return pieces;
+  }
+
+  /** Reflect speech on the bar and in the sheet, wherever either happens to be. */
+  function paintSpeech() {
+    statusBtn.classList.toggle('cmo-speaking', speaking);
+    // The glyph changes as well as the colour: on the bar this is the only Stop
+    // once the sheet has been dismissed, and a pulse alone does not say so.
+    statusBtn.innerHTML = speaking ? '&#9632;' : '&#9673;';
+    statusBtn.setAttribute(
+      'aria-label',
+      speaking ? 'Stop reading aloud' : 'Is Claude working?',
+    );
+    const sheetBtn = panel.querySelector('#cmo-speak');
+    if (sheetBtn) sheetBtn.textContent = speaking ? 'Stop' : 'Read aloud';
+  }
+
+  function stopSpeech() {
+    speechChunks = [];
+    if (speaking) speaking = false;
+    if (speechAvailable()) {
+      try {
+        window.speechSynthesis.cancel();
+      } catch {
+        /* a synthesiser that refuses to be cancelled is still one we forget */
+      }
+    }
+    paintSpeech();
+  }
+
+  /** Say the next piece, and the one after it, until Stop or the end. */
+  function sayNext() {
+    if (!speechChunks.length) {
+      speaking = false;
+      paintSpeech();
+      return;
+    }
+    const piece = speechChunks.shift();
+    const utterance = new window.SpeechSynthesisUtterance(piece);
+    // The same language the recognizer dictates in, so one setting governs both
+    // directions of the conversation.
+    utterance.lang = navigator.language || 'en-US';
+    // Chaining on `end` is what keeps iOS speaking past the first piece. `error`
+    // is chained too rather than aborting: one refused piece (a stray character,
+    // an interrupted voice) must not silence the rest of the message.
+    utterance.onend = () => {
+      if (speaking) sayNext();
+    };
+    utterance.onerror = () => {
+      if (speaking) sayNext();
+    };
+    try {
+      window.speechSynthesis.speak(utterance);
+    } catch {
+      // Nothing will be spoken, so do not leave a Stop button on the bar.
+      stopSpeech();
+    }
+  }
+
+  /**
+   * Start reading. Returns whether anything will actually be said, so the caller
+   * can label its own button honestly.
+   *
+   * `lead` is spoken first and is plain speech, not markdown — it goes on *after*
+   * the reduction rather than in front of the message, because the strips that
+   * remove headings and bullets are anchored to the start of a line, and anything
+   * put in front of the first line hides the marker on it.
+   *
+   * Must be called inside the tap: see the note at the top of this section.
+   */
+  function speak(markdown, lead = '') {
+    stopSpeech();
+    if (!speechAvailable()) return false;
+    /*
+     * Never over a live microphone. The recognizer would hear this and dictate
+     * Claude's own words back into the composer, and the whisper path would
+     * record them and send them to be transcribed.
+     *
+     * Asked of the mic button rather than of `recognition`, because that class is
+     * the one thing both dictation paths maintain — the recognizer sets it, and so
+     * does the recorder, which holds its state in a local nothing else can see.
+     */
+    if (document.getElementById('cmo-mic')?.classList.contains('cmo-rec')) return false;
+    const body = speakable(markdown);
+    // Asked of the message, not of the lead: a lead alone is this feature
+    // announcing itself and saying nothing, which is worse than the button
+    // reporting that there was nothing to read.
+    if (!body) return false;
+    speechChunks = speechPieces(lead ? `${lead} ${body}` : body);
+    if (!speechChunks.length) return false;
+    speaking = true;
+    paintSpeech();
+    sayNext();
+    return true;
   }
 
   // -------------------------------------------------------------- wiring
@@ -1353,7 +2000,19 @@
   document.getElementById('cmo-layout').addEventListener('click', openLayout);
   // The chip is the answer; the button is how you get it back after it has gone,
   // and how you ask again without reloading.
-  document.getElementById('cmo-status').addEventListener('click', async () => {
+  statusBtn.addEventListener('click', async () => {
+    /*
+     * While it is reading, this button is Stop.
+     *
+     * The sheet is dismissed by tapping beside it and the voice carries on, so at
+     * that point the bar holds the only control there is — and a phone talking
+     * with no visible way to stop it is the worst outcome this feature has. It
+     * looks like Stop too: see `paintSpeech`.
+     */
+    if (speaking) {
+      stopSpeech();
+      return;
+    }
     // Refreshed before opening, because this button is also "ask again" — and a
     // minutes-old snapshot is exactly the wrong thing to answer that with.
     await checkStatus();
@@ -1384,6 +2043,22 @@
    */
   // The debounce above must not be what loses the last sentence.
   window.addEventListener('pagehide', writeDictation);
+  /*
+   * Stop reading when the page goes away, but NOT when it is merely hidden.
+   *
+   * The workbench reloads itself on this surface, routinely — every bfcache
+   * restore — and speech that outlives its own document cannot be stopped by
+   * anything, because the button that would stop it has been destroyed. iOS has
+   * shipped exactly that bug more than once.
+   *
+   * Hiding the tab is deliberately not the same thing. Pressing Read aloud and
+   * then locking the phone, or switching to something else while it talks, is a
+   * reasonable thing to do — it is close to the point of the feature — and
+   * cutting it off there would break the one case where hearing it beats reading
+   * it. Unlike the recognizer, a synthesiser losing the foreground loses nothing:
+   * it either keeps speaking or is resumed by the OS.
+   */
+  window.addEventListener('pagehide', stopSpeech);
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState !== 'visible') writeDictation();
   });
@@ -1401,6 +2076,7 @@
    * seconds — so returning is also when polling has to be picked back up.
    */
   checkStatus();
+  startStatusHeartbeat();
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState !== 'visible') {
       stopStatusPoll();
@@ -1408,6 +2084,11 @@
     }
     statusPollingSince = Date.now();
     checkStatus();
+  });
+  // Returning to the window is the cheapest signal there is that something may
+  // have changed in the panel while attention was elsewhere.
+  window.addEventListener('focus', () => {
+    if (document.visibilityState === 'visible') refreshStatus({ silent: true });
   });
 
   /*

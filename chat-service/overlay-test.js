@@ -485,8 +485,15 @@ statusReply = {
   at: Date.now(),
 };
 
+/*
+ * Scoped to the bar, not `getElementById`: the dictation sheet has a
+ * `<p id="cmo-status">` of its own, so while that sheet is open the plain lookup
+ * is ambiguous and returns whichever comes first in the document. It happens to
+ * be this button — which is a fact about the order two elements are appended in,
+ * not something to build every later check on.
+ */
 const tapStatus = async () => {
-  doc.getElementById('cmo-status').dispatchEvent(new w.MouseEvent('click', { bubbles: true }));
+  doc.querySelector('#cmo-fab #cmo-status').dispatchEvent(new w.MouseEvent('click', { bubbles: true }));
   await new Promise((resolve) => setTimeout(resolve, 30));
 };
 
@@ -554,6 +561,361 @@ ok(
 ok(
   'the sheet does not say Claude is working',
   /working/i.test(doc.querySelector('#cmo-panel .cmo-title')?.textContent ?? ''),
+);
+
+// ---------------------------------------------------------- reading it aloud
+/*
+ * Say the last message out loud.
+ *
+ * Three things here can fail silently on the device this is for and nowhere else,
+ * which is why they are asserted rather than tried by hand:
+ *
+ *   iOS refuses speech that did not start inside the tap, so the first utterance
+ *   has to be queued synchronously from the click — the same rule the clipboard
+ *   write in the dictation sheet follows, and the same way of getting it wrong.
+ *
+ *   iOS also speaks only the first of a long queue and drops the rest, so the
+ *   pieces are chained on `end`. A broken chain reads as a summary that stops
+ *   after one sentence, which sounds like the answer ending there.
+ *
+ *   Speech over a live microphone is dictated straight back into the composer, so
+ *   Claude ends up quoting itself as the user's next message.
+ *
+ * The reduction is checked too, because a final message is written to be read: a
+ * literal reading is "asterisk asterisk Done asterisk asterisk" and every slash of
+ * every path, out loud.
+ */
+
+// The sheet from the working branch above is still open, and jsdom has no
+// speechSynthesis — which is also every desktop browser with speech disabled.
+ok(
+  'a browser that cannot speak was still offered Read aloud, so the button does ' +
+    'nothing and reads as something being broken',
+  !doc.getElementById('cmo-speak'),
+);
+
+/*
+ * A synthesiser, as far as this feature can tell one apart from the real thing:
+ * it records what it was asked to say, and calls `end` on the next turn of the
+ * loop rather than at once, because a chain that only works synchronously is the
+ * bug being guarded against.
+ */
+const utterances = [];
+const langs = [];
+let cancels = 0;
+let speechGeneration = 0;
+
+class FakeUtterance {
+  constructor(text) {
+    this.text = text;
+    this.lang = '';
+    this.onend = null;
+    this.onerror = null;
+  }
+}
+w.SpeechSynthesisUtterance = FakeUtterance;
+w.speechSynthesis = {
+  speak(utterance) {
+    const generation = speechGeneration;
+    utterances.push(utterance.text);
+    langs.push(utterance.lang);
+    // Cancelled utterances never report `end`; that is what makes Stop stop.
+    setTimeout(() => {
+      if (generation === speechGeneration && utterance.onend) utterance.onend();
+    }, 0);
+  },
+  cancel() {
+    cancels += 1;
+    speechGeneration += 1;
+  },
+};
+
+// A final message shaped like the ones this exists for: a heading, emphasis,
+// inline code, a fenced block, a link, a bare URL, a full path, a line reference,
+// a check-marked list, and enough prose to need more than one utterance.
+const finalMessage = [
+  '## Done',
+  '',
+  '**Fixed** the guard in `pwa/mobile-overlay.js` — it now reads the mic button’s',
+  'class instead of `recognition`, which the recorder path never sets. See',
+  '/workspace/projects/claude-web/chat-service/auth.js:42-51 and the note in',
+  '[AGENTS.md](https://claude.example.com/AGENTS.md).',
+  '',
+  '```js',
+  'const speaking = false; // 3 < 4 && "quoted"',
+  '```',
+  '',
+  '- ✅ `npm run test:auth` passes',
+  '- ✅ the overlay still mounts, checked at https://claude.example.com/editor/',
+  '- *One* thing left: the entry in AGENTS.md.',
+  '',
+  'That is everything worth saying about it, and it is deliberately long enough that',
+  'a synthesiser has to be handed more than one utterance to get through it, because',
+  'a phone that says only the first sentence of a summary is worse than a phone that',
+  'says nothing at all — you would believe it had finished.',
+].join('\n');
+
+statusReply = {
+  ...statusReply,
+  state: 'idle',
+  clients: 0,
+  last: { role: 'assistant', text: finalMessage, at: new Date().toISOString() },
+};
+await tapStatus();
+
+const speakBtn = () => doc.getElementById('cmo-speak');
+const barBtn = doc.querySelector('#cmo-fab #cmo-status');
+const tapSpeak = () =>
+  speakBtn()?.dispatchEvent(new w.MouseEvent('click', { bubbles: true }));
+const settle = async (ms = 120) => new Promise((resolve) => setTimeout(resolve, ms));
+/*
+ * Wait for the queue to drain, rather than for a fixed delay.
+ *
+ * Every piece is one more turn of the event loop, and a box running twelve of
+ * these at once misses a fixed budget often enough to matter — after which every
+ * later check starts from "still reading" and three of them fail for one reason.
+ * `settle` is still right where the assertion is that nothing happened.
+ */
+const drain = async (limit = 5000) => {
+  const until = Date.now() + limit;
+  while (barBtn.classList.contains('cmo-speaking') && Date.now() < until) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+};
+
+ok('the status sheet offers no way to hear the message it is showing', speakBtn());
+ok('the Read aloud button does not say what it does', speakBtn()?.textContent === 'Read aloud');
+
+tapSpeak();
+ok(
+  'nothing was queued inside the tap — speech that starts after an await is refused ' +
+    'outright on iOS, which is the only surface this feature is for',
+  utterances.length === 1,
+);
+ok(
+  'the bar does not show that it is reading, so dismissing the sheet leaves a phone ' +
+    'talking with no visible way to stop it',
+  barBtn.classList.contains('cmo-speaking'),
+);
+ok(
+  'the bar button still offers to open the status sheet while it is reading, instead ' +
+    'of offering Stop',
+  /stop/i.test(barBtn.getAttribute('aria-label') || ''),
+);
+ok('the sheet button did not turn into Stop', speakBtn()?.textContent === 'Stop');
+
+await drain();
+ok(
+  'only one utterance was ever utterances — the chain on `end` is what gets iOS past the ' +
+    'first piece, and without it a summary stops after one sentence',
+  utterances.length > 1,
+);
+ok(
+  'an utterance was queued with no language, so it is read in whatever voice the ' +
+    'device defaults to rather than the one dictation uses',
+  langs.every((lang) => lang === 'en-US'),
+);
+ok(
+  'a piece longer than the chunk limit was queued, so Stop cannot stop until it ends',
+  utterances.every((piece) => piece.length <= 260),
+);
+ok(
+  'the reading did not end on its own, so the bar is left showing Stop for a voice ' +
+    'that has finished',
+  !barBtn.classList.contains('cmo-speaking'),
+);
+
+const heard = utterances.join(' ');
+ok('the markup was read out: backticks survived the reduction', !heard.includes('`'));
+ok('the markup was read out: bold markers survived the reduction', !heard.includes('**'));
+ok('the markup was read out: a heading was read as hashes', !heard.includes('##'));
+ok(
+  'emphasis was read as asterisks — "asterisk One asterisk thing left"',
+  /\bOne thing left\b/.test(heard) && !heard.includes('*'),
+);
+ok('a list marker was read out instead of being a pause', !/(^|\s)- /.test(heard));
+ok(
+  'a URL was read out character by character instead of being named',
+  !heard.includes('http') && !heard.includes('](') && /\blink\b/.test(heard),
+);
+ok(
+  'a code block was read out loud, or dropped without saying it was there — one is ' +
+    'a minute of punctuation names, the other misreports the message',
+  /Code block/.test(heard) && !heard.includes('&&'),
+);
+ok(
+  'a full path was read out slash by slash instead of by its file name',
+  !heard.includes('/workspace/') && !heard.includes('pwa/') &&
+    /\bmobile-overlay\.js\b/.test(heard),
+);
+ok(
+  'a line reference was left as a colon, which runs the number into the next sentence',
+  /auth\.js, line 42 to 51/.test(heard),
+);
+ok('a check mark was pronounced instead of dropped', !heard.includes('✅'));
+ok(
+  'a hard-wrapped sentence was broken at the wrap — a full stop dropped into the ' +
+    'middle of a sentence is heard as a real one, and changes what it says',
+  /the mic button’s class instead of recognition/.test(heard),
+);
+ok(
+  'consecutive bullets were run into one sentence, which is what a list sounds like ' +
+    'with no pauses in it',
+  /passes\. the overlay still mounts/.test(heard),
+);
+ok(
+  'a heading was run into the paragraph under it',
+  /^Done\. Fixed/.test(heard),
+);
+ok(
+  'the last sentence was left unterminated, so the voice ends on a rising note and ' +
+    'sounds cut off',
+  /\.$/.test(utterances[utterances.length - 1] || ''),
+);
+ok(
+  'the message lost its words along with its markup',
+  /\bDone\b/.test(heard) && /\bpasses\b/.test(heard) && /believe it had finished/.test(heard),
+);
+
+// ------------------------------------------------------------------ stopping
+/*
+ * Stop, from both controls. The sheet's button is the obvious one; the bar's is the
+ * one that matters, because the sheet is dismissed by tapping beside it and the
+ * voice carries on afterwards.
+ */
+tapSpeak();
+let cancelsAtStart = cancels;
+let utterancesAtStart = utterances.length;
+tapSpeak();
+await settle();
+ok('Stop in the sheet did not cancel the synthesiser', cancels > cancelsAtStart);
+ok(
+  'Stop in the sheet cancelled the current utterance but the queue carried on',
+  utterances.length === utterancesAtStart,
+);
+ok('Stop left the bar showing that it is still reading', !barBtn.classList.contains('cmo-speaking'));
+
+tapSpeak();
+cancelsAtStart = cancels;
+utterancesAtStart = utterances.length;
+const statusCallsAtStart = statusCalls.length;
+barBtn.dispatchEvent(new w.MouseEvent('click', { bubbles: true }));
+await settle();
+ok('the bar button did not stop the reading', cancels > cancelsAtStart);
+ok('the bar button stopped the current utterance but not the queue', utterances.length === utterancesAtStart);
+ok(
+  'the bar button asked for the status again while it was reading, so Stop also ' +
+    'reopens the sheet over the editor',
+  statusCalls.length === statusCallsAtStart,
+);
+
+/*
+ * Dismissing the sheet is not Stop — the voice is meant to outlive it, so you can
+ * go back to watching the panel while it reads. Opening dictation *is*, because a
+ * live recognizer hears this and types Claude's own reply into the composer.
+ */
+tapSpeak();
+doc.getElementById('cmo-status-close').dispatchEvent(new w.MouseEvent('click', { bubbles: true }));
+ok('closing the sheet also stopped the reading', barBtn.classList.contains('cmo-speaking'));
+ok('closing the sheet did not close it', !sheet.classList.contains('cmo-open'));
+
+utterancesAtStart = utterances.length;
+openMic();
+await settle();
+ok('opening the dictation sheet did not open it', doc.getElementById('cmo-text'));
+ok(
+  'a microphone went live while it was still reading — the recognizer transcribes ' +
+    'Claude’s own reply into the composer, and the recorder uploads it',
+  !barBtn.classList.contains('cmo-speaking') && utterances.length === utterancesAtStart,
+);
+
+// ------------------------------------------------- what it says it is reading
+/*
+ * A message read out during a turn that is still running is the *previous* answer,
+ * and heard on its own it sounds like the reply to whatever is being worked on.
+ */
+statusReply = { ...statusReply, state: 'working', clients: 1 };
+await tapStatus();
+utterances.length = 0;
+tapSpeak();
+ok(
+  'the last message was read out during a live turn without saying so, so it is ' +
+    'heard as the answer to the thing still being worked on',
+  /^Still working\. Last message:/.test(utterances[0] || ''),
+);
+
+// The mic being live is the one refusal the sheet has to explain, because the
+// button is right there and nothing happens when it is pressed. Drained first, so
+// the tap below reopens the sheet instead of being read as Stop.
+await drain();
+doc.getElementById('cmo-mic').classList.add('cmo-rec');
+await tapStatus();
+utterances.length = 0;
+tapSpeak();
+ok('speech started over a live microphone', utterances.length === 0);
+ok(
+  'nothing was utterances and the sheet said nothing about why',
+  /mic/i.test(doc.getElementById('cmo-status-detail')?.textContent ?? ''),
+);
+doc.getElementById('cmo-mic').classList.remove('cmo-rec');
+
+/*
+ * Following a different conversation is leaving this one, and the voice has to go
+ * with it: the message being read belongs to the conversation being left, and
+ * hearing it under a sheet describing another one is worse than silence.
+ */
+statusReply = {
+  ...statusReply,
+  state: 'idle',
+  conversations: [
+    { sessionId: 'abc123', title: 'This one', state: 'idle', at: Date.now(), current: true },
+    { sessionId: 'def456', title: 'The other one', state: 'working', at: Date.now() - 6e5 },
+  ],
+};
+await tapStatus();
+ok('the conversations list did not render, so this proves nothing', doc.querySelectorAll('.cmo-convo').length >= 2);
+tapSpeak();
+ok('nothing was being read, so switching cannot be shown to stop it', barBtn.classList.contains('cmo-speaking'));
+utterancesAtStart = utterances.length;
+doc.querySelectorAll('.cmo-convo')[1].dispatchEvent(new w.MouseEvent('click', { bubbles: true }));
+await settle();
+ok(
+  'following another conversation left the previous one’s message being read aloud ' +
+    'under a sheet describing a different conversation',
+  !barBtn.classList.contains('cmo-speaking') && utterances.length === utterancesAtStart,
+);
+delete statusReply.conversations;
+
+// --------------------------------------------------------------- the long one
+/*
+ * A message that is minutes of speech gets cut, and says that it was: a summary
+ * that just stops sounds like the answer ended there. The rest is on screen, which
+ * is the whole reason this is allowed to be lossy.
+ */
+const essay = `${'Every sentence here is a real sentence with a full stop at the end of it. '.repeat(60)}`;
+statusReply = {
+  ...statusReply,
+  state: 'idle',
+  last: { role: 'assistant', text: essay, at: new Date().toISOString() },
+};
+await tapStatus();
+utterances.length = 0;
+tapSpeak();
+await drain();
+const essayHeard = utterances.join(' ');
+ok(
+  'a very long message was read out in full — this is a phone, and the rest of it is ' +
+    'on screen',
+  essayHeard.length < 2600 && essayHeard.length > 1200,
+);
+ok(
+  'the reading of a truncated message just stopped, which sounds like the answer ' +
+    'ending there',
+  /as far as I will read/.test(essayHeard),
+);
+ok(
+  'the cut landed mid-sentence instead of on a full stop',
+  /end of it\. That is as far as I will read/.test(essayHeard),
 );
 
 // ------------------------------------------------------------------- results

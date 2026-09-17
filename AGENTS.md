@@ -52,7 +52,7 @@ itself is not something you will do on an internet-facing deployment.
 npm run test:auth      # must be 49/49 or better; never fewer checks than before
 npm run test:client
 npm run test:panes     # several projects at once; what closing a tab must not do
-npm run test:overlay   # 61/61; the editor overlay, its chords, its drafts, its clipboard
+npm run test:overlay   # 106/106; the editor overlay: chords, drafts, clipboard, speech
 npm run test:polish    # 19/19; the dictation cleanup's bounds, and its failure paths
 npm run test:projects  # 53/53; real git repos, real pushes
 npm run test:admin     # the operations surface, and every refusal it makes
@@ -100,7 +100,10 @@ chat-service/            The chat backend + PWA client. The security boundary.
                          raw transcript back.
   overlay-test.js        Boots pwa/mobile-overlay.js in jsdom. Nothing else
                          loads that file, and it drives the editor by
-                         keybinding, so this is what checks both.
+                         keybinding, so this is what checks both. Also the
+                         speech reducer and the rules iOS imposes on it, against
+                         a fake speechSynthesis — jsdom has none, which is also
+                         how the no-speech path gets covered.
   project-test.js        Project removal against real git repos. Deletes trees,
                          so the refusals are what this tests hardest.
   admin-test.js          Both halves of /chat/admin against a fake box having
@@ -711,6 +714,65 @@ Things that have burned people, in this codebase specifically:
   "cannot say" and fall back to the transcript, so the chip degrades to an inferred
   answer rather than a wrong one. That is the intended behaviour, not a bug to fix
   by restarting the unit from a deploy path.
+- **Reading the last message aloud is in the overlay, and there is nowhere else it
+  could be.** The Read aloud button in the status sheet is the other half of the
+  mic: dictation carries a phone-shaped question in, this carries the answer back
+  out. It cannot be done from the extension — the panel is a proprietary webview,
+  and the extension host is a node process with no audio device, so neither can
+  make a sound — and it needs no new route, because `/api/claude-status` already
+  returns the text. So the workbench page speaks, using the Web Speech API, and the
+  panel is untouched. Two rules hold it together, both of them ones the dictation
+  sheet already lives with: the first utterance is queued **synchronously inside the
+  click**, because iOS refuses speech that did not start in a gesture (the same
+  reason `Copy` writes the clipboard before it awaits anything), and utterances are
+  queued **one at a time, chained on `end`**, because iOS speaks the first of a long
+  queue and drops the rest. It is also a button on purpose and has no timer or
+  subscription anywhere: a turn can end while you are talking to someone, and a
+  phone that starts speaking by itself is worse than one that stays quiet. While it
+  reads, the bar's status button *is* Stop — it pulses, its glyph changes, and it
+  does not reopen the sheet — because the sheet is dismissed by tapping beside it
+  and the voice carries on afterwards, so at that point the bar holds the only
+  control there is. Do not "fix" it back into a plain open-the-sheet button. And it
+  never speaks over a live microphone — `startDictation` stops it and `speak`
+  refuses while the mic button carries `cmo-rec` — because the recognizer would
+  otherwise dictate Claude's own reply into the composer and the whisper recorder
+  would upload it to be transcribed.
+- **The markdown is reduced before it is spoken, and the reduction is
+  deliberately lossy.** A final message is written to be read: spoken literally it
+  is "asterisk asterisk Done asterisk asterisk", every slash of every path read
+  out, and a fenced diff pronounced one bracket at a time. So `speakable()` in
+  `pwa/mobile-overlay.js` strips the markup, says " Code block. " where a fence was,
+  says "link" where a URL was, reduces a path to its file name and `auth.js:42-51`
+  to "auth.js, line 42 to 51", and cuts at the last full stop inside 2400
+  characters — saying that it has, because a summary that just stops sounds like the
+  answer ending there. Two decisions in it are not obvious and both have a test:
+  **a blank line ends a sentence and a single newline does not**, which is what those
+  two mean in markdown and also how they sound — a full stop dropped into
+  hard-wrapped prose is heard as a real one and changes what the sentence says, so
+  headings, bullets and table rows are terminated earlier, in the pass where their
+  marker is still there to prove they were one; and **anything spoken before the
+  message is passed as `speak`'s `lead`, not concatenated in front of it**, because
+  the strips are anchored to the start of a line, so text put ahead of the first line
+  hides the marker on it (`## Done` was read out as "hash hash Done" that way). It is
+  all deterministic and local rather than a call to `polish.js`, which would do it
+  better: a model round trip between the tap and the first word is exactly what iOS
+  will not allow.
+- **A `setTimeout(closeSheet, …)` closes whatever sheet is open when it fires, not
+  the one that scheduled it.** Tap `Copy & close` in the dictation sheet and then
+  open the status sheet within 700 ms, and the delayed close dismisses the new one.
+  Latent for as long as the delay existed, and it surfaced as a *test* flake — 3 of
+  10 parallel `overlay-test.js` runs against 0 for HEAD — because the speech work
+  added just enough latency for the race to land. Hence `openSheet` bumps
+  `sheetGeneration` and `closeSheetLater(ms)` only closes if the generation still
+  matches. Use `closeSheetLater`, never a bare `setTimeout(closeSheet, …)`.
+- **No regex lookbehind in `pwa/mobile-overlay.js`.** `/(?<=[.!?])\s+/` is the
+  obvious way to split sentences and the one thing that must not be written here: an
+  unsupported lookbehind is a **parse** error, so the whole file fails to load and
+  every button on the bar disappears — the exact silent failure `overlay-test.js`
+  exists for, and the one it cannot catch, because it runs on node where the syntax
+  is fine. `splitSentences()` is a hand-written scanner for that reason. The same
+  caution applies to anything else that is a syntax error rather than a runtime one
+  in an older Safari.
 - **"Claude is working" means a message was sent, not that bytes were written.**
   The panel runs with `--permission-prompt-tool stdio`, so it writes to the CLI's
   stdin constantly with nobody typing: `control_request` / `control_response`
