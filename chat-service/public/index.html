@@ -177,6 +177,15 @@
       Punctuate dictation when I stop talking
     </label>
     <p class="hint" id="polish-hint"></p>
+    <!-- Unchecked in the markup, unlike the two above: this one reflects a
+         permission the OS has granted, so its real state is only known once
+         app.js has asked. Starting it checked would show "on" for a second on
+         every phone that has never enabled it. -->
+    <label class="opt-row">
+      <input type="checkbox" id="opt-push">
+      Notify me when a session outside the app finishes
+    </label>
+    <p class="hint" id="push-hint"></p>
     <button data-close-sheet class="wide">Done</button>
   </div>
 </div>

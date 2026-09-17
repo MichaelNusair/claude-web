@@ -21,6 +21,8 @@ import { transcribe, voiceStatus, resetConfigCache } from './transcribe.js';
 import { polish } from './polish.js';
 import { claudeStatus } from './claude-status.js';
 import { manifestForProject } from './manifest.js';
+import { vapidPublicKey, addSubscription, removeSubscription, listSubscriptions, notifyAll, topicFor } from './push.js';
+import { startTurnWatcher } from './turn-watcher.js';
 import { createAdmin } from './admin.js';
 import {
   AUTH_MODE,
@@ -497,6 +499,67 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    /*
+     * --- push notifications -------------------------------------------------
+     *
+     * The other half of the question above, for when you are not looking at the
+     * app at all: a session you started in the editor panel or under tmux finishes
+     * a turn, and the phone says so. See turn-watcher.js for what counts as
+     * finishing, and push.js for the encryption.
+     *
+     * All four are gated. The public key is not a secret — it is handed to every
+     * browser that subscribes — but an endpoint is: it is a capability to put a
+     * notification on someone's lock screen, and the list of them is a list of the
+     * operator's devices.
+     */
+    if (pathname === '/api/push/key' && req.method === 'GET') {
+      json(res, 200, { key: await vapidPublicKey(), devices: (await listSubscriptions()).length });
+      return;
+    }
+
+    if (pathname === '/api/push/subscribe' && req.method === 'POST') {
+      // A subscription is what `pushManager.subscribe()` hands back, passed
+      // through unchanged. push.js validates it rather than trusting it.
+      const body = JSON.parse((await readBody(req, 8 * 1024)).toString() || '{}');
+      try {
+        const devices = await addSubscription(body, { ua: req.headers['user-agent'] || '' });
+        console.log(`push: subscribed a device (${devices.length} now)`);
+        json(res, 200, { devices: devices.length });
+      } catch (err) {
+        json(res, 400, { error: err.message });
+      }
+      return;
+    }
+
+    if (pathname === '/api/push/unsubscribe' && req.method === 'POST') {
+      const body = JSON.parse((await readBody(req, 8 * 1024)).toString() || '{}');
+      const devices = await removeSubscription(body.endpoint || '');
+      json(res, 200, { devices: devices.length });
+      return;
+    }
+
+    /*
+     * Send one now.
+     *
+     * Not a debugging leftover: everything about a web push can be correct on this
+     * box and still produce nothing on the phone — permission revoked in the OS,
+     * the app uninstalled, a battery optimiser holding the service worker down. The
+     * only way to find out is to send one on purpose, so the settings switch does.
+     */
+    if (pathname === '/api/push/test' && req.method === 'POST') {
+      const result = await notifyAll(
+        {
+          title: 'Notifications are on',
+          body: 'This is what you will see when a session outside the app finishes a turn.',
+          tag: 'cw-push-test',
+        },
+        { topic: topicFor('push-test') },
+      );
+      console.log(`push: test sent to ${result.sent}/${result.devices} device(s)`);
+      json(res, 200, result);
+      return;
+    }
+
     // --- operations surface -------------------------------------------------
     // Reachable at /chat/admin through nginx. Deliberately part of this service
     // rather than an app of its own; see the note next to `admin` above.
@@ -729,6 +792,23 @@ const heartbeat = setInterval(() => {
 }, 30_000);
 heartbeat.unref?.();
 
+/*
+ * Watch for turns ending in sessions this app is not driving, and push them.
+ *
+ * Started unconditionally and costs nothing until a device subscribes: with an
+ * empty subscription list the scan returns without touching the disk. The
+ * conversations held in this process are excluded by handing it `liveSummary()` —
+ * those already announce themselves on screen.
+ *
+ * Nothing shuts it down. Its timer is unref'd, so it never holds the process open,
+ * and a signal handler here would only put a scan — possibly one waiting out an
+ * unreachable push service — between systemd and a restart during every deploy.
+ */
+startTurnWatcher({ liveSessions: () => manager.liveSummary() });
+
 server.listen(PORT, '127.0.0.1', () => {
   console.log(`chat service on 127.0.0.1:${PORT} (projects: ${PROJECTS_ROOT})`);
+  listSubscriptions()
+    .then((devices) => console.log(`push: ${devices.length} device(s) subscribed, watching for turns to end`))
+    .catch(() => {});
 });

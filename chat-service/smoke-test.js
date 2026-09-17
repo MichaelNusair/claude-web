@@ -667,6 +667,254 @@ if (typeof handler === 'function' && panesHooks) {
   }
 }
 
+// This jsdom has no service worker, no PushManager and no Notification — which is
+// also a real browser: desktop Safari, and any iPhone where the app has not been
+// added to the home screen. The switch has to say so rather than sit there looking
+// available and doing nothing when tapped.
+{
+  const toggle = w.document.querySelector('#opt-push');
+  const hint = w.document.querySelector('#push-hint');
+  if (!toggle || !hint) {
+    failures.push('settings has no notification switch');
+  } else {
+    if (!toggle.disabled) failures.push('notification switch is offerable in a browser that cannot do it');
+    if (toggle.checked) failures.push('notification switch shows on where notifications are impossible');
+    if (!/home screen/i.test(hint.textContent)) {
+      failures.push(`unsupported hint does not say what to do: ${JSON.stringify(hint.textContent)}`);
+    }
+  }
+}
+
+// --- notifications, in a browser that has them ------------------------------
+/*
+ * A second DOM, because the three pieces this needs are absent from the first one
+ * and `'PushManager' in window` is read at boot. Everything below is the part of
+ * the feature that can only fail on a phone: whether the switch's state comes from
+ * the browser rather than from a stored flag, whether permission is asked for
+ * before anything is awaited, whether the key survives base64url → bytes, and
+ * whether turning it off reaches the server while the endpoint still exists.
+ */
+{
+  const dom2 = new JSDOM(html, { runScripts: 'outside-only', url: 'https://claude.example.com/' });
+  const w2 = dom2.window;
+
+  // The real key from a real keypair, so the decode below is checked against
+  // something with the shape a P-256 public key actually has.
+  const KEY = 'BOe1x_hUOKzZBnbTz5xLNlOaqZ3Ah3ll7SzKfHRSfrnRHkTKuNJlvBQCLGnJJKKUpUKzIxq2xR2oyF6qkkeGaAo';
+  // Ordered log of everything the client did, so "asked permission first" can be
+  // asserted rather than assumed.
+  const acts = [];
+  let subscription = null;
+  let registerCalls = 0;
+  let unsubscribeCalls = 0;
+  const subscribeOpts = [];
+  const posted = {};
+
+  const makeSubscription = (key) => ({
+    endpoint: 'https://push.example.test/send/abc123',
+    // The browser reports back the key it was created with; the client compares
+    // it to the server's, and that comparison is the only thing standing between
+    // a rotated keypair and a phone that goes quiet with nothing in any log.
+    options: { applicationServerKey: key },
+    toJSON() {
+      return { endpoint: this.endpoint, keys: { p256dh: 'p256dh-value', auth: 'auth-value' } };
+    },
+    unsubscribe() {
+      acts.push('browser-unsubscribe');
+      unsubscribeCalls += 1;
+      subscription = null;
+      return Promise.resolve(true);
+    },
+  });
+
+  const registration = {
+    scope: 'https://claude.example.com/chat/',
+    pushManager: {
+      getSubscription: () => Promise.resolve(subscription),
+      subscribe: (opts) => {
+        acts.push('subscribe');
+        subscribeOpts.push(opts);
+        subscription = makeSubscription(opts.applicationServerKey);
+        return Promise.resolve(subscription);
+      },
+    },
+    unregister: () => Promise.resolve(true),
+  };
+  let registered = false;
+
+  Object.defineProperty(w2.navigator, 'serviceWorker', {
+    configurable: true,
+    value: {
+      register: (url) => {
+        registerCalls += 1;
+        acts.push(`register:${url}`);
+        registered = true;
+        return Promise.resolve(registration);
+      },
+      getRegistration: () => Promise.resolve(registered ? registration : undefined),
+      getRegistrations: () => Promise.resolve(registered ? [registration] : []),
+    },
+  });
+  w2.PushManager = function PushManager() {};
+  w2.Notification = function Notification() {};
+  w2.Notification.permission = 'default';
+  w2.Notification.requestPermission = () => {
+    acts.push('permission');
+    w2.Notification.permission = 'granted';
+    return Promise.resolve('granted');
+  };
+
+  w2.fetch = (url, options = {}) => {
+    const path = String(url);
+    acts.push(`fetch:${path}`);
+    if (options.body) posted[path.replace(/\?.*/, '')] = JSON.parse(options.body);
+    if (path.includes('/api/push/key')) {
+      return Promise.resolve({ ok: true, json: () => Promise.resolve({ key: KEY, devices: 0 }) });
+    }
+    if (path.includes('/api/push/subscribe') || path.includes('/api/push/unsubscribe')) {
+      return Promise.resolve({ ok: true, json: () => Promise.resolve({ devices: 1 }) });
+    }
+    if (path.includes('/api/push/test')) {
+      return Promise.resolve({ ok: true, json: () => Promise.resolve({ sent: 1, failed: 0, devices: 1 }) });
+    }
+    if (path.includes('/api/live')) {
+      return Promise.resolve({ ok: true, json: () => Promise.resolve({ sessions: [] }) });
+    }
+    if (path.includes('/api/projects')) {
+      return Promise.resolve({ ok: true, json: () => Promise.resolve({ projects: [] }) });
+    }
+    return Promise.resolve({ ok: true, json: () => Promise.resolve({ models: [] }) });
+  };
+  w2.WebSocket = function () {
+    this.addEventListener = () => {};
+    this.send = () => {};
+    this.close = () => {};
+    this.readyState = 0;
+  };
+  w2.WebSocket.CONNECTING = 0;
+  w2.WebSocket.OPEN = 1;
+  w2.matchMedia = () => ({ matches: false, addEventListener() {} });
+  w2.addEventListener('error', (e) => failures.push(`uncaught (push dom): ${e.message}`));
+
+  const settle = (ms = 60) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  try {
+    w2.eval(js);
+    await settle(200);
+
+    const toggle = w2.document.querySelector('#opt-push');
+    const hint = w2.document.querySelector('#push-hint');
+    const hooks = w2.__pushForTest;
+    if (!hooks) failures.push('client did not expose the push hooks for testing');
+
+    // Nothing has been turned on, so nothing may have been installed. A worker
+    // registered merely by opening settings is a worker on every device that has
+    // never asked for notifications, and this app had one of those wedge it once.
+    if (registerCalls !== 0) failures.push('opening the app registered the push worker uninvited');
+    if (acts.some((a) => a.includes('/api/push/'))) failures.push('boot talked to the push API unasked');
+    if (toggle.disabled) failures.push('notification switch is disabled in a browser that supports them');
+    if (toggle.checked) failures.push('notification switch shows on before anything was subscribed');
+    if (!/asked for permission once/i.test(hint.textContent)) {
+      failures.push(`off hint does not warn about the prompt: ${JSON.stringify(hint.textContent)}`);
+    }
+
+    // Turning it on.
+    acts.length = 0;
+    toggle.checked = true;
+    toggle.dispatchEvent(new w2.Event('change'));
+    await settle(200);
+
+    if (acts[0] !== 'permission') {
+      // Anything awaited before the prompt spends the tap that authorises it, and
+      // mobile Chrome then refuses to show it at all.
+      failures.push(`permission was not asked for first: ${JSON.stringify(acts.slice(0, 2))}`);
+    }
+    if (registerCalls !== 1) failures.push(`worker registered ${registerCalls} times on enable`);
+    if (!acts.some((a) => a === 'register:/chat/sw.js')) {
+      failures.push('registered a worker other than the push-only /chat/sw.js');
+    }
+    if (subscribeOpts.length !== 1) failures.push(`subscribed ${subscribeOpts.length} times`);
+    if (subscribeOpts[0]?.userVisibleOnly !== true) {
+      failures.push('subscribed without userVisibleOnly, which Chrome refuses');
+    }
+    const sentKey = subscribeOpts[0]?.applicationServerKey;
+    if (!(sentKey instanceof w2.Uint8Array) && !(sentKey instanceof Uint8Array)) {
+      failures.push('applicationServerKey was not raw bytes');
+    } else if (sentKey.length !== 65 || sentKey[0] !== 4) {
+      // A broken base64url decode still produces *a* Uint8Array, and the failure
+      // then happens inside the browser on a phone with no console attached.
+      failures.push(`applicationServerKey is not an uncompressed P-256 point: ${sentKey.length} bytes, first ${sentKey[0]}`);
+    }
+    if (posted['/api/push/subscribe']?.endpoint !== 'https://push.example.test/send/abc123') {
+      failures.push(`server was not told the endpoint: ${JSON.stringify(posted['/api/push/subscribe'])}`);
+    }
+    if (!posted['/api/push/subscribe']?.keys?.p256dh) {
+      failures.push('subscription was posted without its keys, so nothing can be encrypted to it');
+    }
+    const keyAt = acts.indexOf('fetch:/api/push/key');
+    const subAt = acts.findIndex((a) => a === 'fetch:/api/push/subscribe');
+    const testAt = acts.findIndex((a) => a === 'fetch:/api/push/test');
+    if (!(keyAt >= 0 && keyAt < subAt && subAt < testAt)) {
+      failures.push(`enable did not go key → subscribe → test: ${JSON.stringify(acts)}`);
+    }
+    if (!toggle.checked) failures.push('switch fell back to off after a successful subscribe');
+    if (!/On for this device/i.test(hint.textContent)) {
+      failures.push(`on hint is wrong: ${JSON.stringify(hint.textContent)}`);
+    }
+    const toastText = w2.document.querySelector('#toast')?.textContent ?? '';
+    if (!/test/i.test(toastText)) failures.push(`no confirmation that a test was sent: ${JSON.stringify(toastText)}`);
+
+    // A rotated keypair on the server: the subscription still looks healthy to the
+    // browser, and every notification sent to it fails somewhere the phone cannot
+    // see. Every load repairs it, without prompting.
+    acts.length = 0;
+    subscription.options.applicationServerKey = new Uint8Array(65).fill(9);
+    await hooks.pushSync();
+    if (unsubscribeCalls !== 1) failures.push('a subscription bound to a dead key was kept');
+    if (subscribeOpts.length !== 2) failures.push('did not re-subscribe after the key changed');
+    if (!acts.some((a) => a === 'fetch:/api/push/subscribe')) {
+      failures.push('re-subscribed without telling the server');
+    }
+    if (acts.includes('permission')) failures.push('the silent repair prompted the user');
+
+    // Turning it off. The endpoint identifies the device on the server, and the
+    // browser forgets it the moment it unsubscribes — so the server has to hear
+    // about it first, and it has to hear the endpoint.
+    acts.length = 0;
+    delete posted['/api/push/unsubscribe'];
+    toggle.checked = false;
+    toggle.dispatchEvent(new w2.Event('change'));
+    await settle(150);
+
+    if (posted['/api/push/unsubscribe']?.endpoint !== 'https://push.example.test/send/abc123') {
+      failures.push(`unsubscribe did not name the device: ${JSON.stringify(posted['/api/push/unsubscribe'])}`);
+    }
+    const offAt = acts.indexOf('fetch:/api/push/unsubscribe');
+    if (offAt < 0) failures.push('turning it off never reached the server');
+    if (!(offAt >= 0 && offAt < acts.indexOf('browser-unsubscribe'))) {
+      failures.push(`browser dropped the subscription before the server was told: ${JSON.stringify(acts)}`);
+    }
+    if (unsubscribeCalls !== 2) failures.push('turning it off left the browser subscribed');
+    if (toggle.checked) failures.push('switch still shows on after unsubscribing');
+    if (!/asked for permission once/i.test(hint.textContent)) {
+      failures.push('hint did not go back to explaining what the switch does');
+    }
+
+    // Refused permission. It cannot be asked for a second time from a page, so a
+    // switch that silently does nothing is the one outcome this must not produce.
+    w2.Notification.permission = 'denied';
+    await hooks.paintPushToggle();
+    if (!toggle.disabled) failures.push('switch stays tappable after notifications were blocked');
+    if (!/Site settings/i.test(hint.textContent)) {
+      failures.push(`blocked hint does not say where the setting now lives: ${JSON.stringify(hint.textContent)}`);
+    }
+  } catch (err) {
+    failures.push(`push section threw — ${err.constructor.name}: ${err.message}`);
+  } finally {
+    w2.close();
+  }
+}
+
 if (failures.length) {
   console.error('FAIL:');
   for (const f of failures) console.error(`  - ${f}`);
@@ -679,6 +927,6 @@ dom.window.close();
 console.log(
   'PASS: client boots, lists conversations, renders resumed history, ' +
   'announces interrupted dictation, holds the screen awake, keeps an ' +
-  'unsent message across a reload, and punctuates dictation without ' +
-  'overwriting what was typed',
+  'unsent message across a reload, punctuates dictation without ' +
+  'overwriting what was typed, and turns notifications on and off honestly',
 );

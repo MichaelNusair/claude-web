@@ -1173,9 +1173,10 @@ async function openChatsSheet() {
  *
  * This is the payoff for having tabs at all: send a task in one chat, read
  * another, and find out when the first lands without going to look. Deliberately
- * a toast and a buzz rather than a web notification — those need a permission
- * prompt and a service worker, and this app unregisters its worker on purpose
- * because a wedged one has no user-side escape.
+ * a toast and a buzz rather than a web notification, even now that this app can
+ * send those: a conversation in a tab of the app you are looking at does not need
+ * the lock screen, and turn-watcher.js excludes these sessions for the same
+ * reason. Notifications are for the sessions nobody is watching.
  */
 function announce(pane, text) {
   pane.unread = true;
@@ -3007,6 +3008,148 @@ dictationDismiss.addEventListener('click', () => {
   voice.resumeFromEnd = false;
   hideDictationBar();
 });
+/* --- push notifications -----------------------------------------------------
+ *
+ * For the sessions this app is *not* running: the editor panel, and anything under
+ * tmux. Those are the ones you start and walk away from. What arrives is a title
+ * and the first line or so of what Claude said, built by turn-watcher.js on the
+ * box; tapping it dismisses it and nothing else.
+ *
+ * Three things have to be true at once for this to work, and each fails
+ * differently, which is why the hint under the switch is generated rather than
+ * written: the browser needs a service worker and a PushManager (an iPhone only has
+ * them once the app is on the home screen), the OS needs to have granted
+ * permission (a refusal is permanent until the user clears it in browser settings,
+ * so the switch cannot ask twice), and the server needs the subscription.
+ *
+ * The subscription itself is the state. Nothing about "notifications are on" is
+ * kept in localStorage: a stored flag can disagree with the browser, and when it
+ * does the switch lies. `pushManager.getSubscription()` cannot.
+ */
+const PUSH_SW = '/chat/sw.js';
+const PUSH_SCOPE = '/chat/';
+const pushSupported = () =>
+  'serviceWorker' in navigator && 'PushManager' in window && 'Notification' in window;
+
+/**
+ * Register the worker, once — and only when something is actually being turned on.
+ *
+ * Scoped to /chat/ because that is where the script lives, while this page is at /.
+ * A page outside a worker's scope can still register it and still receive its
+ * notifications; the worker has no `fetch` handler, so controlling pages would buy
+ * nothing anyway.
+ */
+let pushRegistration = null;
+async function pushWorker() {
+  if (!pushSupported()) return null;
+  if (!pushRegistration) pushRegistration = await navigator.serviceWorker.register(PUSH_SW);
+  return pushRegistration;
+}
+
+/**
+ * The worker if it is already there, without installing one.
+ *
+ * Everything that only *reads* the state goes through this — painting the switch,
+ * the check at boot — so opening the app on a device that has never enabled
+ * notifications registers nothing at all.
+ */
+async function pushWorkerIfAny() {
+  if (!pushSupported()) return null;
+  if (pushRegistration) return pushRegistration;
+  const found = await navigator.serviceWorker.getRegistration(PUSH_SCOPE).catch(() => null);
+  if (found) pushRegistration = found;
+  return found || null;
+}
+
+/** base64url → bytes. `applicationServerKey` takes nothing else. */
+function pushKeyBytes(base64url) {
+  const padded = base64url.replace(/-/g, '+').replace(/_/g, '/');
+  const raw = atob(padded + '='.repeat((4 - (padded.length % 4)) % 4));
+  return Uint8Array.from(raw, (c) => c.charCodeAt(0));
+}
+
+const pushKeyOf = (subscription) => {
+  const key = subscription?.options?.applicationServerKey;
+  if (!key) return null;
+  let out = '';
+  for (const byte of new Uint8Array(key)) out += String.fromCharCode(byte);
+  return btoa(out).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+};
+
+/** Whether this device is subscribed, without asking or installing anything. */
+async function pushSubscription() {
+  const reg = await pushWorkerIfAny().catch(() => null);
+  if (!reg) return null;
+  return reg.pushManager.getSubscription().catch(() => null);
+}
+
+/**
+ * Subscribe this device and tell the server.
+ *
+ * `Notification.requestPermission()` is called by the caller, not here, and before
+ * anything is awaited: the prompt needs the user's tap to still be the most recent
+ * thing that happened, and one `await` of a network round trip is enough to lose
+ * that on mobile Chrome.
+ */
+async function pushSubscribe() {
+  const reg = await pushWorker();
+  const { key } = await api('/api/push/key').then((r) => r.json());
+
+  let subscription = await reg.pushManager.getSubscription();
+  // A subscription is bound to the key it was made with. If the server's keypair
+  // has changed — a lost volume, a rebuilt box — the old subscription still looks
+  // healthy here and every notification sent to it fails at the push service, so
+  // the mismatch has to be repaired rather than reported.
+  if (subscription && pushKeyOf(subscription) !== key) {
+    await subscription.unsubscribe().catch(() => {});
+    subscription = null;
+  }
+  if (!subscription) {
+    subscription = await reg.pushManager.subscribe({
+      // Required by Chrome, and honest: every push this app sends shows a
+      // notification. Silent pushes are what the flag exists to forbid.
+      userVisibleOnly: true,
+      applicationServerKey: pushKeyBytes(key),
+    });
+  }
+
+  await api('/api/push/subscribe', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(subscription),
+  });
+  return subscription;
+}
+
+/** Stop this device, at both ends. */
+async function pushUnsubscribe() {
+  const subscription = await pushSubscription();
+  if (!subscription) return;
+  // Server first: the endpoint is what identifies the device there, and once the
+  // browser has dropped the subscription that string is gone.
+  await api('/api/push/unsubscribe', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ endpoint: subscription.endpoint }),
+  }).catch(() => {});
+  await subscription.unsubscribe().catch(() => {});
+}
+
+/**
+ * Keep an existing subscription honest, at every load. Never prompts.
+ *
+ * Two silent failures this repairs, both of which look like "notifications just
+ * stopped working" from the phone: the server losing its device list (it lives on
+ * disk, and a restore or a fresh volume drops it), and a rotated VAPID keypair
+ * leaving a subscription that can no longer be sent to.
+ */
+async function pushSync() {
+  if (!pushSupported() || Notification.permission !== 'granted') return;
+  const existing = await pushSubscription();
+  if (!existing) return;
+  await pushSubscribe().catch(() => {});
+}
+
 // --- settings ---------------------------------------------------------------
 $('#btn-settings').addEventListener('click', () => $('#sheet').classList.remove('hidden'));
 document.querySelectorAll('[data-close-sheet]').forEach((el) =>
@@ -3069,6 +3212,100 @@ if (polishHint) {
     + 'using Claude Haiku on Bedrock — a second or two, and a few tokens per '
     + 'dictation. Your words are never rewritten, and a failure leaves the '
     + 'transcript exactly as it was. Also applies to the editor.';
+}
+
+/*
+ * Notifications. Same guarded pattern as the two switches above, with one
+ * difference that matters: this one asks the OS for something, and the OS only
+ * answers once. A refused prompt cannot be re-asked from here at all, so the switch
+ * has to explain where the setting now lives instead of silently doing nothing.
+ *
+ * The switch also sends a test notification when it goes on. Everything can be
+ * correct on the server and still produce nothing on the phone — permission granted
+ * to the browser but revoked for the site, a battery optimiser holding the worker
+ * down, the app uninstalled from the home screen — and the alternative to a test is
+ * finding out hours later that the thing you turned on does nothing.
+ */
+const pushToggle = $('#opt-push');
+const pushHint = $('#push-hint');
+
+function paintPushHint(state) {
+  if (!pushHint) return;
+  const text = {
+    unsupported:
+      'This browser cannot show notifications. On an iPhone, add the app to the home '
+      + 'screen first; notifications only work from there.',
+    blocked:
+      'Notifications are blocked for this site, and only the browser can undo that: '
+      + 'Chrome → the ⋮ menu → Site settings → Notifications. Android may also list '
+      + 'this app separately under Settings › Apps.',
+    off:
+      'Buzzes when a session outside this app finishes a turn — the editor panel, or '
+      + 'anything under tmux. Conversations in this app are not included: they already '
+      + 'announce themselves on screen. Shows the project and the first line or so of '
+      + "the answer; tapping it just dismisses it. You'll be asked for permission once.",
+    on:
+      'On for this device. You get one notification per conversation, replaced rather '
+      + 'than stacked when the same session answers again, and nothing at all for '
+      + 'anything older than ten minutes. Turn it off here to stop them.',
+  }[state];
+  pushHint.textContent = text || '';
+}
+
+async function paintPushToggle() {
+  if (!pushToggle) return;
+  if (!pushSupported()) {
+    pushToggle.checked = false;
+    pushToggle.disabled = true;
+    paintPushHint('unsupported');
+    return;
+  }
+  if (Notification.permission === 'denied') {
+    pushToggle.checked = false;
+    pushToggle.disabled = true;
+    paintPushHint('blocked');
+    return;
+  }
+  const subscribed = Boolean(await pushSubscription());
+  pushToggle.checked = subscribed;
+  pushToggle.disabled = false;
+  paintPushHint(subscribed ? 'on' : 'off');
+}
+
+if (pushToggle) {
+  paintPushToggle();
+  pushToggle.addEventListener('change', async (e) => {
+    const wanted = e.target.checked;
+    if (!wanted) {
+      pushToggle.disabled = true;
+      await pushUnsubscribe();
+      pushToggle.disabled = false;
+      await paintPushToggle();
+      toast('Notifications off');
+      return;
+    }
+
+    // First, before any await: the prompt needs the tap that got here to still
+    // count as user activation.
+    const permission = await Notification.requestPermission();
+    if (permission !== 'granted') {
+      await paintPushToggle();
+      toast(permission === 'denied' ? 'Notifications blocked in the browser' : 'Notifications not enabled');
+      return;
+    }
+
+    pushToggle.disabled = true;
+    try {
+      await pushSubscribe();
+      const result = await api('/api/push/test', { method: 'POST' }).then((r) => r.json());
+      toast(result.sent ? 'Notifications on — sent a test one' : 'Subscribed, but the test notification failed');
+    } catch (err) {
+      toast(`Could not turn on notifications: ${err.message}`);
+    } finally {
+      pushToggle.disabled = false;
+      await paintPushToggle();
+    }
+  });
 }
 
 (async function initModels() {
@@ -3136,17 +3373,26 @@ async function pollLive() {
 }
 
 // --- boot -------------------------------------------------------------------
-// Actively tear down any previously-registered worker. We no longer register
-// one: this is a live WebSocket client, caching buys nothing, and a wedged
-// worker is a failure mode with no user-side escape.
+/*
+ * There is exactly one worker this app will tolerate: the push-only one at
+ * /chat/sw.js, which has no `fetch` handler and therefore cannot wedge a
+ * navigation. Anything else registered against this origin is from an older
+ * version — including the caching worker that wedged the app once — and is torn
+ * down here rather than left to control page loads.
+ *
+ * Nothing is registered at boot and no permission is asked for: the switch in
+ * settings does that, on a tap. What runs here only repairs a subscription that
+ * already exists. See the push section above.
+ */
 if ('serviceWorker' in navigator) {
   navigator.serviceWorker
     .getRegistrations()
-    .then((regs) => regs.forEach((r) => r.unregister()))
+    .then((regs) => regs.filter((r) => !r.scope.endsWith('/chat/')).forEach((r) => r.unregister()))
     .catch(() => {});
   if (window.caches) {
     caches.keys().then((keys) => keys.forEach((k) => caches.delete(k))).catch(() => {});
   }
+  pushSync().catch(() => {});
 }
 
 // Exposed so smoke-test.js can exercise event rendering without a live socket.
@@ -3186,6 +3432,14 @@ window.__draftForTest = {
 window.__screenForTest = {
   syncWakeLock, setKeepAwake, wakeLockHeld, wantsScreenAwake,
   get wanted() { return keepAwakeWanted; },
+};
+// Notifications are the one feature here whose failures are all silent and all on
+// a phone: a switch that says "on" over a subscription the server never received,
+// a subscription bound to a keypair that no longer exists, a hint that tells an
+// Android user to look in iOS settings. None of it can be seen from a desktop
+// browser, so the test stubs the three browser pieces and drives these.
+window.__pushForTest = {
+  paintPushToggle, pushSync, pushSubscription, pushSubscribe, pushUnsubscribe, pushKeyOf,
 };
 
 // A device that wakes up may have been asleep for hours: iOS suspends timers

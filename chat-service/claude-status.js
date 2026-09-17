@@ -188,7 +188,7 @@ const textOf = (message) => {
  * "the last line" is the wrong thing to look at, and this filters by type rather
  * than by position.
  */
-async function lastExchange(file, windows = TAIL_WINDOWS) {
+export async function lastExchange(file, windows = TAIL_WINDOWS) {
   let meta = null;
 
   for (const bytes of windows) {

@@ -1,0 +1,291 @@
+/**
+ * Notice when a Claude session finishes a turn, and push it to the phone.
+ *
+ * Only sessions this app is *not* driving. A conversation held in the chat app
+ * already announces itself on screen — the notification is for the ones the app
+ * cannot see: the editor panel, and anything running under tmux. Those are the
+ * sessions you start and then walk away from, which is the whole reason to want a
+ * buzz in your pocket. The exclusion is by session id, taken from the manager's
+ * own live list, so it stays right without either side knowing about the other.
+ *
+ * Why transcripts and not the broker. claude-broker owns the panel's process and
+ * could in principle be asked to announce a turn ending, but it is a long-lived
+ * process that predates this file and restarting it ends every live conversation
+ * on the box. The transcripts are already the source of truth for
+ * `/api/claude-status`, they are written by Claude Code itself for every surface
+ * equally, and reading them needs nobody's cooperation. This costs one `stat` per
+ * transcript every few seconds — 77 files here, about two milliseconds — and reads
+ * only the ones that changed.
+ *
+ * What counts as "finished", and the two ways this could be annoying instead of
+ * useful:
+ *
+ *   the transcript must be *left* idle — `stop_reason: end_turn`, not `tool_use` —
+ *   and carry assistant text that is not the text already reported for that
+ *   session. A turn that ends by running a tool is mid-thought, and the same text
+ *   seen twice is a transcript being rewritten, not a new answer;
+ *
+ *   the message must be recent. A restored backup, a `git checkout` of a workspace,
+ *   or anything else that touches many files at once must not fire a notification
+ *   per conversation, so anything older than ten minutes is read for its state and
+ *   never announced.
+ *
+ * And the first scan of a process announces nothing at all: a deploy restarts this
+ * service, and a restart is not something Claude just said.
+ */
+import { readdir, stat } from 'fs/promises';
+import { basename, join } from 'path';
+import { createHash } from 'crypto';
+import { CLAUDE_HOME, PROJECTS_ROOT, mangleCwd } from './session-manager.js';
+import { lastExchange } from './claude-status.js';
+import { listSubscriptions, notifyAll, topicFor } from './push.js';
+
+/** How often to look. Fast enough to feel immediate, slow enough to be free. */
+const POLL_MS = 5000;
+
+/**
+ * How far back a message can be and still be worth a notification.
+ *
+ * Ten minutes. This is the guard against a stampede: the trigger is "the file
+ * changed and the last message is new to us", and a bulk mtime change would make
+ * that true for every transcript on the box at once.
+ */
+const FRESH_MS = 10 * 60 * 1000;
+
+/**
+ * One window, not the widening pair `claude-status.js` uses by default.
+ *
+ * A file that just changed changed at the end, so the answer is in the tail; and a
+ * fallback that re-reads four megabytes would run on every poll of a busy
+ * conversation rather than once on a screen being drawn.
+ */
+const WINDOWS = [256 * 1024];
+
+/** As much of the message as a lock screen will show before it truncates anyway. */
+const PREVIEW_CHARS = 150;
+
+/** Stable, short, and independent of how long the message is. */
+const digest = (text) => createHash('sha256').update(text).digest('base64url').slice(0, 16);
+
+/**
+ * The first PREVIEW_CHARS of what Claude said, as one line.
+ *
+ * Transcript text is markdown with hard-wrapped paragraphs, lists and code fences;
+ * a lock screen collapses that into a smear of single spaces anyway, so it is
+ * collapsed here where the ellipsis can be put on a word boundary instead of
+ * mid-token.
+ */
+export function preview(text, limit = PREVIEW_CHARS) {
+  const flat = String(text || '').replace(/```[\s\S]*?```/g, ' ').replace(/\s+/g, ' ').trim();
+  if (flat.length <= limit) return flat;
+  const cut = flat.slice(0, limit);
+  const space = cut.lastIndexOf(' ');
+  return `${(space > limit * 0.6 ? cut.slice(0, space) : cut).trimEnd()}…`;
+}
+
+/**
+ * A readable name for the project a transcript belongs to.
+ *
+ * Transcript directories are named after the mangled cwd — every `/` and `.`
+ * replaced by `-` — which cannot be turned back into a path, because the mangling
+ * is not reversible. So the mapping is built in the other direction: mangle the
+ * projects that exist and look the directory up. A conversation whose cwd is not a
+ * project (someone's home directory, a checkout elsewhere) keeps the directory name,
+ * which is ugly but never wrong.
+ */
+async function projectNames() {
+  const names = new Map();
+  let entries = [];
+  try {
+    entries = await readdir(PROJECTS_ROOT, { withFileTypes: true });
+  } catch {
+    return names;
+  }
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    names.set(await mangleCwd(join(PROJECTS_ROOT, entry.name)), entry.name);
+  }
+  return names;
+}
+
+/**
+ * The watcher, with its dependencies passed in.
+ *
+ * `liveSessions` is the manager's `liveSummary()`, and `notify` is push.js — both
+ * injected so the test can drive a real scan over a real directory of transcripts
+ * without a push service or a session manager anywhere near it.
+ */
+export function createTurnWatcher({
+  liveSessions = () => [],
+  notify = notifyAll,
+  subscriptions = listSubscriptions,
+  now = () => Date.now(),
+  pollMs = POLL_MS,
+  log = console.error,
+} = {}) {
+  /**
+   * transcript path → mtime and a digest of the last message already accounted for.
+   *
+   * Keyed by path rather than by session id. A session id is a UUID and in practice
+   * unique, but the same id *can* appear under two project directories — resuming a
+   * conversation from a different working directory is enough — and two files sharing
+   * one entry means each poll sees the other's message as new and notifies for both,
+   * forever.
+   */
+  const seen = new Map();
+  /**
+   * Every session id this app has ever driven.
+   *
+   * Not just the ones live *now*: a chat conversation whose process has already
+   * exited is no longer in `liveSummary()`, and its final message would otherwise
+   * be announced by the poll that follows — a notification for something the person
+   * is looking at.
+   */
+  const ours = new Set();
+  let seeded = false;
+  let timer = null;
+  let scanning = null;
+  let lastComplaint = '';
+
+  const projectsDir = () => join(CLAUDE_HOME, 'projects');
+
+  /** One pass. Returns what it sent, which is what the test reads. */
+  async function scan() {
+    for (const session of liveSessions()) {
+      if (session.sessionId) ours.add(session.sessionId);
+    }
+
+    // Nothing subscribed: no reason to touch the disk at all. `seeded` is dropped so
+    // that the first scan after a phone subscribes learns the current state silently
+    // instead of announcing every conversation that finished while nobody was
+    // listening.
+    const devices = await subscriptions();
+    if (!devices.length) {
+      seeded = false;
+      seen.clear();
+      return { sent: [], scanned: 0 };
+    }
+
+    let dirs = [];
+    try {
+      dirs = await readdir(projectsDir(), { withFileTypes: true });
+    } catch (err) {
+      complain(`turn-watcher: cannot read ${projectsDir()}: ${err.message}`);
+      return { sent: [], scanned: 0 };
+    }
+
+    const names = await projectNames();
+    const sent = [];
+    let scanned = 0;
+
+    for (const dir of dirs) {
+      if (!dir.isDirectory()) continue;
+      let files = [];
+      try {
+        files = await readdir(join(projectsDir(), dir.name));
+      } catch {
+        continue; // removed between the two reads
+      }
+
+      for (const name of files) {
+        if (!name.endsWith('.jsonl')) continue;
+        const file = join(projectsDir(), dir.name, name);
+        const sessionId = basename(name, '.jsonl');
+        scanned += 1;
+
+        let mtimeMs;
+        try {
+          ({ mtimeMs } = await stat(file));
+        } catch {
+          continue;
+        }
+        const before = seen.get(file);
+        if (before && before.mtimeMs === mtimeMs) continue;
+
+        const exchange = await lastExchange(file, WINDOWS);
+        if (!exchange) continue;
+        const text = exchange.last?.text || '';
+        const record = { mtimeMs, text: text ? digest(text) : '' };
+        const changed = Boolean(record.text) && record.text !== before?.text;
+        seen.set(file, record);
+
+        // Read for its state, but never announced: the first pass of a process, a
+        // conversation this app is driving, a turn that is still going, a repeat of
+        // the message already sent, or something that finished long ago.
+        if (!seeded || !changed || ours.has(sessionId) || exchange.state !== 'idle') continue;
+        const at = Date.parse(exchange.last?.at || '') || mtimeMs;
+        if (now() - at > FRESH_MS) continue;
+
+        const project = names.get(dir.name) || dir.name;
+        const notification = {
+          title: `Claude finished · ${project}`,
+          body: preview(text),
+          // Per conversation, so a session that finishes twice replaces its own
+          // notification rather than stacking two on the lock screen.
+          tag: `turn-${topicFor(`${dir.name}|${sessionId}`)}`,
+          project,
+          sessionId,
+          conversation: exchange.title || null,
+          at: new Date(at).toISOString(),
+        };
+        try {
+          await notify(notification, { topic: topicFor(`${dir.name}|${sessionId}`) });
+          sent.push(notification);
+        } catch (err) {
+          complain(`turn-watcher: could not notify for ${project}: ${err.message}`);
+        }
+      }
+    }
+
+    seeded = true;
+    return { sent, scanned };
+  }
+
+  /** Say it once. This runs every few seconds forever; a broken path must not fill the log. */
+  function complain(message) {
+    if (message === lastComplaint) return;
+    lastComplaint = message;
+    log(message);
+  }
+
+  async function tick() {
+    scanning = scan().catch((err) => {
+      complain(`turn-watcher: scan failed: ${err.message}`);
+      return null;
+    });
+    await scanning;
+    scanning = null;
+    if (timer !== null) arm();
+  }
+
+  function arm() {
+    timer = setTimeout(tick, pollMs);
+    // Never a reason to hold the process open: this is a background observer, and a
+    // timer that keeps node alive turns a clean shutdown into a hang.
+    timer.unref?.();
+  }
+
+  return {
+    scan,
+    start() {
+      if (timer) return;
+      arm();
+    },
+    async stop() {
+      if (timer) clearTimeout(timer);
+      timer = null;
+      await scanning;
+    },
+    /** For the test, and for the admin surface if it ever wants to show this. */
+    stats() {
+      return { seeded, tracking: seen.size, ours: ours.size };
+    },
+  };
+}
+
+/** Start watching, with the real manager and the real push service. */
+export function startTurnWatcher(options = {}) {
+  const watcher = createTurnWatcher(options);
+  watcher.start();
+  return watcher;
+}

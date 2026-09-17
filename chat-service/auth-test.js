@@ -52,6 +52,10 @@ async function startServer(env) {
       // Cookies would otherwise be Secure-only and never sent over plain HTTP.
       CW_INSECURE_COOKIES: '1',
       PROJECTS_ROOT: '/tmp/claude-web-test-projects',
+      // So a test run cannot touch the real VAPID keypair or device list. Nothing
+      // here should reach them — every push route is checked unauthenticated — but
+      // "should" is what the hole this file exists for was made of.
+      CW_PUSH_DIR: '/tmp/claude-web-test-push',
       ...env,
     },
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -153,6 +157,18 @@ const guarded = [
   ['POST', '/api/projects/remove'],
   ['POST', '/api/projects/clone'],
   ['GET', '/api/github/repos'],
+  // A manifest per project, for giving one its own home-screen icon. It answers
+  // 200 for a project that exists and 404 for one that does not, so unauthenticated
+  // it would enumerate the project tree by guessing names.
+  ['GET', '/manifest.webmanifest?project=demo'],
+  // Push. A subscription endpoint is a capability to write on someone's lock
+  // screen, and the list of them is an inventory of the operator's devices — so
+  // subscribing, unsubscribing and sending are all gated, and so is the key that
+  // makes a subscription possible in the first place.
+  ['GET', '/api/push/key'],
+  ['POST', '/api/push/subscribe'],
+  ['POST', '/api/push/unsubscribe'],
+  ['POST', '/api/push/test'],
   ['GET', '/api/transcript?cwd=/tmp&sessionId=x'],
   // Reads the tail of a transcript and asks claude-broker what it is running, so
   // an unauthenticated hit would be both a read of private conversations and an
