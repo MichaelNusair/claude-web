@@ -5,6 +5,29 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
 step() { printf '\n\033[1;36m==> %s\033[0m\n' "$1"; }
 
+# --app-only ships the payload to the instance that is already running and skips
+# `cdk deploy` entirely. It exists because changing UserData replaces the EC2
+# instance, and the payload is pushed *after* the stack finishes — so a full
+# deploy driven from the box itself races its own replacement and cannot finish.
+# The escape hatch is: run --app-only from the box for app changes, and a full
+# deploy from somewhere else when the stack really has to change.
+#
+# It applies everything in the payload — chat service, both extensions, the
+# overlay, `cc` — and re-runs the /opt/bootstrap.sh already on disk. It does NOT
+# apply edits to infra/userdata/bootstrap.sh, because that file reaches the
+# instance through UserData. If your change is in there, you need a full deploy.
+APP_ONLY=0
+for arg in "$@"; do
+  case "$arg" in
+    --app-only) APP_ONLY=1 ;;
+    -h|--help)
+      echo "Usage: ./deploy.sh [--app-only]"
+      echo "  --app-only  push the payload to the running instance; no stack update"
+      exit 0 ;;
+    *) echo "Unknown option: $arg (try --help)" >&2; exit 1 ;;
+  esac
+done
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -124,6 +147,26 @@ for ext in voice-extension mobile-extension; do
   )
 done
 
+if [ "$APP_ONLY" -eq 1 ]; then
+# ---------------------------------------------------------------------------
+step "Skipping infrastructure (--app-only)"
+# ---------------------------------------------------------------------------
+# Read the running stack's outputs into the same file `cdk deploy` would have
+# written, so every stage after this one is one code path rather than two.
+# Via a file rather than a shell variable in the heredoc: output values are
+# arbitrary strings and an unquoted heredoc would expand a `$` in one of them.
+aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+  --query 'Stacks[0].Outputs' --output json "${AWS_ARGS[@]}" \
+  > "$ROOT/dist/stack-outputs.json" ||
+  { echo "Cannot read outputs for stack $STACK_NAME — is it deployed?" >&2; exit 1; }
+python3 - "$STACK_NAME" "$ROOT/dist/stack-outputs.json" "$ROOT/dist/outputs.json" <<'PY'
+import json, sys
+stack, src, dst = sys.argv[1:4]
+outputs = json.load(open(src)) or []
+json.dump({stack: {o['OutputKey']: o['OutputValue'] for o in outputs}}, open(dst, 'w'))
+PY
+echo "  using the running stack; changes to infra/ are NOT applied by this run"
+else
 # ---------------------------------------------------------------------------
 step "Deploying infrastructure"
 # ---------------------------------------------------------------------------
@@ -159,6 +202,7 @@ fi
     --require-approval never \
     --outputs-file "$ROOT/dist/outputs.json"
 ) || { echo "CDK deploy failed — stopping before the payload step." >&2; exit 1; }
+fi
 
 # A failed CDK run can leave a stale outputs file from a previous deploy, which
 # would silently point the rest of this script at the wrong instance.

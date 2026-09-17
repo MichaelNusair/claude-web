@@ -297,6 +297,16 @@ Things that have burned people, in this codebase specifically:
   So drive that deploy from a machine other than the one being replaced. From the
   instance itself it only worked because CloudFormation deletes the old instance
   last, which is luck rather than design.
+- **`./deploy.sh --app-only` is how you deploy from the box itself.** It runs
+  every test, packages both extensions, pushes the payload to the instance that
+  is already running, and skips `cdk deploy` — so it cannot race its own
+  replacement. Use it for the chat service, the extensions, the overlay and `cc`.
+  It reads the running stack's outputs into `dist/outputs.json` so the stages
+  after it are the same code path as a full deploy. What it cannot do is apply an
+  edit to `infra/userdata/bootstrap.sh`: it re-runs the `/opt/bootstrap.sh`
+  already on disk, and the new one only arrives through UserData. Check with
+  `cdk diff` — if the instance would be replaced, that part needs a full deploy
+  from somewhere else.
 - **The CDK CLI reads a narrower slice of `~/.aws/config` than the AWS CLI.** A
   profile whose credentials come from `credential_source = Ec2InstanceMetadata`
   fails the CDK step with "Unable to resolve AWS account to use" while every `aws`
