@@ -80,14 +80,18 @@ your-domain.com
   and full output. Failures auto-expand.
 - **Live streaming** text, with a typing indicator while Claude works.
 - **Stop button** while a turn is running.
-- **Several chats at once** — open conversations sit in a tab strip above the
-  thread, each with a dot for what it is doing: working, idle, or reconnecting.
-  Switching tabs takes the composer, the draft and the title with it, while the
-  chats behind carry on streaming; when one of them finishes, it buzzes and says so
-  by name. Three stay connected at a time and the rest wait as tabs, which is what
-  keeps six open conversations from costing a phone six live threads — tapping one
-  rejoins it exactly as another device would. Closing a tab never stops the
-  conversation behind it.
+- **Several projects at once, one tab each** — the projects you are working on sit
+  in a tab strip above the thread, each with a dot for what it is doing: working,
+  idle, or reconnecting. A tab is a project, not a chat, so the strip stays readable
+  on a box with seventeen of them; the line under the tabs says which of that
+  project's conversations the window is showing, and tapping it lists the others.
+  Switching either way takes the composer and the draft with it, while the projects
+  behind carry on streaming; when one of them finishes, it buzzes and names the
+  project so you know which chip to tap. Three stay connected at a time and the rest
+  wait as tabs, which is what keeps six open projects from costing a phone six live
+  threads — tapping one rejoins it exactly as another device would. Neither closing
+  a tab nor switching conversations stops anything: it goes on running on the box,
+  it just is not being watched.
 - **Drafts survive the app going away** — a half-typed or half-dictated message is
   saved as you write it and restored with the conversation, because a phone browser
   reloads a backgrounded tab whenever it likes and a paragraph of dictation exists
@@ -381,7 +385,7 @@ rules that matter, and the gotchas that have burned people. Contributions welcom
 — see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ```bash
-npm test                              # auth + client + chat tabs + overlay + dictation
+npm test                              # auth + client + project tabs + overlay + dictation
                                       # + projects + operations surface + broker
 cd infra && npx cdk synth --quiet     # stack compiles
 ```

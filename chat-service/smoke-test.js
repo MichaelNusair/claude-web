@@ -129,10 +129,11 @@ const panesHooks = w.__panesForTest;
 let chat = null;
 if (typeof handler === 'function' && panesHooks) {
   try {
-    chat = panesHooks.openChat({
+    chat = panesHooks.openConversation({
       cwd: '/workspace/projects/demo',
+      project: 'demo',
+      sessionId: 'abc123',
       title: 'a past chat',
-      resumeSessionId: 'abc123',
     });
     handler({
       type: 'history',

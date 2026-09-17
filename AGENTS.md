@@ -51,7 +51,7 @@ itself is not something you will do on an internet-facing deployment.
 ```bash
 npm run test:auth      # must be 49/49 or better; never fewer checks than before
 npm run test:client
-npm run test:panes     # several chats at once; what closing a tab must not do
+npm run test:panes     # several projects at once; what closing a tab must not do
 npm run test:overlay   # 61/61; the editor overlay, its chords, its drafts, its clipboard
 npm run test:polish    # 19/19; the dictation cleanup's bounds, and its failure paths
 npm run test:projects  # 53/53; real git repos, real pushes
@@ -106,9 +106,10 @@ chat-service/            The chat backend + PWA client. The security boundary.
   admin-test.js          Both halves of /chat/admin against a fake box having
                          every failure this project has had, at once. What it
                          refuses to signal is the code under test.
-  pane-test.js           Several chat tabs at once: a background conversation
-                         rendering off screen, the live cap, and that closing a
-                         tab stops nothing.
+  pane-test.js           Several projects open at once — a tab is a project, not
+                         a conversation: a background project rendering off
+                         screen, the live cap, switching chats inside one tab,
+                         and that neither that nor closing a tab stops anything.
   public/                index.html, app.js, style.css, login.html, and
                          admin.html + admin.js for the operations surface.
 
@@ -208,22 +209,33 @@ message says so. That is correct behaviour, not a crash — find out why
 process → `public/app.js` for UI. Client requests go through the `api()` wrapper
 so a 401 redirects to login; use it rather than bare `fetch`.
 
-**In the client there is no "the chat" any more.** A conversation is a *pane* —
-its socket, its thread element, the bubble being streamed into, the tool cards
-still waiting for their results — and several are open at once as tabs. Every
-render function takes the pane it draws into, because a background conversation
+**In the client there is no "the chat" any more.** A window onto a project is a
+*pane* — its socket, its thread element, the bubble being streamed into, the tool
+cards still waiting for their results — and several are open at once as tabs.
+Every render function takes the pane it draws into, because a background project
 keeps rendering while you are looking at a different one; that is the whole reason
 tabs exist. `activePane()` is the one on screen and the only thing the composer,
 the header and the mic belong to. If you reach for "the thread" or "the socket" as
 a module-level thing, that is the bug the pane model exists to make impossible.
 
+**A tab is a project, not a conversation** — `paneKey(cwd) === cwd`, so a
+directory has exactly one tab, and `pane.sessionId` is which of that project's
+chats the window currently shows. This is deliberate and was the second design:
+tabs per conversation gave a box with 17 projects and 32 chats a chip strip nobody
+could read. Switching conversation inside a tab (`showConversation`) drops the old
+socket and joins another; it never stops what it left, and the toast says so.
+Drafts stay keyed per conversation (`convKey(cwd, sessionId)`), not per tab, so
+text always resurfaces in the chat it was typed in — as do list rows, `/api/live`
+and everything the server keys by session. The price, accepted: two chats in one
+project cannot be on screen at the same time.
+
 Three panes hold a socket (`MAX_LIVE`); past that the least recently used *idle*
 one is cooled to a tab — socket closed, thread dropped, nothing stopped. Cooling
 is never applied to a pane that is working: the cap is exceeded and the user told
 instead, because a tab going quiet while the box is still spending on it is the
-one outcome worse than four sockets. Closing a tab is not stopping either; ending
-a conversation is `/chat/admin`'s job, on purpose. `pane-test.js` holds all of
-that down and `deploy.sh` runs it.
+one outcome worse than four sockets. Closing a tab is not stopping either, and
+neither is switching conversations; ending a conversation is `/chat/admin`'s job,
+on purpose. `pane-test.js` holds all of that down and `deploy.sh` runs it.
 
 ### "Delete a project I'm done with"
 

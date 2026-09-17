@@ -193,6 +193,40 @@ html, body {
   font: inherit; font-size: 17px; line-height: 1; cursor: pointer;
 }
 
+/* --- which conversation, inside a project's window --- */
+/* A tab is a project, so this line is where you are inside it. Full width and
+   quiet: it is read far more often than it is tapped, and the thread below it is
+   what the screen is for. */
+.conv-bar {
+  flex: 0 0 auto;
+  display: flex; align-items: center; gap: 8px; width: 100%;
+  padding: 7px 14px;
+  border: none; border-bottom: 1px solid var(--border);
+  background: var(--bg); color: var(--text-dim);
+  font: inherit; font-size: 12px; text-align: left; cursor: pointer;
+}
+.conv-name { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.conv-caret { flex: 0 0 auto; font-size: 10px; opacity: .75; }
+
+/* Rows in the chat switcher. Same shape as a list row, without the avatar: the
+   project is already named in the sheet's heading. */
+.sheet-row {
+  display: flex; align-items: center; width: 100%; gap: 10px;
+  padding: 11px 12px; margin-bottom: 6px;
+  border: 1px solid var(--border); border-radius: 10px;
+  background: var(--bg-input); color: var(--text);
+  font: inherit; text-align: left; cursor: pointer;
+}
+.sheet-row.current { border-color: var(--accent-dim); background: var(--bg-raised); }
+.sheet-row-main { min-width: 0; flex: 1 1 auto; }
+.sheet-row-title {
+  font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.sheet-row-sub {
+  margin-top: 3px; font-size: 11px; color: var(--text-dim);
+  display: flex; align-items: center; gap: 6px;
+}
+
 /* --- thread --- */
 /* One .thread per open chat, all in the DOM, one displayed. Switching is a class
    change, so coming back to a long conversation re-renders nothing. */

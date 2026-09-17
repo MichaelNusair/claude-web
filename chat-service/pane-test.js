@@ -1,5 +1,11 @@
 /**
- * Several conversations open at once, on one phone.
+ * Several projects open at once, on one phone.
+ *
+ * **A tab is a project, not a conversation.** That is the model these tests exist
+ * to hold in place, and it is worth stating because the opposite was built first:
+ * a tab per chat, which on a box with 17 projects and 32 conversations gives you a
+ * strip of chips you have to remember the meaning of. You move between projects;
+ * the conversation is where you are inside one.
  *
  * A second window is only worth having because the first one keeps working while
  * you are not looking at it — which is exactly the part no browser can show you,
@@ -11,11 +17,13 @@
  *  - closing a tab must never stop a conversation. The process keeps running, the
  *    transcript is on disk, and the box is still spending money on it, so closing
  *    a tab and ending a turn cannot be the same gesture.
- *  - the live cap must never cool a chat that is working. A cooled tab goes quiet;
- *    doing that to a working one hides the very thing tabs exist to report.
- *  - two panes must never share one session id. Two sockets appending to one
- *    transcript is the divergence this project has already had once, and it is why
- *    the server keys conversations by cwd|sessionId.
+ *  - changing which conversation a window shows must not stop the one it was
+ *    showing either. It goes on running on the box; it just is not being watched.
+ *  - the live cap must never cool a project that is working. A cooled tab goes
+ *    quiet; doing that to a working one hides the very thing tabs exist to report.
+ *  - one project is one tab. Two tabs on one directory would be two windows racing
+ *    to own the same project's conversation, and a draft could surface under
+ *    either.
  *
  * Run: node chat-service/pane-test.js
  */
@@ -41,6 +49,11 @@ function check(name, ok, detail = '') {
 
 const DEMO = '/workspace/projects/demo';
 const API = '/workspace/projects/api';
+// One tab per project means the live cap can only be reached with four *projects*,
+// so the fake box has more than two of them.
+const WEB = '/workspace/projects/web';
+const INFRA = '/workspace/projects/infra';
+const DOCS = '/workspace/projects/docs';
 const settle = (ms = 30) => new Promise((resolve) => setTimeout(resolve, ms));
 /**
  * Let the in-flight fetches land before the window goes away.
@@ -79,6 +92,9 @@ function projectsPayload() {
           { sessionId: 'eee', mtime: now - 180_000, title: 'a fifth chat' },
         ],
       },
+      { name: 'web', path: WEB, sessions: [{ sessionId: 'fff', mtime: now - 200_000, title: 'a web chat' }] },
+      { name: 'infra', path: INFRA, sessions: [{ sessionId: 'ggg', mtime: now - 210_000, title: 'an infra chat' }] },
+      { name: 'docs', path: DOCS, sessions: [{ sessionId: 'hhh', mtime: now - 220_000, title: 'a docs chat' }] },
     ],
   };
 }
@@ -190,18 +206,23 @@ function bootClient({ saved = null, live = [] } = {}) {
     livePanes: () => [...w.__panesForTest.panes.values()].filter((p) => !p.cold),
     toast: () => $('#toast').textContent,
     rows: () => [...w.document.querySelectorAll('#list-body .row')],
+    // The line under the tabs: which conversation this project's window is showing.
+    convName: () => $('#conv-name').textContent,
+    convHidden: () => $('#conv-bar').classList.contains('hidden'),
+    sheetRows: () => [...w.document.querySelectorAll('#chats-sheet .sheet-row')],
+    sheetHidden: () => $('#chats-sheet').classList.contains('hidden'),
   };
 }
 
 /** Everything the server says between an accepted upgrade and a usable chat. */
-function joinConversation(sock, { sessionId = null, busy = false } = {}) {
+function joinConversation(sock, { sessionId = null, busy = false, cwd = DEMO } = {}) {
   sock.accept();
   sock.deliver({ type: 'ready' });
   if (sessionId) sock.deliver({ type: 'history', messages: [], truncated: 0 });
   sock.deliver({
     type: 'attached',
     conversationId: `conv-${sessionId || 'new'}`,
-    cwd: DEMO,
+    cwd,
     busy,
     sessionId,
   });
@@ -209,23 +230,31 @@ function joinConversation(sock, { sessionId = null, busy = false } = {}) {
 }
 
 // --- 1. A cold launch --------------------------------------------------------
-console.log('\nComes back to every tab without opening every socket:');
+console.log('\nComes back to every project without opening every socket:');
 {
+  // Deliberately in the *old* per-conversation shape, with two demo chats in it:
+  // this is what a phone that already had the previous build has on disk, and the
+  // upgrade has to produce one demo tab rather than two.
   const saved = {
     panes: [
-      { cwd: DEMO, title: 'the one still running', sessionId: 'aaa' },
-      { cwd: DEMO, title: 'a finished task', sessionId: 'bbb' },
-      { cwd: API, title: 'an api chat', sessionId: 'ccc' },
+      { cwd: DEMO, project: 'demo', title: 'a finished task', sessionId: 'bbb' },
+      { cwd: DEMO, project: 'demo', title: 'the one still running', sessionId: 'aaa' },
+      { cwd: API, project: 'api', title: 'an api chat', sessionId: 'ccc' },
     ],
     activeKey: null,
   };
   const h = bootClient({ saved });
   await settle();
 
-  check('restores every tab that was open', h.chipNames().length === 3, h.chipNames().join(', '));
-  check('names them from what was saved', h.chipNames().includes('an api chat'));
+  check('restores one tab per project', h.chipNames().length === 2, h.chipNames().join(', '));
+  check('names the tabs after the projects', h.chipNames().join(',') === 'demo,api', h.chipNames().join(','));
   check(
-    'opens no socket for a tab nobody is looking at',
+    'a project saved twice becomes one tab, showing the later chat',
+    h.hooks.panes.get(DEMO)?.sessionId === 'aaa',
+    h.hooks.panes.get(DEMO)?.sessionId,
+  );
+  check(
+    'opens no socket for a project nobody is looking at',
     h.sockets.length === 0,
     `${h.sockets.length} sockets`,
   );
@@ -233,17 +262,17 @@ console.log('\nComes back to every tab without opening every socket:');
   check('every restored tab is cold', [...h.hooks.panes.values()].every((p) => p.cold));
   check('lands on the list when no tab was on screen', h.$('#screen-list').classList.contains('active'));
   check('shows the tab strip', !h.$('#tabs').classList.contains('hidden'));
-  check('offers a way to open another chat', Boolean(h.$('#tabs .chip-add')));
+  check('offers a way to open another project', Boolean(h.$('#tabs .chip-add')));
 
   // Looking at one is what connects it — and only it.
-  const pane = h.hooks.panes.get(h.hooks.paneKey(DEMO, 'bbb'));
+  const pane = h.hooks.panes.get(h.hooks.paneKey(API));
   h.hooks.activatePane(pane);
   check('activating a cold tab connects exactly one socket', h.sockets.length === 1);
   h.sockets[0].accept();
   const start = h.sockets[0].sent[0];
   check(
-    'joins the conversation by session id rather than starting a new one',
-    start?.type === 'start' && start.resumeSessionId === 'bbb' && start.cwd === DEMO,
+    'joins the conversation it was showing rather than starting a new one',
+    start?.type === 'start' && start.resumeSessionId === 'ccc' && start.cwd === API,
     JSON.stringify(start),
   );
   check('builds the thread it is about to render into', h.threads().length === 1);
@@ -254,42 +283,56 @@ console.log('\nComes back to every tab without opening every socket:');
 }
 
 // The tab that was on screen is the one exception: a launch that lands you back
-// in a conversation has to have that conversation live.
+// in a project has to have that project's conversation live.
 {
   const h = bootClient({
     saved: {
       panes: [
-        { cwd: DEMO, title: 'the one still running', sessionId: 'aaa' },
-        { cwd: API, title: 'an api chat', sessionId: 'ccc' },
+        { cwd: DEMO, project: 'demo', title: 'the one still running', sessionId: 'aaa' },
+        { cwd: API, project: 'api', title: 'an api chat', sessionId: 'ccc' },
       ],
+      // The old key shape, which is what a phone upgrading from the previous build
+      // actually has. The directory in front of the pipe is the tab to land on.
       activeKey: `${API}|ccc`,
     },
   });
   await settle();
-  check('lands back in the chat that was on screen', h.$('#screen-chat').classList.contains('active'));
-  check('with one socket, for that chat only', h.sockets.length === 1);
+  check('lands back in the project that was on screen', h.$('#screen-chat').classList.contains('active'));
+  check('with one socket, for that project only', h.sockets.length === 1);
   h.sockets[0].accept();
-  check('resuming the right session', h.sockets[0].sent[0]?.resumeSessionId === 'ccc');
-  check('the header names it', h.$('#chat-title').textContent === 'an api chat');
+  check('resuming the conversation it was showing', h.sockets[0].sent[0]?.resumeSessionId === 'ccc');
+  check('the header names the project', h.$('#chat-title').textContent === 'api', h.$('#chat-title').textContent);
+  check('and the line under the tabs names the chat', h.convName() === 'an api chat', h.convName());
+  check('which is a control, not decoration', !h.convHidden());
+  await finish(h);
+}
+
+// A project whose name was never saved still gets one, from its directory.
+{
+  const h = bootClient({
+    saved: { panes: [{ cwd: '/workspace/projects/legacy-thing', sessionId: 'qqq' }], activeKey: null },
+  });
+  await settle();
+  check('falls back to the directory name', h.chipNames()[0] === 'legacy-thing', h.chipNames().join(','));
   await finish(h);
 }
 
 // --- 2. A conversation nobody is watching -----------------------------------
-console.log('\nKeeps a background conversation rendering, and says when it lands:');
+console.log('\nKeeps a background project rendering, and says when it lands:');
 {
   const h = bootClient();
   await settle();
-  const a = h.hooks.openChat({ cwd: DEMO, title: 'the one still running', resumeSessionId: 'aaa' });
+  const a = h.hooks.openConversation({ cwd: DEMO, project: 'demo', sessionId: 'aaa', title: 'the one still running' });
   const sa = h.sockets[0];
   joinConversation(sa, { sessionId: 'aaa', busy: true });
-  const b = h.hooks.openChat({ cwd: API, title: 'an api chat', resumeSessionId: 'ccc' });
+  const b = h.hooks.openConversation({ cwd: API, project: 'api', sessionId: 'ccc', title: 'an api chat' });
   const sb = h.sockets[1];
-  joinConversation(sb, { sessionId: 'ccc' });
+  joinConversation(sb, { sessionId: 'ccc', cwd: API });
 
-  check('two chats are two tabs', h.chips().length === 2 && h.threads().length === 2);
+  check('two projects are two tabs', h.chips().length === 2 && h.threads().length === 2);
   check('the second one is on screen', b.thread.classList.contains('active'));
   check('the first one is not', !a.thread.classList.contains('active'));
-  check('the tab of a working chat says so', a.chip.classList.contains('busy'));
+  check('the tab of a working project says so', a.chip.classList.contains('busy'));
 
   // The whole point: this arrives while the user is reading something else.
   sa.deliver({ type: 'user_message', text: 'run the tests' });
@@ -302,8 +345,10 @@ console.log('\nKeeps a background conversation rendering, and says when it lands
   sa.deliver({ type: 'assistant_text', text: 'Running them now — all green.' });
   sa.deliver({ type: 'turn_complete', costUsd: 0.0123 });
   check(
-    'announces a background chat that finished',
-    /finished/.test(h.toast()) && h.toast().includes('the one still running'),
+    'announces a background project that finished',
+    // Named after the project, to match the chip that just lit up: what the toast
+    // has to answer is "which tab do I tap".
+    /finished/.test(h.toast()) && h.toast().startsWith('demo'),
     h.toast(),
   );
   check('marks that tab unread', a.chip.classList.contains('unread'));
@@ -321,7 +366,8 @@ console.log('\nKeeps a background conversation rendering, and says when it lands
   h.hooks.activatePane(a);
   check('switching to it clears the unread mark', !a.chip.classList.contains('unread'));
   check('its thread is the one displayed now', a.thread.classList.contains('active') && !b.thread.classList.contains('active'));
-  check('the header follows the switch', h.$('#chat-title').textContent === 'the one still running');
+  check('the header follows the switch', h.$('#chat-title').textContent === 'demo', h.$('#chat-title').textContent);
+  check('and so does the chat name under the tabs', h.convName() === 'the one still running', h.convName());
   check('and the cost it reported is on screen', h.$('#chat-sub').textContent.includes('0.012'));
 
   // An error is the other thing worth interrupting for: a chat that died in the
@@ -331,7 +377,7 @@ console.log('\nKeeps a background conversation rendering, and says when it lands
   sa.deliver({ type: 'error', message: 'the session ended' });
   check('announces a background failure too', h.toast().includes('the session ended'), h.toast());
   sa.deliver({ type: 'exit' });
-  check('a chat whose process is gone is marked on its tab', a.chip.classList.contains('trouble'));
+  check('a project whose process is gone is marked on its tab', a.chip.classList.contains('trouble'));
   check('nothing threw', h.thrown.length === 0, h.thrown.join('; '));
   await finish(h);
 }
@@ -342,19 +388,19 @@ console.log('\nCarries the composer between tabs without mixing two chats up:');
   const h = bootClient();
   await settle();
   const input = h.$('#input');
-  const a = h.hooks.openChat({ cwd: DEMO, title: 'the one still running', resumeSessionId: 'aaa' });
+  const a = h.hooks.openConversation({ cwd: DEMO, project: 'demo', sessionId: 'aaa', title: 'the one still running' });
   joinConversation(h.sockets[0], { sessionId: 'aaa' });
-  const b = h.hooks.openChat({ cwd: API, title: 'an api chat', resumeSessionId: 'ccc' });
-  joinConversation(h.sockets[1], { sessionId: 'ccc' });
+  const b = h.hooks.openConversation({ cwd: API, project: 'api', sessionId: 'ccc', title: 'an api chat' });
+  joinConversation(h.sockets[1], { sessionId: 'ccc', cwd: API });
 
   input.value = 'half a sentence about the api';
   h.drafts.saveDraft({ now: true });
   h.hooks.activatePane(a);
-  check('switching tabs takes the other chat\'s text out of the composer', input.value === '', input.value);
+  check('switching tabs takes the other project\'s text out of the composer', input.value === '', input.value);
 
   input.value = 'a different half-sentence';
   h.hooks.activatePane(b);
-  check('switching back brings that chat\'s text back', input.value === 'half a sentence about the api', input.value);
+  check('switching back brings that project\'s text back', input.value === 'half a sentence about the api', input.value);
   h.hooks.activatePane(a);
   check('and the tab left behind keeps its own', input.value === 'a different half-sentence', input.value);
 
@@ -368,7 +414,7 @@ console.log('\nCarries the composer between tabs without mixing two chats up:');
   input.value = 'only for this one';
   await h.w.__voiceForTest.sendMessage();
   const framesOf = (sock) => sock.sent.filter((f) => f.type === 'message');
-  check('the message went to the chat on screen', framesOf(h.sockets[0])[0]?.text === 'only for this one');
+  check('the message went to the project on screen', framesOf(h.sockets[0])[0]?.text === 'only for this one');
   check('and to no other', framesOf(h.sockets[1]).length === 0);
   check('the send cleared the composer', input.value === '');
   check('and cleared its draft with it', !h.w.localStorage.getItem(h.drafts.draftKeyFor(a)));
@@ -379,31 +425,31 @@ console.log('\nCarries the composer between tabs without mixing two chats up:');
 }
 
 // --- 4. The live cap --------------------------------------------------------
-console.log('\nHolds three conversations live, and cools the one nobody is using:');
+console.log('\nHolds three projects live, and cools the one nobody is using:');
 {
   const h = bootClient();
   await settle();
   check('three is the cap', h.hooks.MAX_LIVE === 3);
 
-  const p1 = h.hooks.openChat({ cwd: DEMO, title: 'the one still running', resumeSessionId: 'aaa' });
+  const p1 = h.hooks.openConversation({ cwd: DEMO, project: 'demo', sessionId: 'aaa', title: 'the one still running' });
   joinConversation(h.sockets[0], { sessionId: 'aaa' });
-  const p2 = h.hooks.openChat({ cwd: DEMO, title: 'a finished task', resumeSessionId: 'bbb' });
-  joinConversation(h.sockets[1], { sessionId: 'bbb' });
-  const p3 = h.hooks.openChat({ cwd: API, title: 'an api chat', resumeSessionId: 'ccc' });
-  joinConversation(h.sockets[2], { sessionId: 'ccc' });
+  const p2 = h.hooks.openConversation({ cwd: API, project: 'api', sessionId: 'ccc', title: 'an api chat' });
+  joinConversation(h.sockets[1], { sessionId: 'ccc', cwd: API });
+  const p3 = h.hooks.openConversation({ cwd: WEB, project: 'web', sessionId: 'fff', title: 'a web chat' });
+  joinConversation(h.sockets[2], { sessionId: 'fff', cwd: WEB });
   // jsdom gets through all three inside one millisecond, so the order they were
   // last looked at is stated rather than left to the clock.
   p1.touchedAt = Date.now() - 3000;
   p2.touchedAt = Date.now() - 2000;
   p3.touchedAt = Date.now() - 1000;
 
-  const p4 = h.hooks.openChat({ cwd: DEMO, title: 'a fourth chat', resumeSessionId: 'ddd' });
-  check('a fourth chat cools the least recently used one', p1.cold, `cold: ${[p1, p2, p3, p4].map((p) => p.cold).join(',')}`);
+  const p4 = h.hooks.openConversation({ cwd: INFRA, project: 'infra', sessionId: 'ggg', title: 'an infra chat' });
+  check('a fourth project cools the least recently used one', p1.cold, `cold: ${[p1, p2, p3, p4].map((p) => p.cold).join(',')}`);
   check('and only that one', !p2.cold && !p3.cold && !p4.cold);
   check('cooling drops the socket', h.sockets[0].closedByClient);
   check('cooling drops the thread', p1.thread === null && h.threads().length === 3);
   check('cooling tells the server nothing', !h.sockets[0].sent.some((f) => f.type === 'interrupt'));
-  check('a cooled conversation is still a tab', h.chips().length === 4 && p1.chip.classList.contains('cold'));
+  check('a cooled project is still a tab', h.chips().length === 4 && p1.chip.classList.contains('cold'));
   check('a cooled tab is still listed as open', JSON.parse(h.w.localStorage.getItem('claude-chat-panes')).panes.length === 4);
 
   // Everything live is working now. Cooling one of these would be a lie: the tab
@@ -411,13 +457,13 @@ console.log('\nHolds three conversations live, and cools the one nobody is using
   h.sockets[1].deliver({ type: 'joined', busy: true });
   h.sockets[2].deliver({ type: 'joined', busy: true });
   h.sockets[3].deliver({ type: 'joined', busy: true });
-  check('all three live chats are working', [p2, p3, p4].every((p) => p.busy));
+  check('all three live projects are working', [p2, p3, p4].every((p) => p.busy));
   h.$('#toast').textContent = '';
-  const p5 = h.hooks.openChat({ cwd: API, title: 'a fifth chat', resumeSessionId: 'eee' });
-  check('never cools a chat that is working', !p2.cold && !p3.cold && !p4.cold);
+  const p5 = h.hooks.openConversation({ cwd: DOCS, project: 'docs', sessionId: 'hhh', title: 'a docs chat' });
+  check('never cools a project that is working', !p2.cold && !p3.cold && !p4.cold);
   check('exceeds the cap instead', h.livePanes().length === 4);
   check('and says so rather than doing it quietly', /already working/.test(h.toast()), h.toast());
-  check('the fifth chat is live and on screen', !p5.cold && p5.thread.classList.contains('active'));
+  check('the fifth project is live and on screen', !p5.cold && p5.thread.classList.contains('active'));
 
   // Coming back to a cooled tab is the same join another device would do.
   const before = h.sockets.length;
@@ -438,11 +484,11 @@ console.log('\nCloses a tab without stopping the conversation behind it:');
 {
   const h = bootClient();
   await settle();
-  const a = h.hooks.openChat({ cwd: DEMO, title: 'the one still running', resumeSessionId: 'aaa' });
+  const a = h.hooks.openConversation({ cwd: DEMO, project: 'demo', sessionId: 'aaa', title: 'the one still running' });
   const sa = h.sockets[0];
   joinConversation(sa, { sessionId: 'aaa', busy: true });
-  const b = h.hooks.openChat({ cwd: API, title: 'an api chat', resumeSessionId: 'ccc' });
-  joinConversation(h.sockets[1], { sessionId: 'ccc' });
+  const b = h.hooks.openConversation({ cwd: API, project: 'api', sessionId: 'ccc', title: 'an api chat' });
+  joinConversation(h.sockets[1], { sessionId: 'ccc', cwd: API });
 
   const framesBefore = sa.sent.length;
   h.hooks.closePane(a);
@@ -452,12 +498,12 @@ console.log('\nCloses a tab without stopping the conversation behind it:');
   check('its thread is gone with it', h.threads().length === 1);
   check('the socket is dropped, because nobody is showing it', sa.closedByClient);
   check('and it says the conversation keeps working', /keeps working/.test(h.toast()), h.toast());
-  check('the chat that is left is the one on screen', h.hooks.activePane() === b);
+  check('the project that is left is the one on screen', h.hooks.activePane() === b);
 
   // The conversation is still on the box, so it is still in the list and can be
   // reopened — the tab was a view of it, not the thing itself.
   await h.hooks.pollLive();
-  const reopened = h.hooks.openChat({ cwd: DEMO, title: 'the one still running', resumeSessionId: 'aaa' });
+  const reopened = h.hooks.openConversation({ cwd: DEMO, project: 'demo', sessionId: 'aaa', title: 'the one still running' });
   check('reopening it is a fresh join of the same conversation', reopened !== a && reopened.sessionId === 'aaa');
 
   h.hooks.closePane(reopened);
@@ -475,12 +521,17 @@ console.log('\nGives a new chat its durable name without losing what was typed:'
   const h = bootClient();
   await settle();
   const input = h.$('#input');
-  const pane = h.hooks.openChat({ cwd: DEMO, title: 'demo' });
+  const pane = h.hooks.openProject({ cwd: DEMO, project: 'demo' });
   const sock = h.sockets[0];
   sock.accept();
   check('starts a chat rather than resuming one', sock.sent[0]?.type === 'start' && !sock.sent[0].resumeSessionId);
-  check('keyed privately until the CLI names it', pane.key === `${DEMO}|new:1` && pane.sessionId === null, pane.key);
-  check('and not written down, because nobody could rejoin it', !h.w.localStorage.getItem('claude-chat-panes'));
+  check('the tab is keyed by project from the start', pane.key === DEMO && pane.sessionId === null, pane.key);
+  check('the chip names the project, not the chat', h.chipNames()[0] === 'demo', h.chipNames().join(','));
+  check('and the line under the tabs admits there is no chat yet', h.convName() === 'New chat', h.convName());
+  check(
+    'the tab is written down even with nothing said in it, because the project exists',
+    JSON.parse(h.w.localStorage.getItem('claude-chat-panes') || 'null')?.panes[0]?.cwd === DEMO,
+  );
 
   // Typed before the first reply, which is the normal way a new chat starts and
   // the one case where the draft's key is about to change underneath it.
@@ -491,44 +542,164 @@ console.log('\nGives a new chat its durable name without losing what was typed:'
 
   sock.deliver({ type: 'attached', conversationId: 'conv-new', cwd: DEMO, busy: false, sessionId: null });
   sock.deliver({ type: 'session', sessionId: 'zzz999' });
-  check('re-keyed to the durable name', pane.key === `${DEMO}|zzz999` && pane.sessionId === 'zzz999', pane.key);
-  check('the pane map agrees', h.hooks.panes.get(`${DEMO}|zzz999`) === pane && h.hooks.panes.size === 1);
+  check('the conversation gains a name', pane.sessionId === 'zzz999');
+  check('the tab does not change its key with it', pane.key === DEMO, pane.key);
+  check('the pane map still has exactly one tab', h.hooks.panes.get(DEMO) === pane && h.hooks.panes.size === 1);
   check('the tab on screen is still the tab on screen', h.hooks.activePane() === pane);
   check('the chat is now written down, so a refresh comes back to it',
     JSON.parse(h.w.localStorage.getItem('claude-chat-panes')).panes[0].sessionId === 'zzz999');
 
   const afterKey = h.drafts.draftKeyFor(pane);
-  check('the draft followed the rename', JSON.parse(h.w.localStorage.getItem(afterKey) || 'null')?.text === 'the first thing I typed');
+  check('the draft followed the conversation being named', JSON.parse(h.w.localStorage.getItem(afterKey) || 'null')?.text === 'the first thing I typed');
   check('and left nothing behind under the old name', !h.w.localStorage.getItem(beforeKey) || beforeKey === afterKey);
   // The reload this is all for: the box is empty, the chat is reopened, the words
   // are still there.
   input.value = '';
   check('so a reload still restores it', h.drafts.restoreDraft(pane) && input.value === 'the first thing I typed');
+
+  // A chat called "New chat" forever gives a project with two of them nothing to
+  // tell them apart by, so the first message names it — which is what the list
+  // will call it once the transcript exists.
+  input.value = 'name this conversation after me';
+  await h.w.__voiceForTest.sendMessage();
+  check('the first message names the conversation', pane.title === 'name this conversation after me', pane.title);
+  check('and the line under the tabs shows it', h.convName() === 'name this conversation after me', h.convName());
+  check('the chip still names the project', h.chipNames()[0] === 'demo', h.chipNames().join(','));
   check('nothing threw', h.thrown.length === 0, h.thrown.join('; '));
   await finish(h);
 }
 
-// --- 7. One pane per conversation -------------------------------------------
-console.log('\nRefuses to show one conversation in two tabs:');
+// --- 7. One tab per project --------------------------------------------------
+console.log('\nKeeps one tab per project, and switches conversation inside it:');
 {
   const h = bootClient();
   await settle();
-  const first = h.hooks.openChat({ cwd: DEMO, title: 'the one still running', resumeSessionId: 'aaa' });
-  joinConversation(h.sockets[0], { sessionId: 'aaa' });
-  const again = h.hooks.openChat({ cwd: DEMO, title: 'the one still running', resumeSessionId: 'aaa' });
+  const input = h.$('#input');
+  const first = h.hooks.openConversation({ cwd: DEMO, project: 'demo', sessionId: 'aaa', title: 'the one still running' });
+  const sa = h.sockets[0];
+  joinConversation(sa, { sessionId: 'aaa', busy: true });
+  const again = h.hooks.openConversation({ cwd: DEMO, project: 'demo', sessionId: 'aaa', title: 'the one still running' });
   check('the same chat opened twice is one tab', again === first && h.hooks.panes.size === 1 && h.chips().length === 1);
   check('and one socket', h.sockets.length === 1);
 
-  // The same collision from the other direction: a new chat handed a session id
-  // that already has a tab. Two panes on one id would be two sockets appending to
-  // one transcript, so the older tab goes.
-  const fresh = h.hooks.openChat({ cwd: DEMO, title: 'a new chat' });
-  h.sockets[1].accept();
-  h.sockets[1].deliver({ type: 'session', sessionId: 'aaa' });
-  check('a session id is never held by two panes', h.hooks.panes.size === 1);
-  check('the tab that kept it is the one that just claimed it', h.hooks.panes.get(`${DEMO}|aaa`) === fresh);
-  check('the tab that lost it was closed, not interrupted', first.closed && !h.sockets[0].sent.some((f) => f.type === 'interrupt'));
-  check('and its socket was dropped', h.sockets[0].closedByClient);
+  // The move this whole model is for: another conversation in the *same* project.
+  // It must not be a second tab, and it must not stop the one being left.
+  input.value = 'unsent words in the first chat';
+  h.drafts.saveDraft({ now: true });
+  const framesBefore = sa.sent.length;
+  h.$('#toast').textContent = '';
+  const second = h.hooks.showConversation(first, { sessionId: 'bbb', title: 'a finished task' });
+
+  check('switching conversation is the same tab', second === first && h.hooks.panes.size === 1 && h.chips().length === 1);
+  check('the chip still names the project', h.chipNames().join(',') === 'demo', h.chipNames().join(','));
+  check('the line under the tabs names the new chat', h.convName() === 'a finished task', h.convName());
+  check('the window is showing the new conversation', first.sessionId === 'bbb');
+  check('nothing was sent to the conversation being left', sa.sent.length === framesBefore, JSON.stringify(sa.sent.slice(framesBefore)));
+  check('in particular it was not interrupted', !sa.sent.some((f) => f.type === 'interrupt'));
+  check('its socket was dropped, because nobody is showing it', sa.closedByClient);
+  check('and it says the chat left behind keeps working', /keeps working/.test(h.toast()), h.toast());
+  check('one thread, for the conversation on screen', h.threads().length === 1);
+
+  const sb = h.sockets[1];
+  check('a socket was opened for the conversation arriving', Boolean(sb));
+  sb.accept();
+  check(
+    'joining it by session id, which is what another device would do',
+    sb.sent[0]?.type === 'start' && sb.sent[0].resumeSessionId === 'bbb' && sb.sent[0].cwd === DEMO,
+    JSON.stringify(sb.sent[0]),
+  );
+  check('the composer is empty for the conversation arriving', input.value === '', input.value);
+  check(
+    'the draft stayed with the conversation it was typed in',
+    JSON.parse(h.w.localStorage.getItem(h.drafts.draftKeyFor({ cwd: DEMO, sessionId: 'aaa' })) || 'null')?.text
+      === 'unsent words in the first chat',
+  );
+
+  // And back again, which is where a draft would surface in the wrong chat if the
+  // composer belonged to the tab rather than to the conversation.
+  input.value = 'words in the second chat';
+  h.drafts.saveDraft({ now: true });
+  h.hooks.showConversation(first, { sessionId: 'aaa', title: 'the one still running' });
+  h.sockets[2].accept();
+  check('going back is still one tab', h.hooks.panes.size === 1 && h.chips().length === 1);
+  check('and rejoins the first conversation', h.sockets[2].sent[0]?.resumeSessionId === 'aaa');
+  input.value = '';
+  check(
+    'its own draft comes back',
+    h.drafts.restoreDraft(first) && input.value === 'unsent words in the first chat',
+    input.value,
+  );
+
+  // "New chat in this project" empties the window without touching the box.
+  const beforeSockets = h.sockets.length;
+  h.hooks.showConversation(first, { sessionId: null });
+  check('a new chat in the project is still one tab', h.hooks.panes.size === 1 && h.chips().length === 1);
+  check('with no session to resume', first.sessionId === null);
+  check('and it opened a socket to start one', h.sockets.length === beforeSockets + 1);
+  h.sockets[beforeSockets].accept();
+  check('starting rather than resuming', !h.sockets[beforeSockets].sent[0]?.resumeSessionId);
+  check('nothing threw', h.thrown.length === 0, h.thrown.join('; '));
+  await finish(h);
+}
+
+// Opening a project that is already open must not throw away the conversation in
+// it. "+" on the tab strip means "put this project on screen"; only an explicit
+// new chat empties the window.
+{
+  const h = bootClient();
+  await settle();
+  const pane = h.hooks.openConversation({ cwd: DEMO, project: 'demo', sessionId: 'aaa', title: 'the one still running' });
+  joinConversation(h.sockets[0], { sessionId: 'aaa', busy: true });
+  h.hooks.openProject({ cwd: API, project: 'api' });
+
+  const sockets = h.sockets.length;
+  h.hooks.openProject({ cwd: DEMO, project: 'demo', fresh: false });
+  check('reopening an open project keeps the conversation it was showing', pane.sessionId === 'aaa');
+  check('and opens no socket for it', h.sockets.length === sockets, `${h.sockets.length - sockets} new`);
+  check('it is simply on screen again', h.hooks.activePane() === pane);
+  check('still two tabs', h.hooks.panes.size === 2);
+
+  h.hooks.openProject({ cwd: DEMO, project: 'demo', fresh: true });
+  check('asking for a new chat in it empties the window', pane.sessionId === null);
+  check('without opening a second tab', h.hooks.panes.size === 2 && h.chips().length === 2);
+  check('nothing threw', h.thrown.length === 0, h.thrown.join('; '));
+  await finish(h);
+}
+
+// The switcher itself: the sheet lists the project's chats and nothing else's.
+console.log('\nLists the project\'s own conversations in the switcher:');
+{
+  const h = bootClient();
+  await settle();
+  const pane = h.hooks.openConversation({ cwd: DEMO, project: 'demo', sessionId: 'aaa', title: 'the one still running' });
+  joinConversation(h.sockets[0], { sessionId: 'aaa' });
+
+  check('the switcher starts closed', h.sheetHidden());
+  h.$('#conv-bar').dispatchEvent(new h.w.Event('click'));
+  await settle();
+  check('tapping the line under the tabs opens it', !h.sheetHidden());
+  check('titled after the project', h.$('#chats-sheet-title').textContent === 'demo');
+  const titles = h.sheetRows().map((r) => r.querySelector('.sheet-row-title').textContent);
+  check('lists every chat in this project', titles.join('|') === 'the one still running|a finished task|a fourth chat', titles.join('|'));
+  check('and no chat from another project', !titles.includes('an api chat'));
+  check('marking the one on screen', h.sheetRows()[0].classList.contains('current'));
+
+  // Tapping another one is the switch, from the UI rather than the hook.
+  h.sheetRows()[1].dispatchEvent(new h.w.Event('click'));
+  check('tapping a row switches the window to it', pane.sessionId === 'bbb', pane.sessionId);
+  check('closes the sheet', h.sheetHidden());
+  check('and still one tab', h.hooks.panes.size === 1 && h.chips().length === 1);
+
+  // The other button in the sheet. A chat started this way must still be *unnamed*:
+  // if "New chat" counted as its name, the first message would not replace it and
+  // the project would end up with two chats called the same thing.
+  h.$('#btn-new-in-project').dispatchEvent(new h.w.Event('click'));
+  check('starting a new chat in the project empties the window', pane.sessionId === null);
+  check('the switcher line says there is no chat yet', h.convName() === 'New chat', h.convName());
+  h.sockets[h.sockets.length - 1].accept();
+  h.$('#input').value = 'the first thing said in it';
+  await h.w.__voiceForTest.sendMessage();
+  check('and its first message names it', pane.title === 'the first thing said in it', pane.title);
   check('nothing threw', h.thrown.length === 0, h.thrown.join('; '));
   await finish(h);
 }
@@ -541,7 +712,7 @@ console.log('\nTells a cooled tab what its conversation is doing:');
     live: [],
   });
   await settle();
-  const pane = h.hooks.panes.get(`${DEMO}|aaa`);
+  const pane = h.hooks.panes.get(DEMO);
   check('a restored tab starts cold', pane.cold && pane.chip.classList.contains('cold'));
 
   h.box.live = [{ cwd: DEMO, sessionId: 'aaa', busy: true, lastActivity: Date.now() }];
@@ -554,7 +725,10 @@ console.log('\nTells a cooled tab what its conversation is doing:');
   h.$('#toast').textContent = '';
   h.box.live = [{ cwd: DEMO, sessionId: 'aaa', busy: false, lastActivity: Date.now() }];
   await h.hooks.pollLive();
-  check('announces a cooled chat that finished', /finished/.test(h.toast()) && h.toast().includes('the one still running'), h.toast());
+  // Named after the project, like every other announcement: the answer this has
+  // to give is which chip to tap, and the chat's own title is on the switcher line
+  // once you are there.
+  check('announces a cooled project that finished', /finished/.test(h.toast()) && h.toast().startsWith('demo'), h.toast());
   check('and the tab stops showing as working', !pane.busy && !pane.chip.classList.contains('busy'));
 
   // Every six seconds, forever, is the failure mode here.
@@ -574,8 +748,14 @@ console.log('\nTells a cooled tab what its conversation is doing:');
   const row = (key) => h.rows().find((r) => r.dataset.key === key);
   check('a working session is labelled in the list', row(`${DEMO}|bbb`)?.querySelector('.row-live').textContent === 'working…');
   check('a session with no process is not', row(`${DEMO}|aaa`)?.querySelector('.row-live').classList.contains('hidden'));
-  check('a session already open on this device is marked', !row(`${DEMO}|aaa`)?.querySelector('.row-open').classList.contains('hidden'));
-  check('one that is not open on this device is not', row(`${DEMO}|bbb`)?.querySelector('.row-open').classList.contains('hidden'));
+  check('the conversation a window is showing is marked open', !row(`${DEMO}|aaa`)?.querySelector('.row-open').classList.contains('hidden'));
+  // A tab is the project, but "open" has to mean this chat: the same project's
+  // other chats are reachable in one tap and none of them is on screen.
+  check(
+    'and its project\'s other chats are not, even though the project has a tab',
+    row(`${DEMO}|bbb`)?.querySelector('.row-open').classList.contains('hidden')
+      && row(`${DEMO}|ddd`)?.querySelector('.row-open').classList.contains('hidden'),
+  );
   check(
     'polling never re-reads every transcript',
     h.calls.filter((u) => u.includes('/api/projects')).length === 1,
@@ -596,10 +776,10 @@ console.log('\nRejoins every live conversation when the phone comes back:');
 {
   const h = bootClient();
   await settle();
-  const a = h.hooks.openChat({ cwd: DEMO, title: 'the one still running', resumeSessionId: 'aaa' });
+  const a = h.hooks.openConversation({ cwd: DEMO, project: 'demo', sessionId: 'aaa', title: 'the one still running' });
   joinConversation(h.sockets[0], { sessionId: 'aaa', busy: true });
-  const b = h.hooks.openChat({ cwd: API, title: 'an api chat', resumeSessionId: 'ccc' });
-  joinConversation(h.sockets[1], { sessionId: 'ccc' });
+  const b = h.hooks.openConversation({ cwd: API, project: 'api', sessionId: 'ccc', title: 'an api chat' });
+  joinConversation(h.sockets[1], { sessionId: 'ccc', cwd: API });
 
   // iOS suspends a backgrounded tab and freezes its sockets, and the close event
   // usually never arrives — so both of these are dead without having said so.
@@ -639,10 +819,11 @@ if (failures.length) {
 }
 
 console.log(
-  '\nPASS: a cold launch restores every tab and opens one socket; a background '
-  + 'conversation renders into its own thread and announces itself when it lands; '
-  + 'the composer follows the tab on screen and sends nowhere else; the live cap '
-  + 'cools an idle chat and never a working one; closing a tab stops nothing; a '
-  + 'new chat keeps its draft through being renamed; and no session id is ever '
-  + 'held by two panes.',
+  '\nPASS: a tab is a project — a cold launch restores one per project (collapsing '
+  + 'the old per-chat saves) and opens one socket; a background project renders into '
+  + 'its own thread and announces itself when it lands; the composer follows the '
+  + 'conversation on screen and sends nowhere else; the live cap cools an idle '
+  + 'project and never a working one; closing a tab stops nothing, and neither does '
+  + 'switching which conversation a tab shows; and a new chat keeps its draft '
+  + 'through being named.',
 );

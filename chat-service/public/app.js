@@ -85,29 +85,35 @@ function loadSettings() {
 }
 
 /*
- * Which chats this device has open, and which one it was looking at.
+ * Which projects this device has open, and which one it was looking at.
  *
  * Persisted so a refresh, an app-switch on iOS, or reopening the PWA comes back
- * to the same set of conversations instead of dropping to the list and starting
- * over. Only chats that have a session id are written down: that id is the
- * durable, cross-device name for a conversation, and one without it cannot be
- * rejoined by anybody — including this device a second later.
+ * to the same set of projects instead of dropping to the list and starting over.
+ * Each entry carries the conversation that project's window was showing: that
+ * session id is the durable, cross-device name for a conversation. A window with
+ * no conversation yet is still saved — the tab is the project, and the project
+ * exists whether or not anything has been said in it.
  */
 const OPEN_PANES_KEY = 'claude-chat-panes';
 // The single-chat key this replaced. Read once at boot so upgrading does not drop
 // the conversation the user had open, and never written again.
 const LEGACY_OPEN_CHAT_KEY = 'claude-chat-open';
-// More tabs than this is a scrolling strip nobody reads, and every one of them is
-// a conversation to keep track of. The oldest fall off the end; their processes
-// keep running and they are still in the list.
+// More tabs than this is a scrolling strip nobody reads. The oldest fall off the
+// end; nothing in them stops, and they are all still in the list.
 const MAX_TABS = 6;
 
 function saveOpenPanes() {
   try {
     const open = [...panes.values()]
-      .filter((p) => p.sessionId && !p.closed)
+      .filter((p) => !p.closed)
       .slice(-MAX_TABS)
-      .map((p) => ({ cwd: p.cwd, title: p.title, sessionId: p.sessionId }));
+      .map((p) => ({
+        cwd: p.cwd,
+        project: p.project,
+        sessionId: p.sessionId,
+        title: p.title,
+        named: Boolean(p.named),
+      }));
     if (!open.length) {
       localStorage.removeItem(OPEN_PANES_KEY);
       return;
@@ -121,15 +127,41 @@ function saveOpenPanes() {
   }
 }
 
+/*
+ * The saved tabs, collapsed to one per project.
+ *
+ * The collapse is also what upgrades a device that saved tabs under the old
+ * per-conversation model: two claude-web chats become one claude-web tab showing
+ * the later of them. Nothing is lost that mattered — the other conversation is
+ * still running on the box and still in the list — and the alternative is a strip
+ * with the same project on it twice, which is the thing this replaced.
+ */
 function loadOpenPanes() {
+  const collapse = (list) => {
+    const byCwd = new Map();
+    for (const entry of list) {
+      if (!entry?.cwd) continue;
+      // Later entries win, key by key, so a project saved twice keeps the newer
+      // conversation without losing a name the older entry alone carried.
+      byCwd.set(entry.cwd, { ...byCwd.get(entry.cwd), ...entry });
+    }
+    return [...byCwd.values()].slice(-MAX_TABS);
+  };
   try {
     const saved = JSON.parse(localStorage.getItem(OPEN_PANES_KEY) || 'null');
     if (saved?.panes?.length) {
-      return { panes: saved.panes.slice(-MAX_TABS), activeKey: saved.activeKey || null };
+      const list = collapse(saved.panes);
+      // The saved active key may be a new-style `cwd`, an old `cwd|sessionId`, or
+      // an old `cwd|new:1` that never meant anything to anybody but the page that
+      // wrote it. In all three the directory in front of the pipe is the tab to
+      // land on.
+      const activeCwd = String(saved.activeKey || '').split('|')[0];
+      const active = list.some((p) => p.cwd === activeCwd) ? paneKey(activeCwd) : null;
+      return { panes: list, activeKey: active };
     }
     const legacy = JSON.parse(localStorage.getItem(LEGACY_OPEN_CHAT_KEY) || 'null');
     if (legacy?.cwd && legacy?.sessionId) {
-      return { panes: [legacy], activeKey: paneKey(legacy.cwd, legacy.sessionId) };
+      return { panes: collapse([legacy]), activeKey: paneKey(legacy.cwd) };
     }
   } catch {
     /* fall through to a cold start, which is always safe */
@@ -140,11 +172,11 @@ function loadOpenPanes() {
 const state = {
   projects: [],
   settings: loadSettings(),
-  // Which pane is on screen. Everything else about a conversation lives in the
-  // pane itself — see the panes section — because a conversation now keeps
-  // running, and keeps rendering, while you are looking at a different one.
+  // Which pane is on screen — a pane's key is its project's directory. Everything
+  // else about a window lives in the pane itself — see the panes section — because
+  // a conversation now keeps running, and keeps rendering, while you are looking
+  // at a different project.
   activeKey: null,
-  newPaneSeq: 0,
 };
 function saveSettings() {
   localStorage.setItem('claude-chat', JSON.stringify(state.settings));
@@ -169,11 +201,12 @@ function back() {
   const target = navStack[navStack.length - 1] || 'list';
   for (const s of screens) $(`#screen-${s}`).classList.toggle('active', s === target);
   if (target === 'list') {
-    // Deliberately looking away from every chat, so the next launch lands on the
-    // list. The panes stay open and their sockets stay up — that is how a chat
+    // Deliberately looking away from every project, so the next launch lands on
+    // the list. The tabs stay open and their sockets stay up — that is how a chat
     // left working still announces itself — but none of them is on screen now.
     saveDraft({ now: true });
     state.activeKey = null;
+    renderConvBar(null);
     saveOpenPanes();
     refreshList();
   }
@@ -228,9 +261,13 @@ async function refreshList() {
   for (const { project, session } of rows) {
     const row = document.createElement('button');
     row.className = 'row';
-    // The key the pane map and /api/live both use, so the badges below can be
-    // kept honest by polling without re-reading every transcript to redraw a list.
-    row.dataset.key = paneKey(project.path, session.sessionId);
+    // The conversation key /api/live uses, so the badges below can be kept honest
+    // by polling without re-reading every transcript to redraw a list.
+    row.dataset.key = convKey(project.path, session.sessionId);
+    // The tab this row would open, and the chat it would put in it — what
+    // `paintRowBadges` needs to say whether it is already on screen.
+    row.dataset.cwd = project.path;
+    row.dataset.session = session.sessionId;
     // A chat that is still live on the server is labelled, so it's clear that
     // opening it joins the running session — including one left working on
     // another device.
@@ -243,7 +280,12 @@ async function refreshList() {
         </div>
       </div>`;
     row.addEventListener('click', () =>
-      openChat({ cwd: project.path, title: session.title, resumeSessionId: session.sessionId }),
+      openConversation({
+        cwd: project.path,
+        project: project.name,
+        sessionId: session.sessionId,
+        title: session.title,
+      }),
     );
     body.appendChild(row);
   }
@@ -260,7 +302,7 @@ function liveByKey(rows) {
   const map = new Map();
   for (const { project, session } of rows) {
     if (!session.live && !session.busy) continue;
-    map.set(paneKey(project.path, session.sessionId), { busy: Boolean(session.busy) });
+    map.set(convKey(project.path, session.sessionId), { busy: Boolean(session.busy) });
   }
   return map;
 }
@@ -283,20 +325,37 @@ function paintRowBadges(byKey) {
       badge.classList.toggle('hidden', !text);
       badge.classList.toggle('busy', Boolean(live?.busy));
     }
-    // Already a tab on this device: tapping the row switches to it rather than
-    // opening the same conversation twice.
-    if (open) open.classList.toggle('hidden', !panes.has(row.dataset.key));
+    // Already on screen in its project's window: tapping the row switches to that
+    // tab rather than opening the same conversation twice. A row in a project that
+    // has a tab showing a *different* chat is not "open" — tapping it will move
+    // that window, which is a change, not a no-op.
+    if (open) {
+      const pane = panes.get(paneKey(row.dataset.cwd));
+      open.classList.toggle('hidden', !pane || pane.sessionId !== row.dataset.session);
+    }
   }
 }
 
-// --- new chat ---------------------------------------------------------------
-$('#btn-new').addEventListener('click', async () => {
+// --- new chat / open a project ------------------------------------------------
+/*
+ * The picker screen serves two intents, and the difference only shows when the
+ * project already has a tab. "New chat" means start one; "+" on the tab strip
+ * means put that project on screen. Getting this backwards would either replace a
+ * conversation the user was in the middle of, or refuse to start the new chat they
+ * just asked for.
+ */
+let pickerWantsNewChat = true;
+
+async function showPicker({ newChat }) {
+  pickerWantsNewChat = newChat;
   await refreshList();
   renderProjectPicker();
   $('#repo-picker').innerHTML = '';
   $('#clone-status').textContent = '';
   show('new');
-});
+}
+
+$('#btn-new').addEventListener('click', () => showPicker({ newChat: true }));
 
 function renderProjectPicker() {
   const picker = $('#project-picker');
@@ -319,7 +378,9 @@ function renderProjectPicker() {
         <div class="row-title">${escapeHtml(project.name)}</div>
         <div class="row-sub">${project.sessions.length} chat${project.sessions.length === 1 ? '' : 's'}</div>
       </div>`;
-    row.addEventListener('click', () => openChat({ cwd: project.path, title: project.name }));
+    row.addEventListener('click', () =>
+      openProject({ cwd: project.path, project: project.name, fresh: pickerWantsNewChat }),
+    );
 
     const manage = document.createElement('button');
     manage.type = 'button';
@@ -367,7 +428,7 @@ async function cloneRepo(repo) {
     $('#repo-picker').innerHTML = '';
     await refreshList();
     renderProjectPicker();
-    openChat({ cwd: data.project.path, title: data.project.name });
+    openProject({ cwd: data.project.path, project: data.project.name });
   } catch (err) {
     status.textContent = err.message;
   }
@@ -591,7 +652,7 @@ $('#form-project').addEventListener('submit', async (e) => {
     const repo = (data.project.steps || []).find((s) => s.step === 'github' && s.ok);
     status.textContent = repo?.url ? `Pushed to ${repo.url}` : '';
     input.value = '';
-    openChat({ cwd: data.project.path, title: data.project.name });
+    openProject({ cwd: data.project.path, project: data.project.name });
   } catch (err) {
     status.textContent = '';
     toast(err.message);
@@ -600,16 +661,28 @@ $('#form-project').addEventListener('submit', async (e) => {
 
 // --- panes ------------------------------------------------------------------
 /*
- * Several conversations open at once, on a phone.
+ * Several projects open at once, on a phone.
  *
- * A pane is one conversation and everything that draws it: its socket, its thread
- * element, the bubble currently being streamed into, the tool cards still waiting
- * for their results. It exists because the thing that makes a second window worth
- * having is that the first one keeps working while you are not looking at it — so
- * events have to land in a thread that is off screen, which cannot happen while
- * there is exactly one of everything.
+ * **A tab is a project, not a conversation.** That is the whole design, and it is
+ * worth being explicit about because the obvious alternative — a tab per chat —
+ * was built first and was wrong. There are 17 projects on this box and 32
+ * conversations in them: a strip of chips named after conversations is a list of
+ * things you have to remember the meaning of, while a strip named after projects
+ * is the thing you actually move between. You work on a project; the conversation
+ * is just where you are in it.
  *
- * Tabs, not tiles. Two 190px columns on a 390px phone make both conversations
+ * So a pane is one project's window, and it holds:
+ *   - `cwd`, its identity — a project is a directory, so the directory is the key
+ *   - `project`, the name on the chip
+ *   - `sessionId`, *which* conversation is in the window right now, and mutable:
+ *     switching conversation swaps the socket and the thread inside one tab
+ * plus everything that draws it — its socket, its thread element, the bubble being
+ * streamed into, the tool cards still waiting for results. A window's conversation
+ * keeps working while you are looking at another project, so events have to land in
+ * a thread that is off screen, which cannot happen while there is exactly one of
+ * everything.
+ *
+ * Tabs, not tiles. Two 190px columns on a 390px phone make both projects
  * unreadable; what a second window is actually for here is switching without
  * losing state and knowing what the other one is doing, and a strip of chips with
  * a status dot gives both for no width at all.
@@ -620,12 +693,36 @@ $('#form-project').addEventListener('submit', async (e) => {
  * coming back is the same join another device would do — and it is what stops six
  * open tabs from being six threads of several hundred bubbles in a phone's
  * memory. A working pane is never cooled: being told when it lands is the point.
+ *
+ * The one thing this model gives up: two conversations in the *same* project
+ * cannot both be on screen, because that project has one tab. Switching between
+ * them inside the window leaves the other running on the box — nothing is stopped
+ * — but only the one in the window is watched. Cross-project is the case this is
+ * for, and it is the case that happens.
  */
 const MAX_LIVE = 3;
 const panes = new Map();
 
-/** The durable name for a conversation, and the key everything else agrees on. */
-function paneKey(cwd, sessionId) {
+/**
+ * A tab's key. A tab is a project, so the project's directory *is* the key —
+ * which is what makes "open this project" idempotent no matter where it is
+ * called from: the list, the picker, a restored tab, or another conversation in
+ * the same project.
+ */
+function paneKey(cwd) {
+  return cwd;
+}
+
+/**
+ * A conversation's durable, cross-device name.
+ *
+ * Deliberately still `cwd|sessionId`, and deliberately no longer the pane key:
+ * drafts, the list rows and `/api/live` are all about a *conversation*, and they
+ * agree with the server, which keys its conversations this way too. A draft
+ * belongs to the chat it was typed in, not to the window that happened to be
+ * showing it.
+ */
+function convKey(cwd, sessionId) {
   return `${cwd}|${sessionId || ''}`;
 }
 
@@ -633,14 +730,21 @@ function activePane() {
   return panes.get(state.activeKey) || null;
 }
 
-function makePane({ cwd, title, sessionId }) {
-  // A chat with no session id yet has no durable name, so it gets a private one
-  // until the CLI assigns the real one and `rememberSession` re-keys it.
-  const key = sessionId ? paneKey(cwd, sessionId) : `${cwd}|new:${++state.newPaneSeq}`;
+function makePane({ cwd, project, title, sessionId }) {
   const pane = {
-    key,
+    // Stable for the life of the tab: a project does not become another project,
+    // and the conversation inside it changing is not a re-key. This is the part
+    // the per-conversation model got wrong — every new chat's first reply used to
+    // rename its own tab out from under everything holding a reference to it.
+    key: paneKey(cwd),
     cwd,
-    title: title || 'Claude',
+    project: project || basename(cwd),
+    // The conversation currently in the window, for the switcher line under the
+    // tabs. Not the chip's label — the chip is the project.
+    title: title || 'New chat',
+    // Whether that title came from a transcript. A chat opened from the list is
+    // already named; a new one names itself from its first message.
+    named: Boolean(title),
     // The CLI's own session id: the durable, cross-device name for this chat.
     // `conversationId` only identifies the process to this browser, so it is
     // useless after a refresh and meaningless on another device.
@@ -663,17 +767,97 @@ function makePane({ cwd, title, sessionId }) {
     reconnectDelay: 500,
     draft: '',
   };
-  panes.set(key, pane);
+  panes.set(pane.key, pane);
   return pane;
 }
 
-function openChat({ cwd, title, resumeSessionId }) {
-  // One pane per conversation, always. Two panes on one session id would be two
-  // sockets appending to one transcript — the divergence this project has already
-  // had once, and the reason the server keys conversations by cwd|sessionId.
-  const existing = resumeSessionId ? panes.get(paneKey(cwd, resumeSessionId)) : null;
-  const pane = existing || makePane({ cwd, title, sessionId: resumeSessionId });
+/** The project name to fall back on when a caller only knows the directory. */
+function basename(cwd) {
+  return String(cwd || '').replace(/\/+$/, '').split('/').pop() || 'project';
+}
+
+/**
+ * Open a project's window.
+ *
+ * One tab per project, always — so this is find-or-create, and tapping a project
+ * you already have open is a switch rather than a second tab. With no conversation
+ * named, an existing window keeps the one it is showing (which is what "go to
+ * claude-web" means) and a new window starts a new chat.
+ */
+function openProject({ cwd, project, sessionId, title, fresh = false }) {
+  const existing = panes.get(paneKey(cwd));
+  const pane = existing || makePane({ cwd, project, sessionId, title });
+  // Keep the name fresh: a tab restored from localStorage knows only what was
+  // saved, and the list is authoritative about what a project is called.
+  if (project) pane.project = project;
+  if (existing) {
+    // A named conversation moves the window to it; an explicit "new chat" empties
+    // it. Neither stops what was there.
+    if (sessionId && sessionId !== pane.sessionId) {
+      showConversation(pane, { sessionId, title });
+      return pane;
+    }
+    if (fresh && pane.sessionId) {
+      showConversation(pane, { sessionId: null, title: null });
+      return pane;
+    }
+  }
   activatePane(pane);
+  return pane;
+}
+
+/**
+ * Open a specific conversation, in its project's window.
+ *
+ * This is what a row in the list does. The project is the tab; the conversation is
+ * what the tab is showing. Tapping a chat in a project that is already open moves
+ * that window to it rather than opening a seventh tab.
+ */
+function openConversation({ cwd, project, sessionId, title }) {
+  return openProject({ cwd, project, sessionId, title });
+}
+
+/**
+ * Change which conversation a window is showing.
+ *
+ * The socket and the thread belong to the conversation, not to the tab, so both
+ * are torn down and rebuilt — the same teardown `coolPane` does, then the same
+ * join a cold tab does. Deliberately *not* a stop: the conversation being left
+ * keeps running on the box, so this says so when it was working, because a chat
+ * disappearing from the window while it is still spending money is exactly the
+ * thing the user has to be able to trust.
+ */
+function showConversation(pane, { sessionId = null, title } = {}) {
+  if (pane.closed) return pane;
+  const sameChat = (sessionId || null) === (pane.sessionId || null);
+  if (sameChat && !pane.cold) {
+    activatePane(pane);
+    return pane;
+  }
+
+  // The composer belongs to the conversation being left, not to the tab. Flush it
+  // to disk under *that* conversation's key first, then clear it — in that order,
+  // and `pane.draft` last of all, because `writeDraft` stashes the text on the pane
+  // on its way out and `activatePane` restores from there. Clearing before the save
+  // loses the draft; not clearing at all pastes it into the conversation arriving,
+  // which is somebody's words in a chat they were not written for.
+  if (pane === activePane()) {
+    saveDraft({ now: true });
+    input.value = '';
+  }
+  pane.draft = '';
+
+  const leaving = pane.busy ? pane.title : null;
+  teardownPane(pane);
+  pane.sessionId = sessionId || null;
+  pane.title = title || (sessionId ? 'Chat' : 'New chat');
+  pane.named = Boolean(title);
+  pane.busy = false;
+  pane.trouble = false;
+  pane.unread = false;
+  pane.sub = 'connecting…';
+  activatePane(pane);
+  if (leaving) toast(`${leaving} keeps working — it's still in the list.`);
   return pane;
 }
 
@@ -710,7 +894,11 @@ function activatePane(pane) {
   }
   pane.thread.classList.add('active');
 
-  $('#chat-title').textContent = pane.title;
+  // The project is what the header names, because the project is what the tab is.
+  // Which conversation you are in goes on its own line below the tabs, where it is
+  // also the control for changing it.
+  $('#chat-title').textContent = pane.project;
+  renderConvBar(pane);
   setSub(pane, pane.sub);
   setBusy(pane, pane.busy);
   input.value = pane.draft || '';
@@ -751,6 +939,18 @@ function reheat(pane) {
  * choice for /chat/admin to offer, not something a tab limit does quietly.
  */
 function coolPane(pane) {
+  teardownPane(pane);
+  renderTabs();
+}
+
+/**
+ * Drop everything that belongs to the conversation, keeping the tab.
+ *
+ * Shared by cooling (the tab stays, the conversation stays), closing (the tab
+ * goes) and switching conversation inside a window (the tab stays, a different
+ * conversation arrives). None of the three stops anything on the box.
+ */
+function teardownPane(pane) {
   pane.cold = true;
   pane.conversationId = null;
   const ws = pane.ws;
@@ -766,7 +966,6 @@ function coolPane(pane) {
   pane.echoedMessages.clear();
   pane.streamingEl = null;
   pane.typingEl = null;
-  renderTabs();
 }
 
 /**
@@ -801,6 +1000,7 @@ function closePane(pane, { quiet = false } = {}) {
   coolPane(pane);
   panes.delete(pane.key);
   if (wasBusy && !quiet) toast(`${pane.title} keeps working — reopen it from the list.`);
+  closeChatsSheet();
 
   if (state.activeKey === pane.key) {
     state.activeKey = null;
@@ -810,6 +1010,7 @@ function closePane(pane, { quiet = false } = {}) {
       return;
     }
     renderTabs();
+    renderConvBar(null);
     saveOpenPanes();
     if ($('#screen-chat').classList.contains('active')) back();
     return;
@@ -839,13 +1040,13 @@ function renderTabs() {
     main.type = 'button';
     main.className = 'chip-main';
     main.innerHTML = '<span class="chip-dot"></span><span class="chip-name"></span>';
-    main.querySelector('.chip-name').textContent = pane.title;
+    main.querySelector('.chip-name').textContent = pane.project;
     main.addEventListener('click', () => activatePane(pane));
 
     const close = document.createElement('button');
     close.type = 'button';
     close.className = 'chip-x';
-    close.setAttribute('aria-label', `Close ${pane.title}`);
+    close.setAttribute('aria-label', `Close ${pane.project}`);
     close.textContent = '✕';
     close.addEventListener('click', () => closePane(pane));
 
@@ -855,21 +1056,17 @@ function renderTabs() {
     paintChip(pane);
   }
 
-  // The only way to open a second chat from inside the first. Without it the
+  // The only way to open a second project from inside the first. Without it the
   // feature is reachable only by going back to the list, which is the flow tabs
   // exist to replace.
   const add = document.createElement('button');
   add.type = 'button';
   add.className = 'chip-add';
-  add.setAttribute('aria-label', 'Open another chat');
+  add.setAttribute('aria-label', 'Open another project');
   add.textContent = '+';
-  add.addEventListener('click', async () => {
-    await refreshList();
-    renderProjectPicker();
-    $('#repo-picker').innerHTML = '';
-    $('#clone-status').textContent = '';
-    show('new');
-  });
+  // `newChat: false` — this is "put another project on screen". A project already
+  // open keeps the conversation it is showing rather than being emptied.
+  add.addEventListener('click', () => showPicker({ newChat: false }));
   bar.appendChild(add);
 }
 
@@ -882,7 +1079,93 @@ function paintChip(pane) {
   chip.classList.toggle('cold', pane.cold);
   chip.classList.toggle('unread', pane.unread && pane.key !== state.activeKey);
   chip.classList.toggle('trouble', pane.trouble);
-  chip.querySelector('.chip-name').textContent = pane.title;
+  chip.querySelector('.chip-name').textContent = pane.project;
+}
+
+// --- which conversation, inside a project's window ---------------------------
+/*
+ * One tab per project means changing conversation is a move *within* a tab, so it
+ * needs a control of its own. This is it: a line under the tabs naming the chat on
+ * screen, which opens the project's other chats.
+ */
+function renderConvBar(pane) {
+  const bar = $('#conv-bar');
+  if (!bar) return;
+  bar.classList.toggle('hidden', !pane);
+  if (!pane) return;
+  $('#conv-name').textContent = pane.title;
+  bar.setAttribute('aria-label', `Chat: ${pane.title}. Switch chats in ${pane.project}.`);
+}
+
+const chatsSheet = $('#chats-sheet');
+
+function closeChatsSheet() {
+  chatsSheet?.classList.add('hidden');
+}
+document
+  .querySelectorAll('[data-close-chats]')
+  .forEach((el) => el.addEventListener('click', closeChatsSheet));
+
+$('#conv-bar')?.addEventListener('click', () => openChatsSheet());
+
+$('#btn-new-in-project')?.addEventListener('click', () => {
+  const pane = activePane();
+  closeChatsSheet();
+  // No title, deliberately: a title here would count as a name, and the first
+  // message would then never replace it — leaving "New chat" on the switcher line
+  // beside the project's other chats for the rest of the session.
+  if (pane) showConversation(pane, { sessionId: null });
+});
+
+/**
+ * The chats in the project on screen.
+ *
+ * Reads `/api/projects` on open, which is the one thing that may never be polled —
+ * but this is a tap, and the point of the sheet is to be right about what exists.
+ */
+async function openChatsSheet() {
+  const pane = activePane();
+  if (!pane) return;
+  $('#chats-sheet-title').textContent = pane.project;
+  $('#chats-sheet-body').textContent = 'Loading…';
+  chatsSheet.classList.remove('hidden');
+  await refreshList();
+  // Still the same window? A tap on a tab while this was in flight means the
+  // answer below is about a project the user has already left.
+  if (activePane() !== pane || chatsSheet.classList.contains('hidden')) return;
+
+  const project = state.projects.find((p) => p.path === pane.cwd);
+  const sessions = project?.sessions ?? [];
+  const body = $('#chats-sheet-body');
+  body.innerHTML = '';
+  if (!sessions.length) {
+    body.innerHTML = '<div class="empty">No past chats in this project yet.</div>';
+    return;
+  }
+
+  for (const session of sessions) {
+    const row = document.createElement('button');
+    row.type = 'button';
+    row.className = 'sheet-row';
+    const current = session.sessionId === pane.sessionId;
+    row.classList.toggle('current', current);
+    const badge = session.busy ? 'working…' : session.live ? 'live' : '';
+    row.innerHTML = `
+      <div class="sheet-row-main">
+        <div class="sheet-row-title">${escapeHtml(session.title)}</div>
+        <div class="sheet-row-sub">${relTime(session.mtime)}
+          ${badge ? `<span class="row-live${session.busy ? ' busy' : ''}">${badge}</span>` : ''}
+          ${current ? '<span class="row-open">on screen</span>' : ''}
+        </div>
+      </div>`;
+    row.addEventListener('click', () => {
+      closeChatsSheet();
+      if (!current) {
+        showConversation(pane, { sessionId: session.sessionId, title: session.title });
+      }
+    });
+    body.appendChild(row);
+  }
 }
 
 /**
@@ -897,7 +1180,10 @@ function paintChip(pane) {
 function announce(pane, text) {
   pane.unread = true;
   paintChip(pane);
-  toast(`${pane.title}: ${text}`);
+  // Named after the project, to match the chip that just lit up. The chat's own
+  // title is on the switcher line once you get there; what this has to answer is
+  // "which tab do I tap".
+  toast(`${pane.project}: ${text}`);
   try {
     navigator.vibrate?.(120);
   } catch {
@@ -1012,34 +1298,21 @@ function connect(pane) {
 /**
  * Record the durable session id and make this device able to rejoin later.
  *
- * A brand-new chat is keyed privately until this arrives, so the pane is re-keyed
- * here — along with its draft, which was saved under the private key and would
- * otherwise be orphaned the moment the first reply came back.
+ * The tab is not re-keyed here, and that is the point of keying tabs by project:
+ * a brand-new chat getting its name from the CLI used to rename its own pane,
+ * which meant re-keying the map, the thread, the chip, the active key and the
+ * draft, all in the moment the first reply arrived. Now only the *conversation*
+ * gains a name, so the one thing that still has to move is the draft.
  */
 function rememberSession(pane, sessionId) {
-  if (!sessionId) return;
-  const previousKey = pane.key;
+  if (!sessionId || sessionId === pane.sessionId) return;
+  const previous = pane.sessionId;
   pane.sessionId = sessionId;
-  const key = paneKey(pane.cwd, sessionId);
-  if (key !== previousKey) {
-    const clash = panes.get(key);
-    // Two panes on one session id would diverge. A fresh id cannot collide, but
-    // if it ever did the older tab goes rather than both appending to one
-    // transcript.
-    if (clash && clash !== pane) closePane(clash, { quiet: true });
-    panes.delete(previousKey);
-    pane.key = key;
-    panes.set(key, pane);
-    if (pane.thread) pane.thread.dataset.key = key;
-    if (pane.chip) pane.chip.dataset.key = key;
-    if (state.activeKey === previousKey) state.activeKey = key;
-    // Deliberately not `previousKey`: a draft is keyed by the conversation it was
-    // typed in, and a chat with no session id yet has no name but its directory —
-    // so that is where the draft is, not under the pane's private `new:` key. A
-    // message typed before the first reply is the common case for a brand-new
-    // chat, and getting this wrong orphans exactly that one.
-    moveDraft(paneKey(pane.cwd, null), key);
-  }
+  // A draft is keyed by the conversation it was typed in, and a chat with no
+  // session id yet has no name but its directory — so that is where the draft is.
+  // A message typed before the first reply is the common case for a brand-new
+  // chat, and getting this wrong orphans exactly that one.
+  if (!previous) moveDraft(convKey(pane.cwd, null), convKey(pane.cwd, sessionId));
   saveOpenPanes();
 }
 
@@ -1389,8 +1662,10 @@ const LEGACY_DRAFT_KEY = 'claude-chat-draft';
 const DRAFT_MAX_AGE = 24 * 60 * 60 * 1000;
 let draftTimer = null;
 
+// Keyed by conversation, not by tab: a draft belongs to the chat it was typed in,
+// and one window shows several chats over its life.
 function draftKeyFor(chat) {
-  return `${DRAFT_PREFIX}${paneKey(chat.cwd, chat.sessionId)}`;
+  return `${DRAFT_PREFIX}${convKey(chat.cwd, chat.sessionId)}`;
 }
 
 function writeDraft() {
@@ -1534,6 +1809,16 @@ async function sendMessage() {
     return;
   }
   pane.ws.send(JSON.stringify({ type: 'message', text }));
+  // Name the conversation after its first message, which is what the list will
+  // call it once the transcript exists. Without this the switcher line above says
+  // "New chat" for the rest of the session, and a project with two chats in it
+  // gives the user nothing to tell them apart by.
+  if (!pane.named) {
+    pane.named = true;
+    pane.title = text.length > 60 ? `${text.slice(0, 57)}…` : text;
+    renderConvBar(pane);
+    saveOpenPanes();
+  }
   // Echo immediately. The server also echoes it back, but waiting for that
   // round trip makes a slow connection look like the tap did nothing.
   addBubble(pane, 'user', text);
@@ -2832,10 +3117,13 @@ async function pollLive() {
     return;
   }
 
-  const byKey = new Map((sessions || []).map((s) => [paneKey(s.cwd, s.sessionId), s]));
+  const byKey = new Map((sessions || []).map((s) => [convKey(s.cwd, s.sessionId), s]));
   for (const pane of panes.values()) {
     if (!pane.cold) continue;
-    const live = byKey.get(pane.key);
+    // A window with no conversation in it has nothing to be busy about, and no key
+    // to look up — `convKey(cwd, null)` would match nothing and mark it in trouble.
+    if (!pane.sessionId) continue;
+    const live = byKey.get(convKey(pane.cwd, pane.sessionId));
     const wasBusy = pane.busy;
     pane.busy = Boolean(live?.busy);
     // A cooled tab whose process has gone can still be reopened — the transcript
@@ -2864,13 +3152,15 @@ if ('serviceWorker' in navigator) {
 // Exposed so smoke-test.js can exercise event rendering without a live socket.
 // Defaults to the pane on screen, which is what a caller without a pane means.
 window.__handleEventForTest = (msg, pane) => handleEvent(msg, pane || activePane());
-// Several conversations open at once cannot be driven from a desktop browser
-// either: what has to be proved is that a background pane keeps rendering into its
-// own thread, that switching carries the composer with it, and that the tab cap
-// cools an idle chat rather than a working one.
+// Several projects open at once cannot be driven from a desktop browser either:
+// what has to be proved is that a background window keeps rendering into its own
+// thread, that switching carries the composer with it, that the tab cap cools an
+// idle project rather than a working one, and that changing conversation inside a
+// window neither stops the old one nor opens a second tab.
 window.__panesForTest = {
-  panes, state, openChat, activatePane, closePane, coolPane, makeRoomFor,
-  renderTabs, paintChip, pollLive, paneKey, activePane, MAX_LIVE,
+  panes, state, openProject, openConversation, showConversation,
+  activatePane, closePane, coolPane, makeRoomFor,
+  renderTabs, paintChip, pollLive, paneKey, convKey, activePane, MAX_LIVE,
 };
 // The silent-dictation failure can't be reproduced from a desktop browser, so
 // the test drives the interruption path directly instead.
@@ -2931,22 +3221,23 @@ document.addEventListener('visibilitychange', () => {
   if (!$('#screen-chat').classList.contains('active')) refreshList();
 });
 
-// Restore the chats this device had open, so a refresh or a cold PWA launch lands
-// back in the same conversations rather than on the list. Any still running on the
-// server — including work started from another device — are rejoined.
+// Restore the projects this device had open, so a refresh or a cold PWA launch
+// lands back in the same set of windows rather than on the list. Any conversation
+// still running on the server — including work started from another device — is
+// rejoined when its tab is looked at.
 (function boot() {
   // Before anything else: the display should stop sleeping from the moment the
   // app is on screen, not from the moment a chat is open.
   startKeepAwake();
 
   const saved = loadOpenPanes();
-  // Restored cold, every one of them: a tab, a title and a session id, with no
-  // socket and no thread until it is looked at. A launch that opened six sockets
-  // and rebuilt six transcripts would be the slowest thing this app does, on the
-  // device least able to afford it — and five of them would be for conversations
-  // the user is not reading.
-  for (const chat of saved.panes) {
-    if (chat?.cwd && chat?.sessionId) makePane(chat);
+  // Restored cold, every one of them: a project name, the conversation it was
+  // showing and that chat's title, with no socket and no thread until the tab is
+  // looked at. A launch that opened six sockets and rebuilt six transcripts would
+  // be the slowest thing this app does, on the device least able to afford it —
+  // and five of them would be for projects the user is not reading.
+  for (const tab of saved.panes) {
+    if (tab?.cwd) makePane(tab);
   }
   const active = saved.activeKey ? panes.get(saved.activeKey) : null;
   renderTabs();
