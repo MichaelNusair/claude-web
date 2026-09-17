@@ -162,26 +162,30 @@ const isTerminalTab = (tab) =>
 /**
  * Which thing the Claude button opens.
  *
- * `tmux` is the default, and the reason is the whole point of this project: the
- * extension's panel runs `claude` as a child of the extension host, and
- * code-server creates one extension host **per browser page**. So a second device
- * — or a plain reload — gets a second extension host, a second `claude`, and a
- * second copy of the conversation resumed from the transcript on disk, while the
- * first one keeps running. Two live processes appending to one transcript is what
- * "I opened it on my laptop and it was idle, and now they tell different
- * stories" is. Measured on this box: extension hosts 314616 and 319472, three
- * `claude` processes, one project directory.
+ * `panel` is the default — the extension's own UI, with real diffs and tool
+ * cards. It was single-device for a long time, and that was the whole problem
+ * this project set out to solve: the panel runs `claude` as a child of the
+ * extension host, and code-server creates one extension host **per browser
+ * page**. So a second device — or a plain reload — got a second extension host, a
+ * second `claude`, and a second copy of the conversation resumed from the
+ * transcript on disk, while the first one kept running. Two live processes
+ * appending to one transcript is what "I opened it on my laptop and it was idle,
+ * and now they tell different stories" is. Measured on this box: extension hosts
+ * 314616 and 319472, three `claude` processes, one project directory.
  *
- * A tmux session is owned by a server that is parented to systemd and attached to
- * no terminal, so there is exactly one process no matter how many devices are
- * looking at it, and attaching from the laptop joins the run mid-turn instead of
- * forking it. `panel` is kept for the extension's richer UI — real diffs, tool
- * cards — on a single device, and for anyone who prefers it.
+ * That is fixed outside the panel, by claude-broker: the panel's `claude` is
+ * launched through a wrapper that hands its stdio to a daemon owning one process
+ * per conversation, so two pages drive one process no matter how many extension
+ * hosts exist. The panel does not know, and does not need to.
+ *
+ * `tmux` is kept because it needs nothing at all — no broker, no wrapper, no
+ * setting on the extension — so it is the surface that still works when the rest
+ * does not, and it is the real CLI rather than a UI over it.
  */
 function claudeSurface() {
-  return vscode.workspace.getConfiguration().get('claudeMobile.claudeSurface', 'tmux') === 'panel'
-    ? 'panel'
-    : 'tmux';
+  return vscode.workspace.getConfiguration().get('claudeMobile.claudeSurface', 'panel') === 'tmux'
+    ? 'tmux'
+    : 'panel';
 }
 
 /**

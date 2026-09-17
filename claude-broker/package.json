@@ -1,0 +1,11 @@
+{
+  "name": "claude-broker",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "main": "broker.js",
+  "scripts": {
+    "start": "node broker.js",
+    "test": "node broker-test.js"
+  }
+}

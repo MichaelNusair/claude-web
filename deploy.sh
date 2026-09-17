@@ -132,6 +132,17 @@ step "Checking the project lifecycle"
 ) || { echo "project lifecycle tests failed — not deploying." >&2; exit 1; }
 
 # ---------------------------------------------------------------------------
+step "Checking the Claude broker"
+# ---------------------------------------------------------------------------
+# The broker sits between the editor's Claude panel and the real CLI, so a bug
+# here takes away the interface rather than degrading it. Boots the real broker
+# over a real socket and checks both halves: two clients share one process, and
+# every failure path still runs Claude directly.
+(
+  node claude-broker/broker-test.js
+) || { echo "broker tests failed — not deploying." >&2; exit 1; }
+
+# ---------------------------------------------------------------------------
 step "Packaging the voice dictation extension"
 # ---------------------------------------------------------------------------
 mkdir -p dist
@@ -275,6 +286,11 @@ mkdir -p dist/stage/pwa && cp pwa/mobile-overlay.js dist/stage/pwa/
 # Ships in the payload rather than baked into userdata, so `cc` can be updated
 # without replacing the instance.
 mkdir -p dist/stage/scripts && cp scripts/cc-session.sh dist/stage/scripts/
+# The broker that keeps one `claude` per conversation for the editor's panel. No
+# dependencies beyond node, so it ships as plain files with no npm install.
+mkdir -p dist/stage/claude-broker
+cp claude-broker/broker.js claude-broker/wrapper.js claude-broker/package.json \
+  claude-broker/claude-broker.service claude-broker/install.sh dist/stage/claude-broker/
 mkdir -p dist/stage/vsix
 cp dist/claude-voice.vsix dist/claude-mobile.vsix dist/stage/vsix/
 # The chat UI serves its own PWA assets, so bundle them into its public dir.
@@ -286,7 +302,8 @@ cp pwa-icons/*.png dist/stage/chat-service/public/pwa-icons/
 # downloaded and newly written files). Those stubs land on the instance, show up
 # as phantom files in the editor, and left a non-empty directory behind that
 # broke the vsix cleanup below.
-COPYFILE_DISABLE=1 tar -czf dist/payload.tar.gz -C dist/stage chat-service pwa vsix scripts
+COPYFILE_DISABLE=1 tar -czf dist/payload.tar.gz -C dist/stage \
+  chat-service pwa vsix scripts claude-broker
 
 # Staged through S3 rather than inlined into the SSM command.
 #
@@ -336,6 +353,14 @@ cmds = [
   # apostrophe breaks the whole script with a confusing EOF error.
   "install -m 0755 /opt/claude-web/scripts/cc-session.sh /usr/local/bin/cc",
   "command -v tmux >/dev/null || dnf install -y tmux",
+  # The broker that lets one conversation be driven from several devices: its
+  # systemd unit, and the editor setting that points the panel at it.
+  #
+  # A script rather than commands here, because the unit and the settings merge
+  # belong next to the code they install, and because this block is a python
+  # heredoc inside a command substitution — a nested heredoc is exactly the shape
+  # that breaks it.
+  "bash /opt/claude-web/claude-broker/install.sh",
   "sudo -u coder HOME=/home/coder /usr/bin/code-server"
   " --user-data-dir /workspace/code-server-data"
   " --extensions-dir /workspace/code-server-ext"
@@ -357,7 +382,10 @@ cmds = [
   "sleep 3",
   # `is-active` exits non-zero if any unit is down, which fails the SSM command
   # — so a half-broken deploy can no longer report success.
-  "systemctl is-active claude-chat code-server nginx",
+  # claude-broker included so a broker that dies after install.sh checked it —
+  # during the reprovision above, say — fails the deploy rather than quietly
+  # leaving every browser page with its own Claude again.
+  "systemctl is-active claude-chat code-server nginx claude-broker",
   "curl -fsS -o /dev/null http://127.0.0.1:9997/healthz || { echo 'chat service not answering'; exit 1; }",
   "curl -fsS -o /dev/null http://127.0.0.1:9999/healthz || curl -fsS -o /dev/null http://127.0.0.1:9999/ || { echo 'code-server not answering'; exit 1; }",
 ]

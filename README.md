@@ -57,6 +57,11 @@ your-domain.com
   │     └── /api/transcribe → whisper.cpp, on-box, no API key
   │
   ├── code-server + official anthropic.claude-code extension
+  │     └── its Claude launched via claude-broker/wrapper.js
+  │
+  ├── claude-broker service
+  │     ├── one `claude` per conversation, outliving every browser page
+  │     └── replays the stream to a device that joins mid-turn
   │
   └── /workspace  ← persistent EBS, survives instance replacement
         ├── projects/   one directory per repo
@@ -94,33 +99,36 @@ your-domain.com
 ## Sessions that outlive the browser, and follow you between devices
 
 Start something on your phone, arrive home, open the same project on your laptop,
-and keep watching the same run. That works because the editor's Claude runs in a
-**tmux** session rather than inside the browser page.
+and keep watching the same run — in the official Claude Code panel, with its diffs
+and tool cards.
 
-It has to. The extension's own panel runs `claude` as a child of the extension
-host, and code-server creates one extension host *per browser page* — then tears
-it down within **five seconds** of the last WebSocket closing. So the panel does
-not hand off between devices; it *forks*. The second device starts its own
-`claude`, resumes the same session from the transcript on disk, and the first one
-carries on running, untouched. Both then append to the same file and diverge. What
-you see is your laptop showing the conversation sitting idle while your phone is
-still working, and the two telling different stories a minute later.
+The panel could not do that on its own. It runs `claude` as a child of the
+extension host, and code-server creates one extension host *per browser page* —
+then tears it down within **five seconds** of the last WebSocket closing. So the
+panel did not hand off between devices; it *forked*. The second device started its
+own `claude`, resumed the same session from the transcript on disk, and the first
+one carried on running, untouched. Both then appended to the same file and
+diverged. What you saw was your laptop showing the conversation sitting idle while
+your phone was still working, and the two telling different stories a minute later.
 
-tmux fixes it because the session belongs to a server parented to systemd, not to
-any terminal or page:
+That is fixed outside the extension, because nothing can fix it inside one
+extension host. The panel's `claude` is launched through a small wrapper
+(`claudeCode.claudeProcessWrapper`, a supported setting) that hands its stdio to
+**claude-broker**, a service that owns one real process per conversation. Every
+page attaches to that one process; a page that joins mid-turn is replayed the
+stream so far and catches up.
 
 - closing the editor, the browser, or your laptop changes nothing
-- **attaching from a second device joins the same live session** — same screen,
-  same scrollback, mid-turn — rather than starting a second Claude
-- it survives a reload, a dropped connection, a code-server restart and a
-  redeploy — the tmux server is its own systemd service, so restarting the editor
-  cannot take your session down with it
+- **opening the project on a second device joins the same live run**, mid-turn,
+  rather than starting a second Claude
+- it survives a reload, a dropped connection and a code-server restart — the
+  broker is its own systemd service, so restarting the editor cannot take your
+  conversation down with it
+- if the broker is ever down, the wrapper just runs the real binary: you get the
+  old single-device behaviour instead of an editor that will not start
 
-Verified on a live box: two clients attached at once, one session, one `claude`
-process, and the session still running after both detached.
-
-The Claude button on the editor does this for you. From a shell, the same thing by
-hand:
+A terminal-only route is still there, and it depends on nothing at all — no
+broker, no extension. It is the same tmux session on every device you attach from:
 
 ```bash
 cc                      # list live sessions and projects
@@ -128,11 +136,10 @@ cc my-project           # start, or rejoin, a permanent session
 cc my-project --kill    # end it
 ```
 
-Because it is the real CLI, `/model`, permission modes, `@file` references,
-thinking and tool output are all the genuine thing rather than a copy of it.
-
-If you would rather have the extension's panel — richer diffs and tool cards, at
-the cost of being single-device — set `claudeMobile.claudeSurface` to `panel`.
+Verified on a live box: two clients attached at once, one session, one `claude`
+process, and the session still running after both detached. Set
+`claudeMobile.claudeSurface` to `tmux` to make the Claude button open that instead
+of the panel.
 
 ## Voice
 
@@ -227,10 +234,11 @@ so Claude gets the whole screen. A small bar of buttons — dictate, switch proj
 terminal, fix the layout — floats over it; long-press any of them to move the bar
 to the other edge.
 
-Claude opens **in the editor area**, full width, as the tmux session described
-above — so it is the real CLI, and it is the same session on every device you open
-it from. The Claude Code extension is still installed and its panel is one setting
-away (`claudeMobile.claudeSurface: panel`).
+Claude opens **in the editor area**, full width, rather than in a side bar — on a
+phone those are narrow strips that wrap text to a letter per line. It is the
+official extension's panel, sharing one conversation across your devices through
+the broker described above. A terminal session is one setting away
+(`claudeMobile.claudeSurface: tmux`).
 
 The terminal button opens a second, plain shell, also in the editor area, and
 pressing it again hands the window back to Claude — with tabs hidden, the two just
@@ -341,7 +349,7 @@ rules that matter, and the gotchas that have burned people. Contributions welcom
 — see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ```bash
-npm test                              # auth + client + overlay + dictation + projects
+npm test                              # auth + client + overlay + dictation + projects + broker
 cd infra && npx cdk synth --quiet     # stack compiles
 ```
 

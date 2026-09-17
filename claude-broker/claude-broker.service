@@ -1,0 +1,35 @@
+[Unit]
+# Owns the `claude` process behind the editor's Claude Code panel, so the same
+# conversation can be driven from a phone and a laptop. See broker.js.
+#
+# It has to be its own unit, for the same reason claude-tmux.service does: the
+# conversations are children of this process, so they live in this unit's cgroup.
+# Anything spawned from code-server.service instead dies with it, and every
+# deploy restarts code-server. That failure was observed on 2026-09-17 — a task
+# running under a tmux server that had been started from an editor terminal died
+# mid-deploy, which is precisely what the tmux surface existed to prevent.
+#
+# Deliberately NOT ordered against code-server: the panel connects when a page
+# loads, not when the editor starts, and the wrapper falls back to running Claude
+# directly if this is not up. So a missing broker costs the shared-session
+# property and nothing else — no reason to hold the editor back for it.
+Description=Claude broker (one claude process per conversation, shared by devices)
+After=network.target workspace.mount
+Requires=workspace.mount
+
+[Service]
+Type=simple
+User=coder
+Environment=HOME=/home/coder
+WorkingDirectory=/opt/claude-web/claude-broker
+ExecStart=/usr/bin/node broker.js
+# systemd creates and owns /run/claude-broker, and removes it on stop — which is
+# what keeps a stale socket from making every page fall back silently. 0700
+# because anything that can write to the socket can run `claude` as this user.
+RuntimeDirectory=claude-broker
+RuntimeDirectoryMode=0700
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

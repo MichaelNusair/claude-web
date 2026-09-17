@@ -84,6 +84,17 @@ chat-service/            The chat backend + PWA client. The security boundary.
                          so the refusals are what this tests hardest.
   public/                index.html, app.js, style.css, login.html.
 
+claude-broker/           Keeps the editor panel's `claude` alive and shared
+                         between devices. No dependencies beyond node.
+  broker.js              The daemon: one process per (cwd, session id), byte
+                         transparent, replays the stream to a joining page.
+  wrapper.js             What the extension launches instead of `claude`. Every
+                         failure path execs the real binary — keep it that way.
+  broker-test.js         Boots the real broker over a real socket against a fake
+                         CLI. Proves sharing, and proves the fallback.
+  install.sh             Installs the unit and the editor setting. In the payload
+                         because a bootstrap.sh edit cannot reach a live box.
+
 infra/                   AWS CDK (JavaScript, not TypeScript).
   config.js              Config loading + validation. Single source of truth.
   print-config.js        Emits shell assignments for deploy.sh / migrate.sh.
@@ -221,15 +232,25 @@ smaller `instanceType` works but `whisper.cpp` transcription gets slower. Do not
 suggest removing the ALB — it terminates TLS, and the security model depends on
 the instance being unreachable except through it.
 
-## The three surfaces, and which one persists
+## The surfaces, and which one persists
 
 Know this before answering any question about long-running work:
 
 | Surface | Who owns `claude` | Survives closing the app | Shared live across devices |
 | --- | --- | --- | --- |
 | Chat (`/`) | `claude-chat` systemd service | yes | yes — `getBySession` hands both sockets the same process |
-| `cc` / tmux — **the editor's default** | the tmux server, owned by `claude-tmux.service` | yes | yes — multiple tmux clients, one session |
-| VS Code extension panel | extension host, tied to the browser | **no — dies in ~5s** | **no — it forks** |
+| Extension panel — **the editor's default** | `claude-broker.service`, reached through the wrapper | yes | yes — one process per conversation, every page attached |
+| Extension panel, broker stopped | extension host, tied to the browser | **no — dies in ~5s** | **no — it forks** |
+| `cc` / tmux | the tmux server, owned by `claude-tmux.service` | yes | yes — multiple tmux clients, one session |
+
+The middle two rows are the same panel. Which one you get depends on whether
+`claude-broker.service` is running and `claudeCode.claudeProcessWrapper` points at
+it, so when someone reports the panel forking, that is the first thing to check:
+
+```bash
+systemctl status claude-broker
+grep claudeProcessWrapper /workspace/code-server-data/User/settings.json
+```
 
 That 5 seconds is measured, not guessed: a probe on a live box recorded
 `exthost` and `claude` both `DEAD` five seconds after `ws_conns` hit 0, mid-turn.
@@ -249,12 +270,44 @@ own `CLAUDE_PID` changed from 315100 to 319986 mid-conversation while the phone'
 315100 was still running. What the user sees is "I opened my laptop and Claude was
 idle, and now they're telling different stories".
 
-This is why `claudeMobile.claudeSurface` defaults to `tmux`
-([`mobile-extension/extension.js`](mobile-extension/extension.js)): the editor's
-Claude button opens an editor terminal running `cc <folder>`, not the panel. One
-tmux session per project, so every device attaches to the same process instead of
-forking it. Verified on the box: two simultaneous clients, one session, one
-`claude`, and the session still alive after both detached.
+**The fix is outside the extension host, because nothing can fix it inside one.**
+No supported API shares an extension host between two page loads, so the panel
+cannot solve this itself and neither can this repo by patching it. What it can do
+is take the process out of the extension host altogether:
+[`claude-broker/`](claude-broker/) is a daemon owning one `claude` per
+conversation, and the extension's own
+`claudeCode.claudeProcessWrapper` setting — "Executable path used to launch the
+Claude process" — points the panel at
+[`claude-broker/wrapper.js`](claude-broker/wrapper.js) instead of the binary. The
+wrapper hands its stdio to the broker and every page attaches to the same process.
+The panel is not modified, not patched, and does not know: it sees an ordinary
+stream-json conversation on stdio.
+
+The contract is that the wrapper is exec'd with the real claude path as its first
+argument, then the extension's own args — confirmed in the shipped bundle, not
+assumed:
+
+```js
+if (J) return { pathToClaudeCodeExecutable: J, executableArgs: X ? [X] : [], env: Q, viaProcessWrapper: !0 };
+```
+
+so `process.argv[2]` is the binary and `slice(3)` is everything the extension
+wanted. Setting a wrapper also makes the extension resolve permission mode itself
+(`resolvePermissionModeInCli: !W0("claudeProcessWrapper")`), which is why the
+wrapper must pass the args through untouched.
+
+**The wrapper fails safe, and every change to it must keep doing so.** It sits in
+front of the only interface the user has, so no broker, a stale socket, a refused
+join, or a malformed handshake all fall through to exec'ing the real binary — the
+panel forks again, which is merely the old behaviour, rather than failing to start.
+That is what makes `systemctl stop claude-broker` a complete rollback with no
+settings change and no deploy. `claude-broker/broker-test.js` asserts both halves
+and `deploy.sh` will not deploy without it.
+
+`cc` / tmux stays as the surface that depends on nothing — no broker, no wrapper,
+no extension setting — and is the real CLI rather than a UI over it. Verified on
+the box: two simultaneous clients, one session, one `claude`, and the session still
+alive after both detached.
 
 **A tmux session is only as durable as the cgroup its server is in.** Sessions are
 forked by the tmux server, so they inherit *its* cgroup, and a server first
@@ -268,10 +321,12 @@ the next `cc` quietly starts a replacement in the wrong cgroup and durability is
 lost with nothing to see. `cc` warns when it finds a server outside that unit.
 Never `systemctl restart claude-tmux` from a deploy path; `enable --now` only.
 
-Do not "simplify" this back to opening the panel by default. The fork is not a bug
-in this repo and cannot be fixed here — the conversation lives inside the
-extension host, and nothing supported shares one extension host between two page
-loads. `panel` remains available for its richer UI on a single device.
+**The same cgroup lesson applies to the broker**, and for the same reason: the
+conversations are its children, so they live in `claude-broker.service`'s cgroup.
+Never `systemctl restart claude-broker` from a deploy path — `enable --now` only,
+exactly as with `claude-tmux`. A restart ends every live conversation, which is the
+failure the service exists to prevent, so a change to `broker.js` lands at the next
+deliberate restart, chosen at a moment when losing the running work is acceptable.
 
 ## Gotchas that look like bugs
 
@@ -339,17 +394,20 @@ Things that have burned people, in this codebase specifically:
   code-server keeps shells alive across a page reload while the extension host is
   destroyed: creating per press would leave a pile of orphaned shells. A shell in a
   tab still dies with the tab, so long work belongs in `cc`/tmux, not here.
-  Since Claude itself is now an editor terminal by default, this button asks *which*
-  terminal is in front rather than whether one is — `isClaudeTerminalTab` — because
-  treating Claude as "the terminal" made the button bounce off it and never open a
-  shell.
+  On the `tmux` surface Claude is itself an editor terminal, so this button asks
+  *which* terminal is in front rather than whether one is —
+  `isClaudeTerminalTab` — because treating Claude as "the terminal" made the button
+  bounce off it and never open a shell. That test stays regardless of the default
+  surface; it costs nothing on `panel` and is load-bearing on `tmux`.
 - **The workbench reloads itself, and a reload of `/editor/` destroys work.** Its
   lifecycle service calls `location.reload()` when the browser restores the page
   from the back/forward cache — on a phone that is every app switch — and a reload
-  restarts the extension host. On the `panel` surface that is where the Claude
-  conversation lives, so a reload forks it; the `tmux` default is what takes the
-  conversation out of the blast radius, since the tmux server and the pty both
-  outlive the page. Everything else below still applies — a reload still discards
+  restarts the extension host. The extension host is where the panel used to keep
+  the conversation, which is what made a reload fork it; the broker (and, on the
+  other surface, the tmux server) is what takes the process out of the blast radius,
+  since both outlive the page. A reload is now survivable rather than free:
+  the panel rebuilds its view from the stream the broker replays.
+  Everything else below still applies — a reload still discards
   typed text and still rearranges the layout. So
   treat *every* extra page load on that surface as damage: it is measurable (the
   remote agent log shows a fresh `ManagementConnection` and "Extension Host Process
@@ -458,6 +516,28 @@ Things that have burned people, in this codebase specifically:
 - **The CLI's flags are process arguments**, so model, permission mode and effort
   are fixed for the life of a conversation. Settings changes apply to new chats
   only. This is not a bug to fix.
+- **The broker is byte-transparent, and must stay that way.**
+  `chat-service/session-manager.js` translates stream-json into a small vocabulary
+  for its own UI; `claude-broker/broker.js` deliberately does not, because it is
+  standing in for a pipe in front of a UI it does not own. It parses exactly one
+  thing — the `system` event carrying `session_id`, so a session opened with no id
+  can be re-keyed and found by the next device resuming that id. Everything else is
+  forwarded verbatim. Interpreting more would couple it to a vendor bundle that
+  updates on its own schedule.
+- **Replay is all-or-nothing, so it is capped.** A page joining mid-conversation is
+  sent every byte written so far, because a partial stream cannot be rendered. Past
+  64 MB the session stops accepting new pages instead of handing one a broken
+  stream — and a refused page just gets its own process, which is only the old
+  behaviour. Do not "fix" the cap by replaying a suffix.
+- **A deploy cannot apply an `infra/userdata/bootstrap.sh` edit to a running
+  instance.** cloud-init runs `scripts-user` once per instance *ever*
+  (`/var/lib/cloud/instances/<id>/sem/config_scripts_user`), so `/opt/bootstrap.sh`
+  stays whatever first boot wrote, and the deploy's reprovision step re-runs that
+  stale copy. A stack update usually stop/starts the instance rather than replacing
+  it — verified on 2026-09-17: same instance id, new boot time, `/opt/bootstrap.sh`
+  two days old, zsh and `claude-tmux.service` simply absent after a "successful"
+  deploy. Anything that must actually land goes in the payload, which is why
+  `claude-broker/install.sh` exists and why `cc` is installed from there too.
 
 ## Things not to do
 
@@ -477,11 +557,16 @@ Things that have burned people, in this codebase specifically:
 There is no staging environment, so local verification is what you have:
 
 ```bash
-npm test                                   # auth + client + project lifecycle
+npm test                                   # auth + client + project lifecycle + broker
 cd infra && npx cdk synth --quiet          # stack compiles
-bash -n deploy.sh migrate.sh infra/userdata/bootstrap.sh
+bash -n deploy.sh migrate.sh infra/userdata/bootstrap.sh claude-broker/install.sh
 node --check chat-service/server.js
 ```
+
+One caveat for the broker: `npm test` proves it shares a process and falls back
+safely, using a fake CLI over a real socket. It cannot prove the *panel* renders a
+replayed stream correctly, because that is the vendor's UI reacting to bytes it
+normally sees live. Only two real devices show that.
 
 `nginx -t` cannot run locally unless nginx is installed; `deploy.sh` runs it on
 the instance and fails the deploy if the config is invalid.
