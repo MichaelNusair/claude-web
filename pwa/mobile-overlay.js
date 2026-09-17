@@ -357,6 +357,9 @@
   function closeSheet() {
     sheet.classList.remove('cmo-open');
     stopRecognition();
+    // Dismissing the status sheet is how you stop it following the conversation
+    // and reading out what arrives; see followStatusSheet.
+    stopSheetPoll();
   }
   /** Close after `ms`, unless a different sheet has been opened by then. */
   function closeSheetLater(ms) {
@@ -1397,12 +1400,46 @@
    * enough to run while the tab is watched and stopped the moment it is not.
    */
   const STATUS_HEARTBEAT_MS = 15000;
+  /*
+   * And a fast one, but only while the status sheet is open in front of someone.
+   *
+   * The sheet answers "what did Claude last say", and that answer changes
+   * underneath it: a turn ends, another message is written mid-turn, someone
+   * types into the panel. Opened once and left alone it kept showing the snapshot
+   * from the tap that opened it, and the only way to see anything newer was to
+   * keep tapping Refresh — which is the same waiting-and-checking this whole
+   * section exists to remove.
+   *
+   * Five seconds rather than the heartbeat's fifteen, because a sheet on screen is
+   * the one moment where a stale line is actively being read as the current one.
+   * It is bounded three ways: only while that sheet is the sheet on screen, only
+   * while the tab is visible, and only for as long as a working turn would be
+   * polled for anyway.
+   */
+  const SHEET_POLL_MS = 5000;
+  // A sheet left open in a pocket must not poll for the rest of the day. Same
+  // limit as a working turn, and Refresh — or reopening it — starts it again.
+  const SHEET_FOLLOW_LIMIT = STATUS_POLL_LIMIT;
 
   let status = null;
   let statusPollTimer = null;
   let statusHeartbeat = null;
   let statusPollingSince = 0;
   let chipTimer = null;
+  let sheetPollTimer = null;
+  let sheetFollowUntil = 0;
+  /*
+   * What the open sheet is showing, which is what "something changed" is measured
+   * against. It lives with the sheet rather than with the last fetch, because the
+   * fetch that finds the change is usually not the sheet's own: a working turn is
+   * already polled every four seconds, the heartbeat runs every fifteen, and the
+   * window regaining focus asks as well. Whichever of them notices, the sheet
+   * catches up.
+   */
+  let sheetShown = null;
+  // Which sheet the status sheet is. Opening any other one (dictation, layout)
+  // bumps the counter, which ends the following without needing to be told.
+  let statusSheetGeneration = -1;
   /*
    * A conversation the user picked out of the list, which then overrides the
    * guess. Null means "whichever one you think I am in" — see guessConversation in
@@ -1531,6 +1568,16 @@
       stopStatusPoll();
       statusPollTimer = setTimeout(pollStatus, STATUS_POLL_MS);
     }
+    /*
+     * Whichever background ask found it, an open sheet is showing this answer and
+     * has to catch up. `silent` is exactly the right condition: it means nobody
+     * tapped for this — the heartbeat, the working poll, the sheet's own poll,
+     * coming back to the window. The tapped paths redraw the sheet themselves,
+     * through openStatus, and deliberately do not read anything out: a message
+     * that appears in the same moment you asked for it is on screen, being looked
+     * at, which is not the case this speaks for.
+     */
+    if (silent) syncStatusSheet();
     return next;
   }
 
@@ -1568,8 +1615,96 @@
     }, STATUS_HEARTBEAT_MS);
   }
 
+  // ------------------------------------------------- following the open sheet
+  /*
+   * Keep the sheet current while it is open, and read out what arrives.
+   *
+   * The reading is the part that is deliberately unlike the Read aloud button
+   * below, which only ever speaks when pressed. Speech that starts on its own is a
+   * phone talking in a meeting, so this is fenced in by the sheet: it can only
+   * happen while the status sheet is the sheet on screen, which means a tap opened
+   * it seconds ago and one tap beside it ends it. Stop silences the message being
+   * read; closing the sheet stops anything further being read at all.
+   *
+   * Two things deliberately do not speak. A message that has not changed — the
+   * poll finding the same answer again is not news — and a change of
+   * *conversation*, because following another one is a request to look at it, not
+   * to be read its history, and the sheet is already describing it.
+   *
+   * One platform note. iOS refuses speech that did not begin inside a gesture, and
+   * a poll five seconds later is not inside one; once Read aloud has been pressed
+   * on the page the refusal lifts for the rest of it. Android — the surface this
+   * was asked for — has no such rule and reads the first change it sees.
+   */
+
+  /** Is the status sheet the sheet on screen? */
+  function statusSheetOpen() {
+    return sheet.classList.contains('cmo-open') && sheetGeneration === statusSheetGeneration;
+  }
+
+  function stopSheetPoll() {
+    if (sheetPollTimer) clearTimeout(sheetPollTimer);
+    sheetPollTimer = null;
+  }
+
+  /** Arm the next look, if there is still a sheet to look on behalf of. */
+  function followStatusSheet() {
+    stopSheetPoll();
+    if (!statusSheetOpen()) return;
+    if (Date.now() >= sheetFollowUntil) return;
+    sheetPollTimer = setTimeout(pollStatusSheet, SHEET_POLL_MS);
+  }
+
+  async function pollStatusSheet() {
+    sheetPollTimer = null;
+    if (!statusSheetOpen()) return;
+    /*
+     * A locked phone is a hidden tab, and nothing on a hidden sheet is being
+     * misread, so this stops asking and stays armed: coming back re-asks anyway
+     * (see the visibilitychange handler) and the sheet catches up then.
+     */
+    if (document.visibilityState !== 'visible') {
+      followStatusSheet();
+      return;
+    }
+    if (Date.now() >= sheetFollowUntil) {
+      // Redrawn rather than just going still, because the sheet says in words
+      // that it is refreshing itself, and that has just stopped being true.
+      openStatus({ auto: true });
+      return;
+    }
+    await refreshStatus({ silent: true });
+    followStatusSheet();
+  }
+
+  /**
+   * Put a changed answer on the open sheet, and say the new message out loud.
+   *
+   * Called from `refreshStatus`, so it runs for every fetch however it was
+   * started. Redrawing is `openStatus` again: it is cheap, it is the one place
+   * that knows how this sheet looks, and it re-seeds the baseline below.
+   */
+  function syncStatusSheet() {
+    if (!statusSheetOpen() || !status) return;
+    const before = sheetShown;
+    const text = status.last?.text || '';
+    if (before && before.state === status.state && before.text === text) return;
+
+    const said =
+      Boolean(text) && Boolean(before) && text !== before.text && status.sessionId === before.sessionId;
+    openStatus({ auto: true });
+    // After the redraw, so the button it draws says Stop rather than Read aloud.
+    if (said) speak(text, status.state === 'working' ? 'Still working.' : 'Claude finished.');
+  }
+
   /** The whole of what Claude last said, for when one line was not enough. */
-  function openStatus() {
+  function openStatus({ auto = false } = {}) {
+    /*
+     * A tap is a decision to watch this conversation for a while. A redraw from
+     * the poll is not, and must not extend its own licence to keep polling —
+     * otherwise the limit above can never be reached.
+     */
+    if (!auto) sheetFollowUntil = Date.now() + SHEET_FOLLOW_LIMIT;
     const s = status;
     if (!s) {
       openSheet(`
@@ -1610,6 +1745,7 @@
           ? 'The panel is still loading the history; the end of it has not been written yet.'
           : 'This is the last thing Claude said. The panel is still rendering the history above it.'
       }${size ? ` This conversation is ${size} on disk, which is what the panel is reading.` : ''}</p>
+      <p class="cmo-hint" id="cmo-status-follow"></p>
       ${others.length > 1 ? `
         <p class="cmo-hint" id="cmo-convo-head"></p>
         <div id="cmo-convos" class="cmo-convos"></div>` : ''}`);
@@ -1741,6 +1877,27 @@
         }
       });
     }
+
+    /*
+     * Say, in the sheet, that the sheet is watching — and stop saying it the
+     * moment it isn't. A sheet that quietly refreshes itself is indistinguishable
+     * from one that does not, right up to the point where a phone starts talking.
+     */
+    const following = Date.now() < sheetFollowUntil;
+    panel.querySelector('#cmo-status-follow').textContent = !following
+      ? 'This has stopped refreshing itself — tap Refresh, or reopen it, to follow along again.'
+      : speechAvailable()
+        ? 'Refreshing every 5 seconds while this is open, and reading out anything new that Claude says. Stop silences the message being read; closing this stops it following.'
+        : 'Refreshing every 5 seconds while this is open.';
+
+    /*
+     * The baseline for "something changed", seeded from what was just drawn — so
+     * the message already on screen is never read out as if it had just arrived —
+     * and the timer that does the looking.
+     */
+    sheetShown = { state: s.state, text: s.last?.text || '', sessionId: s.sessionId };
+    statusSheetGeneration = sheetGeneration;
+    followStatusSheet();
   }
 
   // ------------------------------------------------------- reading it aloud
@@ -1753,11 +1910,16 @@
    * has been running for an hour. The final message of a turn is the one worth
    * hearing: it is where the summary of everything that just happened is.
    *
-   * It is a button, deliberately, and not something that fires when a turn ends.
-   * A turn can finish while you are mid-sentence with someone, in another app, or
-   * twenty minutes after you stopped waiting for it — and a phone that starts
-   * talking by itself in any of those is worse than one that stays quiet. So
-   * nothing here has a timer or a subscription: it speaks when tapped.
+   * It is a button, deliberately, and not something that fires whenever a turn
+   * ends. A turn can finish while you are mid-sentence with someone, in another
+   * app, or twenty minutes after you stopped waiting for it — and a phone that
+   * starts talking by itself in any of those is worse than one that stays quiet.
+   *
+   * There is exactly one exception, and the point of it is that it cannot be any
+   * of those cases: while the status sheet is open, a message arriving is read out
+   * as it lands. That sheet is only open because it was tapped open, it is on
+   * screen while it happens, and dismissing it ends it. See followStatusSheet —
+   * everything here is still driven from a tap, one way or another.
    *
    * This cannot be done from the extension, and that is not a limitation of this
    * repo. The panel is a proprietary webview, and the extension host is a node

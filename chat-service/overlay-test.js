@@ -778,6 +778,13 @@ const utterances = [];
 const langs = [];
 let cancels = 0;
 let speechGeneration = 0;
+/*
+ * How long a piece takes to be spoken. Zero — the next turn of the loop — for
+ * everything that only cares about the order pieces arrive in. The section on
+ * following the sheet raises it, because interrupting a message that has already
+ * finished proves nothing about interrupting one.
+ */
+let speechMs = 0;
 
 class FakeUtterance {
   constructor(text) {
@@ -796,7 +803,7 @@ w.speechSynthesis = {
     // Cancelled utterances never report `end`; that is what makes Stop stop.
     setTimeout(() => {
       if (generation === speechGeneration && utterance.onend) utterance.onend();
-    }, 0);
+    }, speechMs);
   },
   cancel() {
     cancels += 1;
@@ -1091,6 +1098,219 @@ ok(
   'the cut landed mid-sentence instead of on a full stop',
   /end of it\. That is as far as I will read/.test(essayHeard),
 );
+
+// --------------------------------------------- following the sheet while it is open
+/*
+ * The sheet answers a question whose answer changes while it is on screen: a turn
+ * ends, another message is written mid-turn, someone types into the panel. Left
+ * alone it kept showing the snapshot from the tap that opened it, and the way to
+ * see anything newer was to keep tapping Refresh. So while it is open it asks
+ * again every five seconds, and reads out what it finds.
+ *
+ * Reading out is the part that has to be fenced in rather than merely working:
+ * every other utterance in this file starts inside a tap, and these do not. The
+ * fence is the sheet — open only because it was just tapped open, on screen while
+ * it happens, and dismissing it ends it — so the checks below are mostly about
+ * what does *not* speak: an unchanged message, a message that was already there
+ * when the sheet opened, and anything at all once the sheet is gone.
+ *
+ * Everything on a timer in the overlay is gated on the tab being visible, and
+ * jsdom reports `prerender`, so nothing above this line has ever run one. It is
+ * overridden here rather than at the top deliberately: it also releases the
+ * fifteen-second heartbeat, which would otherwise turn up inside the counts below.
+ */
+Object.defineProperty(doc, 'visibilityState', { configurable: true, get: () => 'visible' });
+
+// Read out of the overlay rather than restated, because the number is the
+// requirement: five seconds is what was asked for, and the waits below are timed
+// against whatever the file actually says.
+const numberOf = (name) => Number(new RegExp(`const ${name} = (\\d+)`).exec(overlayJs)?.[1]);
+const SHEET_POLL_MS = numberOf('SHEET_POLL_MS');
+const HEARTBEAT_MS = numberOf('STATUS_HEARTBEAT_MS');
+ok('the open sheet no longer refreshes every five seconds, which is what was asked for', SHEET_POLL_MS === 5000);
+
+/*
+ * Give each piece a duration for the rest of the file, and watch for the reading
+ * to *start* rather than checking whether it is still going after a fixed wait.
+ * A reading that began and finished inside one `settle` looks identical to one
+ * that never began, and this box runs several of these suites at once.
+ */
+speechMs = 40;
+const rise = async (limit = 3000) => {
+  const until = Date.now() + limit;
+  while (!barBtn.classList.contains('cmo-speaking') && Date.now() < until) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  return barBtn.classList.contains('cmo-speaking');
+};
+
+const answer = (text) => ({
+  ...statusReply,
+  state: 'idle',
+  clients: 0,
+  last: { role: 'assistant', text, at: new Date().toISOString() },
+});
+
+const firstAnswer = 'First answer. The migration script is written.';
+statusReply = answer(firstAnswer);
+utterances.length = 0;
+await tapStatus();
+ok(
+  'opening the sheet read out the message that was already on it — every tap on the ' +
+    'bar would start the phone talking',
+  utterances.length === 0,
+);
+
+const followHint = () => doc.getElementById('cmo-status-follow')?.textContent ?? '';
+ok(
+  'the sheet refreshes itself and says nothing about it, so a phone that starts ' +
+    'talking has nothing on screen explaining why',
+  /every 5 seconds/.test(followHint()),
+);
+ok('the sheet does not say that a new message will be read aloud', /read/i.test(followHint()));
+ok('the sheet does not say how to stop it', /Stop/.test(followHint()));
+
+/*
+ * A change found by a background ask. The window regaining focus is one of them,
+ * and it takes exactly the path the five-second poll takes — a silent
+ * `refreshStatus` — so it stands in for the timer in every check but the cadence
+ * one below, which is the only place worth spending real seconds on.
+ */
+const secondAnswer = 'Second answer. The migration is done, and the tests pass.';
+statusReply = answer(secondAnswer);
+w.dispatchEvent(new w.Event('focus'));
+const startedOnItsOwn = await rise();
+await drain();
+ok(
+  'a message that arrived while the sheet was open never reached it — the sheet is ' +
+    'still showing the answer from the tap that opened it',
+  doc.getElementById('cmo-status-said')?.textContent === secondAnswer,
+);
+ok('the message that arrived was not read out', /migration is done/.test(utterances.join(' ')));
+ok(
+  'a voice that started on its own did not open with why it is talking',
+  /^Claude finished\./.test(utterances[0] || ''),
+);
+ok(
+  'the bar offers no Stop for a reading nobody asked for, which is the one that ' +
+    'most needs one',
+  startedOnItsOwn,
+);
+
+utterances.length = 0;
+w.dispatchEvent(new w.Event('focus'));
+await settle();
+ok(
+  'the same message was read out again on the next ask — a sheet left open would ' +
+    'repeat it every five seconds',
+  utterances.length === 0,
+);
+
+/*
+ * The cadence itself, which is the one thing here that costs real seconds to
+ * prove: nothing is touched, and five seconds later the sheet has asked again and
+ * read out what came back.
+ *
+ * The heartbeat is the only other thing that asks unprompted — every fifteen
+ * seconds since the page loaded — so the window is nudged clear of it. Otherwise a
+ * coincidence and a poll that is really there look the same from here.
+ */
+const loadedAt = loads()[0].t;
+const untilHeartbeat = () => HEARTBEAT_MS - ((Date.now() - loadedAt) % HEARTBEAT_MS);
+if (untilHeartbeat() < SHEET_POLL_MS + 900) {
+  await new Promise((resolve) => setTimeout(resolve, untilHeartbeat() + 300));
+}
+
+const thirdAnswer = 'Third answer. Deployed, and the box is green.';
+statusReply = answer(thirdAnswer);
+utterances.length = 0;
+const asksBefore = statusCalls.length;
+await new Promise((resolve) => setTimeout(resolve, SHEET_POLL_MS + 800));
+ok(
+  'the open sheet never asked again on its own, so it goes on showing the answer ' +
+    'from the tap that opened it',
+  statusCalls.length > asksBefore,
+);
+ok(
+  'the poll found a newer message and did not put it on the sheet',
+  doc.getElementById('cmo-status-said')?.textContent === thirdAnswer,
+);
+ok('the poll found a newer message and did not read it out', /box is green/.test(utterances.join(' ')));
+
+/*
+ * The newest message is the one wanted, so one that lands while the previous is
+ * still being read replaces it instead of queueing behind it — a phone reading two
+ * answers in a row, oldest first, is worse than one that reads neither.
+ */
+const longAnswer = 'This is one sentence of a long answer. '.repeat(30);
+statusReply = answer(longAnswer);
+utterances.length = 0;
+w.dispatchEvent(new w.Event('focus'));
+// Caught while it is still reading — many pieces at 40 ms each — so the change
+// below lands on a message in flight rather than on one already finished.
+ok('nothing was still being read, so nothing here can show an interruption', await rise());
+
+const newest = 'Newest answer. Ignore everything above this line.';
+statusReply = answer(newest);
+utterances.length = 0;
+w.dispatchEvent(new w.Event('focus'));
+await settle(150);
+const afterInterrupt = utterances.join(' ');
+ok(
+  'a newer message queued behind the one being read instead of replacing it',
+  /Ignore everything above/.test(afterInterrupt) && !/one sentence of a long answer/.test(afterInterrupt),
+);
+await drain();
+
+// A message written mid-turn is not the answer, and being read one that is not the
+// answer without being told is how you end up replying to a turn still running.
+statusReply = { ...answer('Fourth answer. Running the test suite now.'), state: 'working', clients: 1 };
+utterances.length = 0;
+w.dispatchEvent(new w.Event('focus'));
+await settle();
+ok(
+  'a message read out mid-turn did not say the turn is still running',
+  /^Still working\./.test(utterances[0] || ''),
+);
+await drain();
+
+/*
+ * Dismissing the sheet is how you stop it. The voice already reading a message
+ * outlives the sheet on purpose — that is checked further up — but nothing new
+ * starts. This is the worst outcome the feature has: a phone talking about a
+ * conversation with the sheet that explains it gone, and no Stop in sight but the
+ * one on the bar.
+ */
+doc.getElementById('cmo-status-close').dispatchEvent(new w.MouseEvent('click', { bubbles: true }));
+statusReply = answer('Fifth answer, said after the sheet was dismissed.');
+utterances.length = 0;
+w.dispatchEvent(new w.Event('focus'));
+await settle();
+ok('a message that arrived after the sheet was dismissed was read out anyway', utterances.length === 0);
+ok(
+  'the dismissed sheet was redrawn behind the scenes, so reopening it skips past the ' +
+    'message it was showing',
+  !/dismissed/.test(doc.getElementById('cmo-panel')?.textContent ?? ''),
+);
+
+/*
+ * Another sheet in front of it is the same answer. Layout and the project switcher
+ * are one tap from the status sheet and replace it in place, so the conversation it
+ * was following is no longer what anyone is looking at — and a voice reading a
+ * message out under a sheet about something else is the same wrong as reading one
+ * out under a sheet about another conversation, which is checked further up.
+ */
+await tapStatus();
+doc.getElementById('cmo-layout').dispatchEvent(new w.MouseEvent('click', { bubbles: true }));
+statusReply = answer('Sixth answer, said while the Layout sheet was open.');
+utterances.length = 0;
+w.dispatchEvent(new w.Event('focus'));
+await settle();
+ok(
+  'a change was read out under a different sheet, which is describing something else',
+  utterances.length === 0,
+);
+speechMs = 0;
 
 // ------------------------------------------------------------------- results
 if (failures.length) {
