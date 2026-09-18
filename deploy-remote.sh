@@ -149,7 +149,14 @@ printf '  shipping origin/main at %s — %s\n' "$DEPLOYING" "$(git log -1 --form
 # Run Command rather than a session, because it needs no plugin installed locally
 # and because a command that has been *sent* does not depend on this end staying
 # alive to keep running.
+#
+# Output comes back in $SSM_OUT rather than on stdout, and callers must not wrap
+# this in $(...): a command substitution runs in a subshell, so the $SSM_STATUS
+# it sets there is thrown away and the caller reads an empty status. That mistake
+# cost this script its first real deploy — it started one correctly and then
+# announced it could not start it.
 SSM_STATUS=""
+SSM_OUT=""
 ssm_run() {
   local script="$1" cmd_id status=Pending tries=0
   cmd_id="$(aws ssm send-command \
@@ -170,9 +177,9 @@ ssm_run() {
     sleep 2
   done
   SSM_STATUS="$status"
-  aws ssm get-command-invocation --command-id "$cmd_id" \
+  SSM_OUT="$(aws ssm get-command-invocation --command-id "$cmd_id" \
     --instance-id "$CFG_DEPLOY_INSTANCE" --query StandardOutputContent --output text \
-    "${AWS_ARGS[@]}" 2>/dev/null || true
+    "${AWS_ARGS[@]}" 2>/dev/null || true)"
   if [ "$status" != "Success" ]; then
     aws ssm get-command-invocation --command-id "$cmd_id" \
       --instance-id "$CFG_DEPLOY_INSTANCE" --query StandardErrorContent --output text \
@@ -234,7 +241,8 @@ done
 echo "STARTED $(cat {q(pid)})"''')
 PY
 )"
-LAUNCH_OUT="$(ssm_run "$LAUNCH")"
+ssm_run "$LAUNCH"
+LAUNCH_OUT="$SSM_OUT"
 printf '%s\n' "$LAUNCH_OUT" | sed 's/^/  /'
 if [ "$SSM_STATUS" != "Success" ]; then
   echo "Could not start the deploy on $CFG_DEPLOY_INSTANCE ($SSM_STATUS)." >&2
@@ -260,9 +268,10 @@ CODE=""
 WAITED=0
 LIMIT=3600
 while [ "$WAITED" -lt "$LIMIT" ]; do
-  OUT="$(ssm_run "printf 'CWSTATUS:%s\n' \"\$(tr -dc 0-9 < $STATUS_FILE 2>/dev/null)\"
+  ssm_run "printf 'CWSTATUS:%s\n' \"\$(tr -dc 0-9 < $STATUS_FILE 2>/dev/null)\"
 printf 'CWLINES:%s\n' \"\$(wc -l < $LOG_FILE 2>/dev/null || echo 0)\"
-tail -n +$((SEEN + 1)) $LOG_FILE 2>/dev/null || true")"
+tail -n +$((SEEN + 1)) $LOG_FILE 2>/dev/null || true"
+  OUT="$SSM_OUT"
   CODE="$(printf '%s\n' "$OUT" | sed -n 's/^CWSTATUS:\([0-9]\+\)$/\1/p' | head -1)"
   TOTAL="$(printf '%s\n' "$OUT" | sed -n 's/^CWLINES:\([0-9]\+\)$/\1/p' | head -1)"
   BODY="$(printf '%s\n' "$OUT" | sed '1,2d')"
