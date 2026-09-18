@@ -34,6 +34,7 @@ import {
   FALLBACK_VOICES,
   FIRST_SEGMENT_CHARS,
   SEGMENT_CHARS,
+  SILENT_WAV,
 } from './speak.js';
 
 let checks = 0;
@@ -365,6 +366,30 @@ section('What the phone is told:');
   ok(
     FALLBACK_VOICES.every((v) => v.id && v.gender && v.language),
     'every fallback voice has the gender and language the picker shows',
+  );
+}
+
+// --------------------------------------------------------------------------
+/*
+ * The silence the tap unlocks the audio element with.
+ *
+ * Small enough to look unimportant, and it is the whole feature on iOS: an element
+ * that was not played inside the gesture may not be played from a callback
+ * afterwards, so if this will not play there is no server voice on a phone at all —
+ * only the robotic one, with nothing reported anywhere. Checked as audio rather
+ * than as a length, because a truncated header is the way it would break.
+ */
+{
+  const riff = SILENT_WAV.subarray(0, 4).toString('ascii');
+  const wave = SILENT_WAV.subarray(8, 12).toString('ascii');
+  ok(riff === 'RIFF' && wave === 'WAVE', 'the unlock file is a WAV', `got ${riff}/${wave}`);
+  ok(
+    SILENT_WAV.readUInt32LE(4) === SILENT_WAV.length - 8,
+    'its declared size matches its actual size, so no player has to guess',
+  );
+  ok(
+    SILENT_WAV.subarray(36, 40).toString('ascii') === 'data' && SILENT_WAV.readUInt32LE(40) === 0,
+    'and it is silence: a data chunk with no samples in it',
   );
 }
 

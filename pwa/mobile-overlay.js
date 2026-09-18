@@ -2890,8 +2890,25 @@
    * life of the page, and a silent WAV to unlock it with. Never replaced: a new
    * element would be locked again, and the next read would be silence.
    */
-  const SILENCE =
-    'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YQAAAAA=';
+  /*
+   * Every audio URL on this surface is same-origin, and that is a constraint, not
+   * a preference.
+   *
+   * This overlay is injected into code-server's workbench, and that page carries
+   * code-server's own Content-Security-Policy. It says `media-src 'self'`. Neither
+   * a `data:` URL nor a `blob:` one is `'self'`, so both are refused by the browser
+   * the moment they are handed to the element — after the audio has been fetched,
+   * which is what made this so confusing to find: the network showed the mp3
+   * arriving and the phone still read the message in the robotic voice, because a
+   * blocked source fires `error` and `readTrouble` falls back.
+   *
+   * So the silence comes from `/api/speak/silence` and the segments are played
+   * straight from `/api/speak`. The policy belongs to code-server, ships in its
+   * server bundle with per-build nonces, and would be undone by the next upgrade if
+   * it were patched — so this side is the one that has to hold. `overlay-test.js`
+   * asserts that nothing else ever reaches the element.
+   */
+  const SILENCE = '/api/speak/silence';
   let audioEl = null;
 
   function unlockAudio() {
@@ -3202,23 +3219,9 @@
   let read = null;
   let readGeneration = 0;
 
-  function releaseSegment(index) {
-    const url = read?.urls.get(index);
-    if (!url) return;
-    read.urls.delete(index);
-    try {
-      window.URL.revokeObjectURL(url);
-    } catch {
-      /* nothing to release, or a browser that never made one */
-    }
-  }
-
   function stopServerRead() {
     readGeneration += 1;
-    if (read) {
-      for (const index of [...read.urls.keys()]) releaseSegment(index);
-      read = null;
-    }
+    read = null;
     if (!audioEl) return;
     audioEl.onended = null;
     audioEl.onerror = null;
@@ -3260,24 +3263,29 @@
     if (!read || index < 0 || index >= read.total) return null;
     const already = read.fetching.get(index);
     if (already) return already;
-    const pending = fetch(`/api/speak?id=${encodeURIComponent(read.id)}&segment=${index}`)
-      .then(async (res) => {
-        if (!res.ok) throw new Error(await refusalReason(res));
-        const blob = await res.blob();
-        const url = window.URL.createObjectURL(blob);
-        // Stop happened while this was in flight: hand back nothing, and do not
-        // leak the URL that was just created for it.
-        if (generation !== readGeneration || !read) {
-          try {
-            window.URL.revokeObjectURL(url);
-          } catch {
-            /* as above */
-          }
-          return null;
-        }
-        read.urls.set(index, url);
-        return url;
-      });
+    const url = `/api/speak?id=${encodeURIComponent(read.id)}&segment=${index}`;
+    /*
+     * Fetched here and then played from the same URL, rather than handed to the
+     * element unseen.
+     *
+     * The element cannot report *why* a source failed — it fires `error` and says
+     * nothing — and the server's refusals are sentences worth repeating: a lapsed
+     * session, the day's budget, a voice Polly would not speak. This fetch is where
+     * those are read. It is not a wasted round trip: the response is
+     * `Cache-Control: private, max-age=600`, so the element's own request for the
+     * same URL is served from the browser cache, and a miss costs a re-read of
+     * audio the server already has rather than another synthesis.
+     *
+     * It is also what makes the piece *ahead* worth asking for: that request is what
+     * makes Polly build it while this one plays.
+     */
+    const pending = fetch(url).then(async (res) => {
+      if (!res.ok) throw new Error(await refusalReason(res));
+      // Drain it, so it lands in the cache the element is about to read from.
+      await res.blob();
+      if (generation !== readGeneration || !read) return null;
+      return url;
+    });
     read.fetching.set(index, pending);
     return pending;
   }
@@ -3302,7 +3310,6 @@
 
     audioEl.onended = () => {
       if (generation !== readGeneration) return;
-      releaseSegment(index);
       if (read && index + 1 < read.total) {
         playSegment(index + 1, generation);
         return;
@@ -3394,7 +3401,6 @@
           total: prepared.segments,
           voice: prepared.voice,
           text,
-          urls: new Map(),
           fetching: new Map(),
         };
         playSegment(0, generation);

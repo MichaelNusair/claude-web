@@ -24,6 +24,7 @@ import {
   speakSegment,
   speechStatus,
   resetSpeech,
+  SILENT_WAV,
 } from './speak.js';
 import { claudeStatus } from './claude-status.js';
 import { manifestForProject } from './manifest.js';
@@ -494,6 +495,25 @@ const server = http.createServer(async (req, res) => {
       } catch (err) {
         speakRefusal(res, err);
       }
+      return;
+    }
+
+    /*
+     * The silence the tap unlocks the audio element with.
+     *
+     * Served from here, rather than being a `data:` URL in the overlay, because
+     * the overlay runs in code-server's workbench under code-server's own
+     * `media-src 'self'` — which blocks `data:` and `blob:` alike. See SILENT_WAV.
+     *
+     * Immutable: 44 bytes that will never change, asked for on every first tap.
+     */
+    if (pathname === '/api/speak/silence' && req.method === 'GET') {
+      res.writeHead(200, {
+        'Content-Type': 'audio/wav',
+        'Content-Length': SILENT_WAV.length,
+        'Cache-Control': 'private, max-age=86400, immutable',
+      });
+      res.end(SILENT_WAV);
       return;
     }
 

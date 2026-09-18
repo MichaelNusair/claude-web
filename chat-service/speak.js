@@ -116,6 +116,25 @@ export const FALLBACK_VOICES = [
   { id: 'Tiffany', gender: 'Female', language: 'en-US' },
 ];
 
+/**
+ * A silent WAV, served from this origin, for the tap to unlock the audio element
+ * with. 44 bytes: a header describing zero samples.
+ *
+ * It has to come from the server rather than from a `data:` URL in the overlay,
+ * which is what it was at first. The overlay runs inside code-server's workbench,
+ * and that page carries code-server's own Content-Security-Policy — which says
+ * `media-src 'self'`. A `data:` URL is not `'self'`, so the unlock was blocked and
+ * the silent play never happened; on iOS that is the whole feature, because an
+ * element that was not played inside the gesture may not be played afterwards.
+ *
+ * The same rule is why segment audio is played from `/api/speak` directly instead
+ * of from a `blob:` URL. See the audio section of pwa/mobile-overlay.js.
+ */
+export const SILENT_WAV = Buffer.from(
+  'UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YQAAAAA=',
+  'base64',
+);
+
 /** A refusal with an HTTP status on it, so the route can answer honestly. */
 export class SpeakError extends Error {
   constructor(message, status = 500) {

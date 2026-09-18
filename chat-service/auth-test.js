@@ -186,6 +186,11 @@ const guarded = [
   // the id alone, being a hash of text nobody else has, is not a credential.
   ['POST', '/api/speak/prepare'],
   ['GET', '/api/speak?id=0123456789abcdef&segment=0'],
+  // 44 bytes of silence, and no secret in it — but gated with the rest of the
+  // feature rather than opened. It reveals that this is a claude-web box, the
+  // allowlist is the thing this file exists to keep short, and the only caller is
+  // a page that is already signed in.
+  ['GET', '/api/speak/silence'],
   ['POST', '/api/client-error'],
   // The operations surface. `/admin` is the reason this list matters most: it
   // enumerates every process on the box and can signal three of them, so an

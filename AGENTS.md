@@ -1088,7 +1088,21 @@ Things that have burned people, in this codebase specifically:
   network callback for the rest of the page's life. That is why it is created once
   and never replaced, why the sheet, the bar button and the voice picker all unlock
   it on the way past, and why the auto-read of a turn that finishes while the sheet
-  is open works with server audio at all. The split between the two routes is what
+  is open works with server audio at all. **Every audio URL on that element must be
+  same-origin, and this is the one that bit.** The overlay is injected into
+  code-server's workbench, and that page carries code-server's own
+  Content-Security-Policy, which says `media-src 'self'`. A `blob:` URL is not
+  `'self'` and neither is a `data:` one, so the first version of this — segments
+  turned into blobs, unlocked with an inline silent wav — was refused by the browser
+  on every read, and the symptom was that the voice picker worked, the mp3s arrived
+  with a 200, Polly was billed, and every message came out in the robotic voice
+  anyway, because a blocked source raises `error` and the fallback did its job. The
+  policy belongs to code-server, ships in its server bundle with per-build nonces
+  and hashes, and patching it would be undone by the next upgrade, so this side is
+  the side that holds: segments play straight from `/api/speak`, the unlock plays
+  `/api/speak/silence`, and the fake `<audio>` in `overlay-test.js` refuses a
+  `blob:` or `data:` source the way a browser does, so reaching for one fails the
+  suite rather than shipping. The split between the two routes is what
   keeps a read quick and cheap: `prepare` is free — it hashes the text, cuts it into
   segments and hands back an id — and each `GET /api/speak?id=…&segment=n` buys one
   segment, delivered as a complete mp3 with a `Content-Length`, because iOS is
@@ -1105,9 +1119,8 @@ Things that have burned people, in this codebase specifically:
   and the voice carries on afterwards, so at that point the bar holds the only
   control there is. Do not "fix" it back into a plain open-the-sheet button. Stop
   has more to undo than it looks: as well as cancelling `speechSynthesis` it pauses
-  the element, detaches its `src`, revokes the blob URLs and bumps a generation
-  counter — a segment already in flight will still arrive, and it must not be heard
-  after Stop. And it
+  the element, detaches its `src` and bumps a generation counter — a segment already
+  in flight will still arrive, and it must not be heard after Stop. And it
   never speaks over a live microphone — `startDictation` stops it and `speak`
   refuses while the mic button carries `cmo-rec` — because the recognizer would
   otherwise dictate Claude's own reply into the composer and the whisper recorder

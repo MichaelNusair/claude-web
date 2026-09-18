@@ -229,8 +229,9 @@ w.fetch = (url, options = {}) => {
         json: () => Promise.resolve({ error: 'the voice failed' }),
       });
     }
-    // A Blob is opaque here; what matters is that it becomes a URL and that the
-    // URL is handed to the element. `createObjectURL` below turns this into one.
+    // The body is drained and discarded: this fetch is for the status — a refusal is
+    // a sentence worth repeating — and to warm the cache the element then reads the
+    // same URL from. The bytes never pass through the overlay.
     return Promise.resolve({ ok: true, status: 200, blob: () => Promise.resolve({ segment }) });
   }
   if (target.includes('/api/claude-status')) {
@@ -1489,9 +1490,15 @@ speechMs = 0;
  *   silence, and the sheet has to say which voice it ended up using.
  */
 const audioSrcs = [];   // every src handed to the element, in order
-const revoked = [];     // every blob URL released
+/*
+ * Every URL the overlay tried to mint for the element. Has to stay empty — see the
+ * policy note in `play` below.
+ */
+const objectUrls = [];
 let audioElements = 0;  // how many elements were created, ever
 let audioNode = null;   // the element the overlay is holding
+/** Where a piece of the prepared message is fetched from, and played from. */
+const segUrl = (n) => `/api/speak?id=aa11bb22cc33dd44&segment=${n}`;
 
 class FakeAudio {
   constructor() {
@@ -1505,6 +1512,27 @@ class FakeAudio {
   }
   play() {
     audioSrcs.push(this.src);
+    /*
+     * The Content-Security-Policy, enforced here, because this is the layer that
+     * enforces it in a browser and no other layer can see it.
+     *
+     * This overlay is injected into code-server's workbench, and that page carries
+     * code-server's policy: `media-src 'self'`. A `blob:` or `data:` source is not
+     * `'self'`, so the element refuses it and reports an `error` — *after* the audio
+     * has been fetched. That is how this shipped once: the network showed every mp3
+     * arriving with a 200, the server was synthesising and being billed, and the
+     * phone read every message in the robotic voice anyway, because a blocked
+     * source looks exactly like a broken one and the fallback did its job.
+     *
+     * So a fake that plays anything it is given cannot see the only bug this
+     * section has actually had. This one refuses what the browser refuses.
+     */
+    if (/^(blob|data):/i.test(this.src)) {
+      this.paused = true;
+      const blocked = new Error(`media-src 'self' blocked ${this.src}`);
+      if (this.onerror) this.onerror(blocked);
+      return Promise.reject(blocked);
+    }
     this.paused = false;
     return Promise.resolve();
   }
@@ -1521,8 +1549,13 @@ class FakeAudio {
   }
 }
 w.Audio = FakeAudio;
-w.URL.createObjectURL = (blob) => `blob:segment-${blob.segment}`;
-w.URL.revokeObjectURL = (url) => revoked.push(String(url));
+// Left in place so that reaching for them is a recorded failure rather than a
+// TypeError that could be read as this harness being incomplete.
+w.URL.createObjectURL = (blob) => {
+  objectUrls.push(blob);
+  return `blob:segment-${blob?.segment}`;
+};
+w.URL.revokeObjectURL = (url) => objectUrls.push(String(url));
 
 voiceReply = {
   configured: true,
@@ -1596,7 +1629,7 @@ ok(
   'the audio element was not unlocked inside the tap — a silent file has to be played ' +
     'during the gesture, because the real audio does not exist yet and iOS will not ' +
     'play what no gesture started',
-  audioSrcs.length === 1 && audioSrcs[0].startsWith('data:audio/wav'),
+  audioSrcs.length === 1 && audioSrcs[0] === '/api/speak/silence',
 );
 ok(
   'the bar does not show that it is reading until the network answers, so a tap looks ' +
@@ -1632,7 +1665,13 @@ ok(
 );
 ok(
   `the first piece was not played: ${audioSrcs.join(', ')}`,
-  audioSrcs[audioSrcs.length - 1] === 'blob:segment-0',
+  audioSrcs[audioSrcs.length - 1] === segUrl(0),
+);
+ok(
+  'the audio was turned into a blob: URL, which code-server’s `media-src \'self\'` ' +
+    'refuses — the mp3 arrives, the element rejects it, and every message is read in ' +
+    'the robotic voice instead',
+  objectUrls.length === 0,
 );
 
 // ------------------------------------------------------------------- the chain
@@ -1641,18 +1680,12 @@ ok(
     'every read after the first would be silent',
   audioElements === 1,
 );
-revoked.length = 0;
 audioNode.finish();
 await settle();
 ok(
   `the message stopped after its first piece — a phone that says one sentence of a ` +
     `summary reads as one that finished: ${audioSrcs.join(', ')}`,
-  audioSrcs[audioSrcs.length - 1] === 'blob:segment-1',
-);
-ok(
-  'the piece that finished was not released, so a long read holds every file it has ' +
-    'already played',
-  revoked.includes('blob:segment-0'),
+  audioSrcs[audioSrcs.length - 1] === segUrl(1),
 );
 ok(
   `the piece after the one now playing was not fetched: ${segmentCalls.join(', ')}`,
@@ -1670,25 +1703,16 @@ ok(
   !barBtn.classList.contains('cmo-speaking'),
 );
 ok('the sheet button did not go back to Read aloud', speakBtn()?.textContent === 'Read aloud');
-ok(
-  'the last piece was not released at the end of the message',
-  revoked.includes('blob:segment-2'),
-);
 
 // ----------------------------------------------------------------------- stopping
 segmentCalls.length = 0;
 audioSrcs.length = 0;
-revoked.length = 0;
 tapSpeak();
 await settle();
 const playing = audioNode;
 barBtn.dispatchEvent(new w.MouseEvent('click', { bubbles: true }));
 ok('Stop left the audio playing', playing.paused);
 ok('Stop left the source attached, so the browser keeps buffering it', playing.src === '');
-ok(
-  'the audio that had been fetched was not released on Stop',
-  revoked.length > 0,
-);
 const afterStop = audioSrcs.length;
 playing.finish();
 await settle();
