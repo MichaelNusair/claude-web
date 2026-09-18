@@ -377,6 +377,11 @@ is not arbitrary:
   strings for cache-busting. Change one, change both.
 - `/editor/` strips its prefix and uses `proxy_redirect` so code-server's
   root-relative redirects do not bounce the user back to the chat.
+- `/p/<name>/` is that same editor behind a per-project path, and the only regex
+  location in the file — it matches one path segment and nothing below it, so
+  code-server's absolute asset URLs still fall to the catch-all. It exists so a
+  project can be an installable app of its own; see "A window per project, on a
+  phone" for why a path, and not just an `id`, is what that takes.
 
 ### "Make it cheaper"
 
@@ -622,10 +627,45 @@ What *is* per-app is identity. A manifest whose `id` differs describes a distinc
 application even when served from the same URL, and a distinct application on
 Android is a distinct home-screen icon with its own task in the recents switcher.
 So `chat-service/manifest.js` hands out one manifest per project — same origin,
-same code, same login, same push subscription, differing in `id`, `start_url` and
-the name under the icon — and `start_url` is `/editor/?folder=<path>`, so tapping a
-project's icon lands exactly where tapping it in the project switcher does. One
-install per project, once, and the second window the user asked for.
+same code, same login, same push subscription, differing in `id`, `start_url`,
+`scope` and the name under the icon. One install per project, once, and the second
+window the user asked for.
+
+**A differing `id` is not enough, and that is why `/p/<name>/` exists.** A
+manifest's `scope` is a path prefix, and scope matching *ignores the query string*.
+While every project's `start_url` was `/editor/?folder=<path>` with `scope: '/'`,
+every project manifest described an app with the same scope as every other one —
+so Android had one installed web app claiming the whole origin and refused every
+install after the first as "already installed". On Android the installed WebAPK
+claims URLs by scope; the `id` never gets a say. A window per project therefore
+needs a *path* per project:
+
+- `chat-service/manifest.js` mints `id`, `start_url` and `scope` from
+  `projectWindowPath(project)` — `/p/<name>/` — so all three agree by construction.
+- `pwa/mobile-overlay.js` sends every navigation there through `projectHref()`, so
+  the switcher rows, their ⧉ new-tab siblings and the redirect after creating a
+  project all land inside the scope the manifest claims.
+- `infra/userdata/bootstrap.sh` routes it, which means **this cannot be changed by
+  `deploy.sh --app-only`**: the route is a nginx location, so it needs a full deploy
+  and therefore an instance replacement.
+
+`?folder=<path>` stays in the URL because it is what code-server reads to open the
+folder and what the overlay's `folder()` reads to know which project it is in; the
+path segment carries no information and is not redundant, because scope cannot see
+a query. Both halves are built together in the two functions named above, and
+`manifest-test.js` checks the route in `bootstrap.sh` matches what they hand out —
+a drift there puts an error page behind every icon on the phone.
+
+The route **proxies**, it does not redirect: a redirect out of scope lands the user
+in Chrome's in-app browser with a toolbar, which is the "semi-window" this feature
+was reported as. It proxies to the same code-server `/editor/` does, which is the
+security-relevant part — nothing in nginx authenticates anything, and the workbench
+is gated by code-server's own password. A `/p/` path that reached the workbench
+without one would be remote code execution.
+
+The accepted cost: `/login` is outside every project's scope, so the first launch
+after a lapsed session shows Chrome's toolbar until the redirect lands. A scope wide
+enough to hold the login page is wide enough to collide with every other project.
 
 **The `<link rel="manifest">` has to be injected into the editor's document**, which
 is why `pwa/mobile-overlay.js` does it (`linkProjectManifest`) rather than the chat
@@ -637,26 +677,27 @@ same reason the chat's own link does. The install itself is a button in the proj
 sheet, using `beforeinstallprompt` where Chrome offers it and telling the user which
 menu item to use where it does not (every iOS browser).
 
-**Chrome can still refuse the install, and the reason only exists on the phone.**
-Android matches an installed web app to a page by *scope*, and the chat app's manifest
-claims `/` — the whole origin, including every `/editor/` URL — so with the chat icon
-on the home screen Chrome answers "this app is already installed" for a project
-manifest whatever its `id` says. That is the leading hypothesis for a report from a
-real phone, not a finding, so what is shipped is a diagnostic rather than a fix:
-**Check this install** in the project sheet (`explainInstall`) prints the build of the
-overlay, the manifest this page links and what the server says is in it, whether this
-is a browser tab at all, whether `beforeinstallprompt` fired, and — via
-`navigator.getInstalledRelatedApps()` — which installed app Chrome thinks this page
-belongs to. That last answer is only possible because `manifest.js` declares the chat
-app in `related_applications`; the API answers about nothing else.
+**Chrome can still refuse the install, and the remaining reason only exists on the
+phone: the chat app's own manifest still claims `scope: '/'`** — the whole origin,
+including every `/p/<name>/` URL — so a home screen with the chat icon on it may
+still answer "already installed" for a project. Narrowing it to `/chat/` is an
+app-file-only change that ships with `--app-only`, and it is not free: the chat's
+`start_url` moves and `/login` falls out of *its* scope too. Confirm on a device
+before paying that, which is what **Check this install** in the project sheet
+(`explainInstall`) is for. It prints the build of the overlay, the manifest this page
+links and what the server says is in it, whether this page is inside that manifest's
+scope, whether this is a browser tab at all, whether `beforeinstallprompt` fired, and
+— via `navigator.getInstalledRelatedApps()` — which installed app Chrome thinks this
+page belongs to. That last answer is only possible because `manifest.js` declares the
+chat app in `related_applications`; the API answers about nothing else.
 `prefer_related_applications: false` is stated explicitly there, because `true` is the
 one member that would suppress the install offer this is trying to explain.
 
-If the hypothesis holds, the fix is to narrow the chat app's scope to `/chat/`, which
-is not free: its `start_url` moves, `/login` and the `/editor/` shortcut fall out of
-scope, and a lapsed session then opens the app in a browser bar. Confirm on a device
-before paying that — removing the chat icon and installing a project is a thirty-second
-experiment that settles it.
+The scope line in that report earns its place now that scopes are narrow: an install
+cannot be offered for a page *outside* the manifest it links, so opening a project at
+`/editor/?folder=…` or at the catch-all — both still work, and both are outside
+`/p/<name>/` — makes Chrome silent for a reason that is indistinguishable from
+"already installed" unless something says which one it is.
 
 **A workbench left open across a deploy runs the script it loaded**, which is
 indistinguishable from a feature that does not work. `/mobile-overlay.js` is served

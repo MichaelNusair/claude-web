@@ -48,6 +48,7 @@ your-domain.com
   │     ├── /          → chat service (:9997)
   │     ├── /chat/     → chat assets
   │     ├── /editor/   → code-server (:9999)
+  │     ├── /p/<name>/ → code-server, one installable app per project
   │     └── /          → code-server, for its own absolute asset URLs
   │
   ├── claude-chat service
@@ -397,19 +398,28 @@ notifications: it caches nothing and intercepts no requests — the app is a liv
 WebSocket client, and a stale cached shell would break it rather than help.
 
 **A project can have its own icon, and therefore its own window.** Open the project
-in `/editor/`, then the project button on the floating bar → **Give &lt;project&gt; its
-own window**. It lands on the home screen as its own app: tapping it opens the
-editor on that project, in its own task in the app switcher, beside whatever else
-you had open. This is the only way to get a second window on Android — Chrome gives
-an installed web app exactly one, and no API opens another — so it is one install
-per project, once. Same origin, same login, same notifications.
+from the project button on the floating bar — it opens at `/p/<name>/` — then that
+same button → **Give &lt;project&gt; its own window**. It lands on the home screen as its
+own app: tapping it opens the editor on that project, in its own task in the app
+switcher, beside whatever else you had open. This is the only way to get a second
+window on Android — Chrome gives an installed web app exactly one, and no API opens
+another — so it is one install per project, once. Same origin, same login, same
+notifications.
 
-If Chrome answers **"this app is already installed"**, it is matching this page
-against something on the home screen already: Android matches an installed web app to
-a page by scope, and the chat app claims the whole site. **Check this install**, beside
-that button, asks the phone what it can see — which manifest this page links, whether
-Chrome offered an install, and which installed app it thinks this page belongs to — and
-names the icon in the way. Removing that icon frees the origin for per-project ones. It
+**The `/p/<name>/` path is the whole trick.** An installed app owns a *path prefix*
+(its scope), and scope matching ignores the query string, so while every project
+opened at `/editor/?folder=<path>` they were all one app as far as Android was
+concerned and only the first would install — the rest were refused as "already
+installed". A project therefore gets a path of its own, which nginx proxies to the
+same code-server `/editor/` does. Both addresses still work; only the per-project one
+can be installed.
+
+If Chrome still answers **"this app is already installed"**, it is matching this page
+against something on the home screen already — the chat app's own manifest claims the
+whole site, and it is now the only thing left that can. **Check this install**, beside
+that button, asks the phone what it can see: which manifest this page links, whether
+this page is inside that manifest's scope, whether Chrome offered an install, and which
+installed app it thinks this page belongs to. Removing that icon frees the origin. It
 also prints the version of the overlay it is running, because a workbench left open
 across a deploy keeps the script it loaded; reloading the page is the fix for that one.
 

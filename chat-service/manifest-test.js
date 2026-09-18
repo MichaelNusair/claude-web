@@ -5,9 +5,17 @@
  * window on a phone, and no API opens a second. App *identity* is the only lever —
  * a manifest with an unfamiliar `id` is a distinct application even when served
  * from the same URL, and a distinct application on Android is a distinct icon with
- * its own task. So the whole feature is "the id differs per project", and if that
- * ever stops being true the symptom is silent: adding a second project to the home
- * screen quietly replaces the first icon instead of joining it.
+ * its own task. If the id ever stops differing per project the symptom is silent:
+ * adding a second project to the home screen quietly replaces the first icon
+ * instead of joining it.
+ *
+ * The id is not sufficient, only necessary, which is the lesson that cost a release.
+ * An installed app claims URLs by *scope*, a path prefix compared without the query
+ * string, so projects differing only in `?folder=` were one app to Android and only
+ * the first could be installed — "already installed" for the rest. Hence a path per
+ * project, `/p/<name>/`, and hence the last section of this file: that path is a
+ * promise only nginx can keep, and it is written in another language in another
+ * directory.
  *
  * The other thing checked here is drift. The fields that are not project-specific
  * are written out in manifest.js rather than read from pwa/manifest.webmanifest,
@@ -32,7 +40,8 @@ fs.mkdirSync(path.join(PROJECTS, 'other'), { recursive: true });
 // Read at import time by session-manager.js, which manifest.js validates through.
 process.env.PROJECTS_ROOT = PROJECTS;
 
-const { projectManifest, projectStartUrl, manifestForProject } = await import('./manifest.js');
+const { projectManifest, projectStartUrl, projectWindowPath, manifestForProject } =
+  await import('./manifest.js');
 
 let pass = 0;
 let fail = 0;
@@ -51,25 +60,60 @@ section('A project is a distinct app, which is the entire point:');
 const demo = await manifestForProject('demo');
 const other = await manifestForProject('other');
 ok(demo.id !== other.id, 'two projects share an id, so the second icon replaces the first');
+ok(demo.id === '/p/demo/', 'the id is not the project’s own path');
 ok(
-  demo.id === `/editor/?folder=${encodeURIComponent(path.join(PROJECTS, 'demo'))}`,
-  'the id is not the folder URL, so it is not stable across deploys',
+  demo.start_url.startsWith(demo.id),
+  'the icon opens outside the app it identifies, so the first launch is a browser tab',
 );
-ok(demo.start_url === demo.id, 'the icon opens somewhere other than the app it identifies');
 ok(
-  demo.start_url === projectStartUrl(path.join(PROJECTS, 'demo')),
+  demo.start_url === projectStartUrl('demo', path.join(PROJECTS, 'demo')),
   'the manifest and the switcher disagree about where a project opens',
 );
 ok(
-  /^\/editor\/\?folder=/.test(demo.start_url),
-  'a project window opens somewhere other than the editor — /?folder= lands in the chat',
+  demo.start_url === `/p/demo/?folder=${encodeURIComponent(path.join(PROJECTS, 'demo'))}`,
+  'a project window opens somewhere other than its own path with its folder named — ' +
+    'the path is what makes it installable, the query is what opens the folder',
+);
+
+/*
+ * The check the original version of this file was missing, and the reason a second
+ * project would not install on Android at all.
+ *
+ * A manifest's scope is a path prefix and scope matching *ignores the query string*.
+ * Every project used to declare `scope: '/'` with a start_url differing only in
+ * `?folder=`, so to Android every project — and the chat app — was one installed web
+ * app claiming the whole origin, and Chrome refused each install after the first as
+ * "already installed". A differing `id` does not help: the installed WebAPK claims
+ * URLs by scope. If these two ever share a scope again, that returns.
+ */
+ok(
+  demo.scope !== other.scope,
+  'two projects share a scope, so Android treats them as one app and only the first ' +
+    'one installs — "already installed" is the symptom',
+);
+ok(demo.scope === '/p/demo/', 'a project’s scope is not its own path');
+ok(
+  demo.start_url.startsWith(demo.scope) && demo.id.startsWith(demo.scope),
+  'the start_url or the id falls outside the scope, which makes the manifest invalid',
+);
+ok(
+  demo.scope !== '/',
+  'the scope is the whole origin again, which is exactly the collision this shape ' +
+    'exists to avoid',
 );
 
 section('What the icon says, and how far the window reaches:');
 ok(demo.short_name === 'demo', 'the home-screen label is not the bare project name');
 ok(/demo/.test(demo.name), 'the installer label does not name the project');
 ok(demo.name !== other.name, 'two projects install under the same name');
-ok(demo.scope === '/', 'the scope excludes /login, so a lapsed session opens a browser tab');
+/*
+ * The accepted cost of a narrow scope: /login is outside it, so the first launch
+ * after a lapsed session shows Chrome's toolbar until the redirect lands. A scope
+ * wide enough to contain the login page is wide enough to collide with every other
+ * project, and a login that looks like a browser beats a project that cannot be
+ * installed.
+ */
+ok(!'/login'.startsWith(demo.scope), 'the scope covers /login, which means it is too wide to be unique');
 ok(demo.display === 'standalone', 'the project window is not standalone, so it is a tab');
 ok(
   demo.orientation === undefined,
@@ -84,7 +128,7 @@ section('The chat app is declared, so a phone can be asked what is installed:');
 /*
  * getInstalledRelatedApps() only answers about applications the page's manifest
  * declares as related, and on Android the one question worth asking is which
- * installed app Chrome thinks an /editor/ URL belongs to — the chat app's scope is
+ * installed app Chrome thinks a /p/<name>/ URL belongs to — the chat app's scope is
  * the whole origin, so it is the first suspect when a project install is refused
  * as "already installed". Both members are load-bearing in opposite directions:
  * without the declaration the check can say nothing, and with
@@ -140,7 +184,104 @@ ok(
 
 section('The builder needs no filesystem, so the route can be reasoned about:');
 const pure = projectManifest({ project: 'p', path: '/workspace/projects/p' });
-ok(pure.id === '/editor/?folder=%2Fworkspace%2Fprojects%2Fp', 'the path is not encoded into the id');
+ok(pure.id === '/p/p/', 'the project name is not the id');
+ok(
+  pure.start_url === '/p/p/?folder=%2Fworkspace%2Fprojects%2Fp',
+  'the folder is not encoded into the start_url',
+);
+
+section('The path a manifest hands out is a real route, gated like the editor it is:');
+/*
+ * This file mints URLs that only nginx can answer, and the two live in different
+ * languages in different directories: change `projectWindowPath` and every icon on
+ * every phone points at a path the server does not route, which lands on the
+ * catch-all as a path code-server has never heard of. An installed icon that opens
+ * an error page is not something a test suite should be able to miss.
+ *
+ * The upstream is compared against /editor/'s rather than named, because that is the
+ * property that matters and it is not about routing: nothing in nginx authenticates
+ * anything here (see the SECURITY note in bootstrap.sh) — the workbench is gated by
+ * code-server's own password check. A project path that reached anything else, or
+ * reached code-server by some other door, would be a shell on this box for whoever
+ * found it.
+ */
+const nginx = fs.readFileSync(path.join(root, 'infra', 'userdata', 'bootstrap.sh'), 'utf8');
+const blockFor = (pattern) =>
+  new RegExp(`\\n\\s*location\\s+(${pattern})\\s*\\{\\n([\\s\\S]*?)\\n    \\}\\n`).exec(nginx);
+const route = blockFor('[^\\n{]*/p/[^\\n{]*?');
+ok(
+  route,
+  'nginx routes nothing under /p/, so every project icon opens on a path the server ' +
+    'does not serve',
+);
+// bootstrap.sh writes the config through a shell heredoc, so every nginx `$` is
+// escaped for the shell and has to be put back before the pattern means anything.
+const unescapeConf = (text) => text.replace(/\\\$/g, '$');
+const matcher = new RegExp(unescapeConf(route?.[1] ?? '$.^').replace(/^~\s*/, ''));
+const body = route?.[2] ?? '';
+ok(
+  matcher.test(projectWindowPath('demo')),
+  'the route does not match the path this file hands out — the manifest and nginx have drifted',
+);
+ok(
+  matcher.test(projectWindowPath('demo').replace(/\/$/, '')),
+  'the route needs the trailing slash, so the same app has two addresses and one of them 404s',
+);
+ok(!matcher.test('/p/../etc/'), 'the route accepts a name that is not a name');
+/*
+ * Below a project, too, and that is not tidiness. code-server answers a request it
+ * has no password cookie for with a *relative* redirect — `Location: ./login?…` —
+ * which the browser resolves against this path and asks for /p/<name>/login. A route
+ * that only matched the project's own path would answer that with the catch-all, and
+ * code-server does not know its own login page under that name: 404 on the first
+ * launch of an icon whose session has lapsed, which is the whole feature failing on
+ * the one day it is used.
+ *
+ * So the prefix has to be stripped, exactly as /editor/ strips its own, and what
+ * comes out the other side is what code-server sees. The rewrite is read out of the
+ * config and applied here rather than eyeballed, because "it forwards *something*"
+ * is not the property that matters.
+ */
+ok(
+  matcher.test('/p/demo/login'),
+  'the route stops at a project’s own path, so code-server’s relative redirect to ' +
+    './login lands on the catch-all as a path it has never heard of',
+);
+const rewrite = /(?:^|\n)\s*rewrite\s+(\S+)\s+(\S+)\s+break;/.exec(body);
+ok(rewrite, 'the project route does not strip its prefix, so code-server sees /p/<name>/ as a path');
+const strip = (url) =>
+  rewrite ? url.replace(new RegExp(unescapeConf(rewrite[1])), unescapeConf(rewrite[2])) : url;
+ok(strip('/p/demo/login') === '/login', 'code-server is asked for a login page at a path it does not serve');
+ok(strip('/p/demo/') === '/' && strip('/p/demo') === '/', 'a project window does not open the workbench root');
+const upstreamOf = (block) => /proxy_pass\s+http:\/\/([^;/\s]+)/.exec(block)?.[1] ?? '';
+ok(
+  upstreamOf(body) !== '' && upstreamOf(body) === upstreamOf(blockFor('/editor/')?.[2] ?? ''),
+  'a project path does not reach the same code-server /editor/ does, and code-server’s ' +
+    'own password is the only thing gating the workbench',
+);
+ok(
+  /cmo_head/.test(body),
+  'the project window gets no overlay injected, so it opens with no switcher, no mic ' +
+    'and no way back',
+);
+
+/*
+ * One trap in writing that config, met twice while writing this route: the nginx
+ * block is a *shell* heredoc with no quoting on the delimiter, so an unescaped
+ * backtick in it is command substitution — run as root, at boot, on the instance,
+ * with its output pasted into the config. The two that were there ate the words out
+ * of an nginx comment and printed "command not found" into the userdata log, which is
+ * harmless and is also the benign version of it.
+ */
+const heredoc = /cat > \/etc\/nginx\/conf\.d\/claude-web\.conf <<NGINXCONF\n([\s\S]*?)\nNGINXCONF\n/.exec(
+  nginx,
+)?.[1];
+ok(heredoc, 'the nginx config is no longer written by the heredoc this checks');
+ok(
+  !/(^|[^\\])`/.test(heredoc ?? '`'),
+  'an unescaped backtick in the nginx heredoc: the shell will run it as root at boot ' +
+    'and paste the output into the config',
+);
 
 fs.rmSync(TMP, { recursive: true, force: true });
 console.log(`\n${pass}/${pass + fail} checks passed`);

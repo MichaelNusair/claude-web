@@ -381,11 +381,37 @@ ok('a project is no longer a row that can hold a second control', rows.length ==
 ok(
   'a project row is not a link, so a long press offers nothing to open elsewhere',
   items.length === 2 &&
-    items.every((el) => el.tagName === 'A' && /^\/editor\/\?folder=/.test(el.getAttribute('href'))),
+    items.every(
+      (el) => el.tagName === 'A' && /^\/p\/[^/]+\/\?folder=/.test(el.getAttribute('href')),
+    ),
 );
 ok(
   'the project row links somewhere other than the folder it names',
-  otherItem?.getAttribute('href') === `/editor/?folder=${encodeURIComponent('/workspace/projects/other')}`,
+  otherItem?.getAttribute('href') ===
+    `/p/other/?folder=${encodeURIComponent('/workspace/projects/other')}`,
+);
+
+/*
+ * Why the rows point at /p/<name>/ and not /editor/?folder=<path>, which is the
+ * URL they used and which code-server itself still answers on.
+ *
+ * A manifest's scope is a path prefix, and scope matching ignores the query. Every
+ * project living under /editor/ meant every project manifest described an app with
+ * the same scope, so Android had one installed web app claiming them all and every
+ * install after the first was refused as "already installed" — the whole reported
+ * bug. The path prefix is the fix, so it is the thing worth asserting: not that the
+ * hrefs are right, but that they *differ before the query*. See
+ * chat-service/manifest.js, which mints the matching scope.
+ */
+const prefixOf = (el) => (el?.getAttribute('href') || '').split('?')[0];
+ok(
+  'two projects share a URL prefix, so their manifests share a scope and Android ' +
+    'installs only the first of them',
+  prefixOf(currentItem) !== prefixOf(otherItem),
+);
+ok(
+  'a project row points outside the per-project path, where scopes collide',
+  items.every((el) => prefixOf(el) !== '/' && !prefixOf(el).startsWith('/editor/')),
 );
 
 const newTabs = [...doc.querySelectorAll('.cmo-item-new')];
@@ -401,7 +427,7 @@ ok(
   newTabs.some(
     (el) =>
       el.getAttribute('href') ===
-      `/editor/?folder=${encodeURIComponent('/workspace/projects/other')}`,
+      `/p/other/?folder=${encodeURIComponent('/workspace/projects/other')}`,
   ),
 );
 
@@ -1419,6 +1445,15 @@ w.Notification = FakeNotification;
 
 const jsonReply = (body, status = 200) =>
   Promise.resolve({ ok: status < 400, status, json: () => Promise.resolve(body) });
+
+/*
+ * What the server says this project's manifest is. Mutable because the install check
+ * has to be asked the same question twice: once about a page inside the app's scope
+ * and once about a page outside it, which are the two answers it exists to tell
+ * apart. This document is at /editor/ (see the URL above), so `/p/demo/` is the
+ * out-of-scope case.
+ */
+let fakeManifest = { id: '/p/demo/', short_name: 'demo', scope: '/p/demo/' };
 const priorFetch = w.fetch;
 w.fetch = (url, options = {}) => {
   const target = String(url);
@@ -1441,11 +1476,7 @@ w.fetch = (url, options = {}) => {
     return jsonReply({ sent: 1 });
   }
   if (target.includes('manifest.webmanifest')) {
-    return jsonReply({
-      id: '/editor/?folder=%2Fworkspace%2Fprojects%2Fdemo',
-      short_name: 'demo',
-      scope: '/',
-    });
+    return jsonReply(fakeManifest);
   }
   return priorFetch(url, options);
 };
@@ -1622,7 +1653,7 @@ ok(
   'the install check does not name the manifest this page would install',
   /manifest\.webmanifest\?project=demo/.test(why),
 );
-ok('the install check does not report the identity the server gave it', /id \/editor/.test(why));
+ok('the install check does not report the identity the server gave it', /id \/p\/demo\//.test(why));
 ok(
   'the install check does not say whether Chrome offered an install, which is the ' +
     'thing being asked about',
@@ -1637,6 +1668,36 @@ ok(
   'the install check names the app in the way but not what to do about it',
   /home screen/.test(why),
 );
+
+/*
+ * The other reason Chrome offers no install, and the one this shape introduced: a
+ * page outside the scope of the manifest it links. /p/<name>/ is a narrow scope by
+ * design, so the editor's older addresses — /editor/?folder=…, or the catch-all —
+ * are outside every project's app, and Chrome's silence there is indistinguishable
+ * from "already installed" unless something says so. This document is at /editor/.
+ */
+ok(
+  'the install check does not notice that this page is outside the manifest’s scope, ' +
+    'which is a silence that looks exactly like "already installed"',
+  /outside that scope/.test(why),
+);
+ok(
+  'the install check reports the page as out of scope without saying which page',
+  new RegExp(`at ${w.location.pathname}`).test(why),
+);
+
+// And the same question about a page the manifest does claim, which must not be
+// reported as a problem: an inverted or unconditional test here would read as a
+// permanent excuse for a missing install button.
+fakeManifest = { ...fakeManifest, scope: '/editor/' };
+doc.getElementById('cmo-install-why').dispatchEvent(new w.MouseEvent('click', { bubbles: true }));
+await settle(80);
+const whyInScope = doc.getElementById('cmo-install-status')?.textContent ?? '';
+ok(
+  'a page inside the manifest’s scope is still reported as outside it',
+  whyInScope.includes('scope /editor/') && !/outside that scope/.test(whyInScope),
+);
+fakeManifest = { ...fakeManifest, scope: '/p/demo/' };
 
 // --------------------------------------------------------- markdown, rendered
 /*

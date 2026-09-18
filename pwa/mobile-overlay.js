@@ -53,7 +53,7 @@
    *
    * Bump it when this file changes in a way anyone would look for.
    */
-  const OVERLAY_BUILD = '2026-09-18.3';
+  const OVERLAY_BUILD = '2026-09-18.4';
 
   // -------------------------------------------- survive a browser refresh
   /*
@@ -878,6 +878,22 @@
     return path ? path.replace(/\/+$/, '').split('/').pop() : '';
   }
 
+  /**
+   * Where a project opens: /p/<name>/?folder=<path>.
+   *
+   * The path segment is what lets a project be an installable app of its own — a
+   * manifest's scope is a path prefix and scope matching ignores the query, so while
+   * every project lived at /editor/?folder=… they were all one app to Android and
+   * only the first would install. The query is still here because it is what
+   * code-server reads to open the folder, and what `folder()` reads to know which
+   * project this window is. Both halves must agree, so they are built together, here
+   * and in chat-service/manifest.js — which is also where the reasoning is written
+   * down. The route is in infra/userdata/bootstrap.sh.
+   */
+  function projectHref(path) {
+    return `/p/${encodeURIComponent(projectOf(path))}/?folder=${encodeURIComponent(path)}`;
+  }
+
   /*
    * A home-screen icon for this project, which on Android is the only way to give
    * a project a window of its own.
@@ -999,6 +1015,20 @@
         } else {
           const m = await res.json();
           lines.push(`It describes “${m.short_name || m.name}”, id ${m.id}, scope ${m.scope}.`);
+          /*
+           * Whether this page is inside that scope, which decides whether an install
+           * can be offered here at all. Now that a project's scope is /p/<name>/ and
+           * not the whole origin, the editor's older addresses — /editor/?folder=…,
+           * or the catch-all — are out of scope, and Chrome stays silent for a page
+           * outside the app it links. That silence looks exactly like "already
+           * installed", so it is worth telling apart from it.
+           */
+          if (m.scope && !location.pathname.startsWith(m.scope)) {
+            lines.push(
+              `This page is at ${location.pathname}, outside that scope, so no install can be ` +
+                'offered here: open the project from the switcher and try again from there.',
+            );
+          }
         }
       } catch (err) {
         lines.push(`It could not be fetched: ${err.message}`);
@@ -1096,7 +1126,7 @@
       .map((p) => {
         const open = current !== '' && current === p.path;
         const path = encodeURIComponent(p.path);
-        const href = `/editor/?folder=${path}`;
+        const href = projectHref(p.path);
         return (
           '<div class="cmo-item-row">' +
           `<a class="cmo-item" href="${href}" data-path="${path}"` +
@@ -1154,11 +1184,11 @@
           closeSheet();
           return;
         }
-        // ?folder= is code-server's own way to open a workspace, and code-server
-        // is mounted at /editor/ — `/` is the chat. Navigating to `/?folder=...`
-        // silently threw you into the chat while the editor kept whatever folder
-        // it had, which reads as "the project switcher does nothing".
-        location.href = `/editor/?folder=${btn.dataset.path}`;
+        // Never a bare `/?folder=...`: `/` is the chat, so that silently threw you
+        // into the chat while the editor kept whatever folder it had, which reads as
+        // "the project switcher does nothing". decodeURIComponent because the data
+        // attribute holds the encoded path and projectHref encodes it again.
+        location.href = projectHref(decodeURIComponent(btn.dataset.path));
       });
     });
   }
@@ -1249,7 +1279,7 @@
           ? `Created and pushed to ${repo.url}. Opening…`
           : 'Created. Opening…';
         setTimeout(() => {
-          location.href = `/editor/?folder=${encodeURIComponent(data.project.path)}`;
+          location.href = projectHref(data.project.path);
         }, 900);
       } catch (err) {
         status.textContent = err.message;

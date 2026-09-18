@@ -711,12 +711,65 @@ server {
         proxy_buffering off;
     }
 
+    # --- One installable app per project ------------------------------------
+    # /p/<name>/ is the editor again, reached by a path that belongs to exactly
+    # one project. It exists because a web app manifest's scope is a path prefix
+    # compared *without* the query string: while every project's start_url was
+    # /editor/?folder=<path>, every project described an app with the same scope,
+    # so Android had one installed web app claiming the origin and refused the
+    # second project as "already installed".
+    #
+    # The query is forwarded rather than rebuilt from \$cwproj, so this route needs
+    # no opinion about where projects live — chat-service/manifest.js is the only
+    # place that knows, and it generates both halves of this URL together. The
+    # browser keeps the query because the overlay reads ?folder= to know which
+    # project it is in.
+    #
+    # The prefix is stripped and everything below it forwarded, which is not
+    # decoration: code-server answers an unauthenticated request with a *relative*
+    # redirect (Location: ./login?...), so the browser resolves it against this path
+    # and asks for /p/<name>/login. An exact-match route would 404 there, which is
+    # what the first launch of a project icon looks like once its password cookie has
+    # expired. The rewrite is what /editor/ gets from \`proxy_pass .../\`; a regex
+    # location cannot use that form, so it is spelled out instead. The query survives
+    # the rewrite untouched.
+    #
+    # Nothing is gated here that is not gated at /editor/: this proxies to the same
+    # code-server, which does its own password check. A path that reached the
+    # workbench without one would be remote code execution.
+    location ~ ^/p/(?<cwproj>[A-Za-z0-9][A-Za-z0-9._-]*)(?:/|\$) {
+        # The slash is not optional, because those redirects are relative: without it
+        # /p/<name> resolves ./login to /p/login, which is this same route with the
+        # project called "login", which redirects to ./login again — a loop the browser
+        # gives up on. 302 rather than 301: nothing links this form, so there is no
+        # reason to leave it in anyone's cache.
+        rewrite ^/p/([A-Za-z0-9][A-Za-z0-9._-]*)\$ /p/\$1/ redirect;
+        rewrite ^/p/[A-Za-z0-9][A-Za-z0-9._-]*/?(.*)\$ /\$1 break;
+        proxy_pass http://127.0.0.1:9999;
+        proxy_redirect / /p/\$cwproj/;
+        proxy_set_header Accept-Encoding "";
+        sub_filter '</head>' '\${cmo_head}</head>';
+        sub_filter_once on;
+        sub_filter_types text/html;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-Host \$host;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection \$connection_upgrade;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        proxy_buffering off;
+    }
+
     # Catch-all: code-server's absolute asset and WebSocket URLs.
     location / {
         proxy_pass http://127.0.0.1:9999/;
         # Inject mobile layout CSS and viewport meta into the workbench shell.
         # Only viewport/PWA meta plus the overlay script. Deliberately NO
-        # stylesheet: CSS that touches `.part.*` desynchronises the workbench's
+        # stylesheet: CSS that touches \`.part.*\` desynchronises the workbench's
         # JS-computed absolute layout and renders as a blank gray screen.
         sub_filter '</head>' '\${cmo_head}</head>';
         sub_filter_once on;
