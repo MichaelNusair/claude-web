@@ -32,9 +32,40 @@ Work in this repository is done when all three of these are true, in this order:
 npm test                       # all of it, not just the part you touched
 git add -A && git commit       # see the message rules below
 git push origin main           # the open-source repo: github.com/MichaelNusair/claude-web
-./deploy.sh                    # the user's own deployment. It re-runs the tests
-                               # and refuses to ship if any of them fail.
+./deploy-remote.sh             # runs the real deploy on the deploy box, from
+                               # origin/main. It re-runs the tests there and
+                               # refuses to ship if any of them fail.
 ```
+
+**Deploys run on the deploy box, not here.** This is an agreement with the user,
+made on 2026-09-18, and it is enforced rather than remembered: `./deploy.sh` now
+*refuses* a full deploy when it detects it is running on the instance the stack
+manages, because such a deploy cannot finish. CloudFormation applies a UserData
+change by stopping this box, so everything after `cdk deploy` — the SSM waits, the
+payload push, the login checks, the summary — dies with it, and the stack goes green
+over an app that was never updated. `./deploy-remote.sh` is the way to ship: it
+resets the deploy box's clone to `origin/main` and runs the real `deploy.sh` there
+over SSM, detached, so the deploy survives this end entirely — close the editor,
+lose the network, let this box restart mid-deploy, and it still finishes. Run it
+again and it re-attaches to the same run rather than starting a second one.
+
+Two things follow from it, and they are the reason it is written here rather than in
+a comment:
+
+- **It deploys `origin/main`, so it refuses to run with anything uncommitted or
+  unpushed.** That is the opposite of `deploy.sh`, which ships the tree it is run
+  from. Push first — including work that is not yours (see below) — or the deploy
+  would quietly ship a different tree than the one you are looking at.
+- **`./deploy.sh --app-only` from this box is still correct and still finishes**, and
+  it is the right tool when the change is only app payload: `chat-service`, `pwa`,
+  either extension, or `infra/userdata/bootstrap.sh`. It changes no AWS resources.
+  Anything under `infra/lib` needs the deploy box.
+
+The box is named in `claude-web.config.json` under `deployFrom` (gitignored, so it
+is per-deployment and never committed). Anyone running the open-source repo should
+do the same — any second machine with an SSM agent and a role that can deploy the
+stack will do, including a laptop or CI. [docs/DEPLOY.md](docs/DEPLOY.md) has the
+setup.
 
 Do all three without being asked. Do not stop after the tests and describe what
 *could* be shipped; do not leave the commit for the user; do not say "ready to
@@ -59,12 +90,14 @@ someone else's.
 
 Five things that are still true while you do it:
 
-- **Say what you are shipping.** `deploy.sh` ships the whole working tree, not your
-  diff. More than one agent works in this repository at a time, so run `git status`
-  first and, if there is work in there that is not yours, say so in the commit
-  message and in what you tell the user. Ship it — but named, never quietly. And
-  never commit `claude-web.config.json` or `infra/cdk.context.json` (both
-  gitignored; keep it that way).
+- **Say what you are shipping.** Neither deploy path ships only your diff:
+  `deploy.sh` ships the whole working tree, and `deploy-remote.sh` ships all of
+  `origin/main`, which may hold commits you have never seen. More than one agent
+  works in this repository at a time, so run `git status` and `git log HEAD..origin/main`
+  first and, if there is work in there that is not yours, say so in the commit message
+  and in what you tell the user. Ship it — but named, never quietly. And never commit
+  `claude-web.config.json` or `infra/cdk.context.json` (both gitignored; keep it that
+  way).
 - **Someone else's file may be mid-edit.** The suite is the arbiter: if `npm test`
   is green with their work in the tree, ship it and say you did. If it is red
   *because* of their work, do not fix it by reverting them and do not weaken the
@@ -289,6 +322,14 @@ failure mode:
 Then walk them through `allowedCidrs`. If they only use this from a couple of
 known networks, narrowing it is the single highest-value hardening step and costs
 nothing. Most people do not know the option exists.
+
+**And tell them where deploys run from after this one.** The first deploy is fine
+from wherever they are — the trap springs on the *second* one, if they run it from
+inside the workspace the stack has just created for them. `deploy.sh` refuses that
+(see the finishing section above), so the thing to set up before they start making
+changes is `deployFrom` in `claude-web.config.json` and `./deploy-remote.sh`. The
+machine they just deployed from already qualifies; the minimum version of this advice
+is "keep running full deploys from here, not from the workspace".
 
 ### "It deployed but X is broken"
 

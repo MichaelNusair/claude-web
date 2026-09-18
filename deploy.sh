@@ -27,7 +27,9 @@ step() { printf '\n\033[1;36m==> %s\033[0m\n' "$1"; }
 # So: --app-only from the box ships app *and* provisioning changes. A full deploy
 # from a machine that is not the box is still what updates the stack, so that a
 # replacement boots the same script this installs, and it is the only thing that
-# can change AWS resources.
+# can change AWS resources. That is no longer advice: a full deploy started on the
+# stack's own instance is refused a few dozen lines below, before anything is built
+# and before any AWS write.
 APP_ONLY=0
 for arg in "$@"; do
   case "$arg" in
@@ -95,6 +97,82 @@ fi
 printf '  identity %s\n' "$IDENTITY"
 
 # ---------------------------------------------------------------------------
+# A full deploy may not be driven from the instance it deploys to.
+# ---------------------------------------------------------------------------
+# This is the trap described at the top of the file, turned into a refusal. The
+# script used to start such a deploy quite happily and leave you to find the
+# half-applied result: CloudFormation stops this instance to apply a UserData
+# change, so the SSM waits, the payload push, the login checks and the summary all
+# die with the box, and the stack goes green carrying code the running instance
+# never received.
+#
+# It is checked here — before the tests, the vsix packaging and any AWS write —
+# because the whole point is to cost you five seconds instead of five minutes and
+# a stack you now have to reason about.
+#
+# Both ways forward are cheap, so nothing is lost by refusing: --app-only from
+# here ships the app *and* the provisioning script, and a full deploy from any
+# machine that is not this one changes AWS resources with nothing downstream of
+# the stop/start. docs/DEPLOY.md names the box this account uses for that.
+if [ "$APP_ONLY" -eq 0 ]; then
+  # A laptop has no metadata service, and 169.254.169.254 is a link-local address
+  # that will never answer there — so this has to fail fast rather than hang the
+  # deploy of someone who is already doing the right thing.
+  IMDS_TOKEN="$(curl -sf -m 1 -X PUT http://169.254.169.254/latest/api/token \
+    -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' 2>/dev/null || true)"
+  SELF_ID=""
+  [ -n "$IMDS_TOKEN" ] && SELF_ID="$(curl -sf -m 1 \
+    -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" \
+    http://169.254.169.254/latest/meta-data/instance-id 2>/dev/null || true)"
+  # Empty or None when the stack does not exist yet, which is the one case where a
+  # full deploy from anywhere is safe: there is no running instance for it to pull
+  # out from under itself.
+  STACK_INSTANCE="$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+    --query "Stacks[0].Outputs[?OutputKey=='InstanceId'].OutputValue | [0]" \
+    --output text "${AWS_ARGS[@]}" 2>/dev/null || true)"
+  if [ -n "$SELF_ID" ] && [ "$SELF_ID" = "$STACK_INSTANCE" ]; then
+    cat >&2 <<REFUSE
+
+Refusing a full deploy: this is the instance the stack manages ($SELF_ID).
+
+CloudFormation applies a UserData change by stopping this instance and starting
+it again. Everything this script does after 'cdk deploy' — waiting for SSM,
+pushing the payload, checking that the app still requires a login — would die
+with the box, leaving the stack green and the running app never updated.
+
+Two ways forward:
+
+  ./deploy.sh --app-only      Ships the app and infra/userdata/bootstrap.sh to
+                              the running instance. No AWS resource changes.
+
+  From any other machine:     git fetch && git reset --hard origin/main
+                              ./deploy.sh
+                              This is the only thing that can change the stack.
+
+Push your work first either way: this script ships the working tree it is run
+from, so a deploy box with a stale clone will quietly ship stale code.
+REFUSE
+    exit 1
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+step "Installing what the tests need"
+# ---------------------------------------------------------------------------
+# This used to be `[ -d node_modules/ws ] || npm install` inside the auth step,
+# which meant a dependency added *after* a machine's first deploy was never
+# installed on it: node_modules/ws existed, so nothing ran, and the suite died on
+# ERR_MODULE_NOT_FOUND for a package sitting right there in package.json. That is
+# a trap that only springs on the second deploy from a given box — which is to say,
+# on the deploy box, and never on the machine the dependency was added on. npm is
+# quick when there is nothing to do, so ask it every time instead of guessing from
+# one directory.
+(
+  cd chat-service
+  npm install --silent --no-audit --no-fund
+) || { echo "npm install failed in chat-service — not deploying." >&2; exit 1; }
+
+# ---------------------------------------------------------------------------
 step "Checking authentication"
 # ---------------------------------------------------------------------------
 # Runs first and blocks the deploy, because this is the check that matters: the
@@ -103,7 +181,6 @@ step "Checking authentication"
 # upgrade refuse an unauthenticated caller.
 (
   cd chat-service
-  [ -d node_modules/ws ] || npm install --silent
   node auth-test.js
 ) || { echo "AUTH TESTS FAILED — refusing to deploy." >&2; exit 1; }
 
@@ -115,7 +192,6 @@ step "Checking the client boots"
 # symptom — and that has shipped before.
 (
   cd chat-service
-  [ -d node_modules/jsdom ] || npm install --silent
   node smoke-test.js
 ) || { echo "client smoke test failed — not deploying." >&2; exit 1; }
 

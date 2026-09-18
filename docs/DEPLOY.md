@@ -66,6 +66,74 @@ aws ssm start-session --target <InstanceId>
 sudo tail -f /var/log/bootstrap.log
 ```
 
+## Deploying changes afterwards: not from the workspace
+
+The first deploy runs from wherever you are, and that is fine. The thing to know
+before the second one is this:
+
+**A full deploy cannot be driven from the instance it deploys to.** Once the app is
+up you will be tempted to make changes in the workspace it gives you — that is what
+it is for — and then to deploy from that same shell. CloudFormation applies a
+UserData change by *stopping* the instance, rewriting the attribute and starting it
+again, so everything `deploy.sh` does after `cdk deploy` dies with the box: the SSM
+waits, the application payload, the check that the live URL still requires a login,
+the summary. The stack goes green and the running app was never updated. `deploy.sh`
+detects this and refuses, so you will get a message rather than a mystery — but you
+still need somewhere to deploy from.
+
+Two ways forward, and you want both:
+
+**App-only changes ship from the workspace.** Anything under `chat-service/`, `pwa/`,
+either extension, or `infra/userdata/bootstrap.sh` is payload rather than
+infrastructure:
+
+```bash
+./deploy.sh --app-only      # ships app + provisioning script; no AWS changes
+```
+
+**Everything else runs on a second machine.** Anything under `infra/lib/` changes AWS
+resources and needs a full deploy. Nominate a machine for it — your laptop, CI, or a
+small instance kept for the job — and record it in `claude-web.config.json`:
+
+```json
+"deployFrom": {
+  "instanceId": "i-0123456789abcdef0",
+  "repoPath": "/home/ec2-user/claude-web",
+  "user": "ec2-user"
+}
+```
+
+Then, from anywhere:
+
+```bash
+git push origin main
+./deploy-remote.sh          # any arguments are passed through to deploy.sh
+```
+
+That resets the deploy box's clone to `origin/main`, starts the real `deploy.sh`
+there over SSM **detached**, and streams its log back. Because it is detached, the
+deploy does not depend on the machine watching it: close your laptop, lose the
+network, or let the workspace instance restart in the middle, and it still finishes.
+Run `./deploy-remote.sh` again and it re-attaches to the run in progress instead of
+starting a second one.
+
+It deploys `origin/main`, not your working tree, so it refuses to start with anything
+uncommitted or unpushed — otherwise it would ship something other than what you are
+looking at, and say nothing.
+
+What the deploy box needs:
+
+- The SSM agent running (`aws ssm describe-instance-information` should list it), and
+  an instance role or credentials that can deploy the stack.
+- A clone of this repository at `repoPath`, owned by `user`, with its own
+  `claude-web.config.json`. That file is gitignored, so copy it across by hand.
+- `node` (20 or newer), `npm` and `git`. It runs the full test suite before shipping,
+  so it needs to be able to install dependencies.
+
+If you skip all of this, nothing breaks — you simply cannot change infrastructure
+from inside the workspace, and `deploy.sh` will tell you so instead of half-applying
+a stack.
+
 ## Configuration
 
 Only `domainName` and `hostedZoneName` are required. Everything else has a
@@ -90,6 +158,7 @@ defaults and validation.
 | `defaultModel` | `us.anthropic.claude-opus-5` | Overridable per chat |
 | `permissionMode` | `bypassPermissions` | The main risk/UX tradeoff |
 | `gitUserName` / `gitUserEmail` | placeholder | Author on Claude's commits |
+| `deployFrom` | none | The machine full deploys run on. See above — set it |
 
 Any key can also be set through the environment — useful in CI, where a config
 file is awkward:

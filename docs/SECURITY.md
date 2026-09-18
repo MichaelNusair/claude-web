@@ -177,15 +177,20 @@ signing key is derived from it):
 ```bash
 aws secretsmanager put-secret-value --secret-id <PasswordSecretArn> \
   --secret-string "$(openssl rand -base64 24)" --region us-east-1
-./deploy.sh   # re-reads the secret onto the instance
+./deploy.sh --app-only   # re-reads the secret onto the instance
 ```
+
+`--app-only` because nothing about the stack changes here — and because it is the
+form that works from inside the workspace, which is where you are most likely to be
+when you decide to rotate a password. See [DEPLOY.md](DEPLOY.md) on why a full
+deploy is not run from there.
 
 Sign every device out without changing the password — rotate the cookie key:
 
 ```bash
 aws secretsmanager put-secret-value --secret-id <SessionSecretArn> \
   --secret-string "$(openssl rand -base64 48)" --region us-east-1
-./deploy.sh
+./deploy.sh --app-only
 ```
 
 Both ARNs are in the stack outputs (`dist/outputs.json` after a deploy).

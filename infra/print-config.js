@@ -34,6 +34,9 @@ const exported = {
   CFG_INSTANCE_TYPE: config.instanceType,
   CFG_LANDING_DOMAIN: config.landing.domainName,
   CFG_LANDING_STACK: config.landing.stackName,
+  CFG_DEPLOY_INSTANCE: config.deployFrom.instanceId,
+  CFG_DEPLOY_PATH: config.deployFrom.repoPath,
+  CFG_DEPLOY_USER: config.deployFrom.user,
 };
 
 for (const [key, value] of Object.entries(exported)) {

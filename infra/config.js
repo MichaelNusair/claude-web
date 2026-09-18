@@ -93,6 +93,34 @@ const DEFAULTS = {
   gitUserEmail: 'claude-web@example.invalid',
 
   /**
+   * The machine full deploys are driven from — `./deploy-remote.sh` reads this.
+   *
+   * A full deploy must not run on the instance this stack manages: CloudFormation
+   * applies a UserData change by stopping that instance, so everything the deploy
+   * does afterwards — pushing the app, checking it still requires a login — dies
+   * with the box, and the stack goes green over an app that was never updated.
+   * `deploy.sh` refuses outright when it detects it is running there.
+   *
+   * So deploys need a second machine. Anything works: a laptop, CI, or a small
+   * instance kept for the purpose. Naming one here is what makes it a habit rather
+   * than a thing someone has to remember — `deploy-remote.sh` resets its clone to
+   * origin/main and runs the real deploy there, over SSM, so the deploy survives
+   * the workspace being stopped, restarted or closed.
+   *
+   * `instanceId` empty means "no deploy box configured", and `deploy-remote.sh`
+   * says so rather than guessing. It needs the SSM agent running and a role that
+   * can deploy the stack.
+   */
+  deployFrom: {
+    /** e.g. "i-0123456789abcdef0". Must not be this stack's own instance. */
+    instanceId: '',
+    /** Where the repository is checked out on that machine. */
+    repoPath: '',
+    /** The user that owns that checkout. Deploys run as them, not as root. */
+    user: 'ec2-user',
+  },
+
+  /**
    * Optional marketing site, served from S3 behind CloudFront on its own
    * hostname. Entirely separate from the workspace: different stack, different
    * hostname, no shared resources, and nothing about it can reach the instance.
@@ -156,6 +184,7 @@ export function loadConfig() {
     ...fromFile,
     oidc: { ...DEFAULTS.oidc, ...(fromFile.oidc || {}) },
     landing: { ...DEFAULTS.landing, ...(fromFile.landing || {}) },
+    deployFrom: { ...DEFAULTS.deployFrom, ...(fromFile.deployFrom || {}) },
   };
 
   for (const [envVar, key] of Object.entries(ENV_MAP)) {
@@ -261,6 +290,34 @@ export function loadConfig() {
         '[config] landing.certificateArn is empty and region is not us-east-1, ' +
           'so a certificate will be created in us-east-1 for CloudFront. This is ' +
           'correct, just worth knowing: the landing stack is always us-east-1.',
+      );
+    }
+  }
+
+  // --- Deploy box (optional) -----------------------------------------------
+  // Only shape is checked here. Whether the machine exists, answers SSM, or is
+  // this stack's own instance are all questions for deploy-remote.sh, which can
+  // ask AWS; this file must stay usable with no credentials at all.
+  if (config.deployFrom.instanceId) {
+    if (!/^i-[0-9a-f]{8,17}$/.test(config.deployFrom.instanceId)) {
+      fail(
+        `deployFrom.instanceId "${config.deployFrom.instanceId}" is not an EC2 instance ` +
+          'id, e.g. "i-0123456789abcdef0". It names the machine ./deploy-remote.sh ' +
+          'drives a full deploy from — see docs/DEPLOY.md.',
+      );
+    }
+    if (!String(config.deployFrom.repoPath).startsWith('/')) {
+      fail(
+        'deployFrom.repoPath must be the absolute path of the repository checkout on ' +
+          `${config.deployFrom.instanceId}, e.g. "/home/ec2-user/claude-web". Got ` +
+          `${JSON.stringify(config.deployFrom.repoPath)}.`,
+      );
+    }
+    if (!config.deployFrom.user) {
+      fail(
+        'deployFrom.user must be the user that owns the checkout on ' +
+          `${config.deployFrom.instanceId}, e.g. "ec2-user". Deploys run as that user ` +
+          'rather than as root, so the checkout keeps one owner.',
       );
     }
   }

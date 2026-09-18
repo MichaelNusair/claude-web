@@ -99,5 +99,32 @@
     "domainName": "",
     "certificateArn": "",
     "stackName": "ClaudeWebLandingStack"
+  },
+
+  "$comment_deployFrom": [
+    "The machine full deploys are driven from. Strongly recommended.",
+    "",
+    "A full deploy must not run on the instance this stack manages. Applying a",
+    "UserData change stops that instance, so everything the deploy does after",
+    "'cdk deploy' — pushing the app, checking it still requires a login — dies",
+    "with the box, and the stack goes green over an app that was never updated.",
+    "./deploy.sh refuses when it detects it is running there.",
+    "",
+    "Anything else will do: a laptop, CI, or a small instance kept for the job.",
+    "Fill this in and ./deploy-remote.sh resets that machine's clone to",
+    "origin/main and runs the deploy there over SSM — which also means the",
+    "deploy survives your browser, your network or the workspace restarting.",
+    "",
+    "It needs the SSM agent running, a clone of this repository with its own",
+    "claude-web.config.json, and a role that can deploy the stack. Leave",
+    "instanceId empty and ./deploy-remote.sh tells you this is what to set.",
+    "",
+    "App-only changes never need it: ./deploy.sh --app-only ships those from",
+    "the workspace itself."
+  ],
+  "deployFrom": {
+    "instanceId": "",
+    "repoPath": "/home/ec2-user/claude-web",
+    "user": "ec2-user"
   }
 }
