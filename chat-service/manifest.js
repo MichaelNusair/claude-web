@@ -84,6 +84,25 @@ export function projectManifest({ project, path }) {
     background_color: THEME_COLOR,
     theme_color: THEME_COLOR,
     icons: ICONS,
+    /*
+     * The chat app, declared as a relation so a phone can be asked about it.
+     *
+     * `navigator.getInstalledRelatedApps()` only answers about applications the
+     * current page's manifest declares, and this is the one question worth asking on
+     * Android: which installed app does Chrome think this page belongs to? Chrome
+     * matches an installed web app to a URL by *scope*, and the chat app's manifest
+     * claims `/` — the whole origin, including every /editor/ URL here — so when
+     * Chrome refuses a project install as "already installed", the chat icon is the
+     * first suspect, and this is what lets the editor's install check name it
+     * instead of guessing. See explainInstall in pwa/mobile-overlay.js.
+     *
+     * `prefer_related_applications` is stated rather than left to its default,
+     * because it is the one member that would turn this diagnostic into a
+     * regression: true tells the browser to offer the related app instead of
+     * installing this one.
+     */
+    related_applications: [{ platform: 'webapp', url: '/chat/manifest.webmanifest' }],
+    prefer_related_applications: false,
   };
 }
 

@@ -1566,6 +1566,62 @@ ok(
   /Site settings/.test(doc.getElementById('cmo-panel')?.textContent ?? ''),
 );
 
+// ------------------------------------------------- why the install was refused
+/*
+ * "It says this app is already installed" cannot be reproduced anywhere but the
+ * phone that said it: whether Chrome offers an install depends on what is on that
+ * home screen. Android matches an installed web app to a page by scope, and the
+ * chat app's manifest claims the whole origin — so the chat icon is the first
+ * suspect, and this check is how the device names it instead of being guessed at
+ * from here. It has to print the build too: a workbench left open across a deploy
+ * runs the script it loaded, which is the other explanation for a control that
+ * appears to do nothing.
+ */
+Object.defineProperty(w.navigator, 'getInstalledRelatedApps', {
+  configurable: true,
+  value: () =>
+    Promise.resolve([
+      { platform: 'webapp', url: 'https://claude.example.com/chat/manifest.webmanifest', id: 'Claude' },
+    ]),
+});
+
+const buildStamp = /const OVERLAY_BUILD = '([^']+)'/.exec(overlayJs)?.[1];
+ok('the overlay carries no build stamp, so a stale page cannot be told from a bug', buildStamp);
+
+await openSwitcher();
+ok(
+  'the switcher offers no way to find out why an install was refused, and the answer ' +
+    'only exists on the phone',
+  doc.getElementById('cmo-install-why'),
+);
+doc.getElementById('cmo-install-why').dispatchEvent(new w.MouseEvent('click', { bubbles: true }));
+await settle(80);
+const why = doc.getElementById('cmo-install-status')?.textContent ?? '';
+ok(
+  'the install check does not say which build of the overlay answered — a page open ' +
+    'across a deploy is the other explanation for a missing feature',
+  why.includes(buildStamp),
+);
+ok(
+  'the install check does not name the manifest this page would install',
+  /manifest\.webmanifest\?project=demo/.test(why),
+);
+ok('the install check does not report the identity the server gave it', /id \/editor/.test(why));
+ok(
+  'the install check does not say whether Chrome offered an install, which is the ' +
+    'thing being asked about',
+  /Chrome has not offered/.test(why),
+);
+ok(
+  'the install check does not name the installed app Chrome thinks this page belongs ' +
+    'to, which is the whole reason it exists',
+  /Claude/.test(why),
+);
+ok(
+  'the install check names the app in the way but not what to do about it',
+  /home screen/.test(why),
+);
+
 // ------------------------------------------------------------------- results
 if (failures.length) {
   console.error(`\noverlay test: ${failures.length} failure(s) of ${checks} checks\n`);

@@ -80,6 +80,32 @@ ok(
   'launch_handler is pinned, which would stop a desktop opening a second window later',
 );
 
+section('The chat app is declared, so a phone can be asked what is installed:');
+/*
+ * getInstalledRelatedApps() only answers about applications the page's manifest
+ * declares as related, and on Android the one question worth asking is which
+ * installed app Chrome thinks an /editor/ URL belongs to — the chat app's scope is
+ * the whole origin, so it is the first suspect when a project install is refused
+ * as "already installed". Both members are load-bearing in opposite directions:
+ * without the declaration the check can say nothing, and with
+ * prefer_related_applications true the browser would offer that app instead of
+ * installing this one.
+ */
+ok(
+  demo.related_applications?.[0]?.platform === 'webapp',
+  'the chat app is not declared as a related web app, so the editor’s install check ' +
+    'can never name what Chrome thinks is already installed',
+);
+ok(
+  demo.related_applications?.[0]?.url === '/chat/manifest.webmanifest',
+  'the declared related app does not point at the chat manifest that index.html links',
+);
+ok(
+  demo.prefer_related_applications === false,
+  'prefer_related_applications is not explicitly false — true would make the browser ' +
+    'offer the chat app instead of installing this project',
+);
+
 section('Everything shared with the chat app still agrees with it:');
 const base = JSON.parse(fs.readFileSync(path.join(root, 'pwa', 'manifest.webmanifest'), 'utf8'));
 ok(

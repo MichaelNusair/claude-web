@@ -40,6 +40,21 @@
   if (window.__claudeMobileOverlay) return;
   window.__claudeMobileOverlay = true;
 
+  /*
+   * Which version of this file is on the phone.
+   *
+   * nginx serves it with `Cache-Control: no-cache`, so a reload always fetches the
+   * current one — but the workbench is a page that stays open for days on a phone,
+   * and a page open across a deploy keeps running the script it loaded. That is
+   * indistinguishable from a feature that does not work, and it has cost a round
+   * trip of "it isn't doing anything" / "it is, reload it" more than once. So the
+   * date is printed by the install check below, where someone comparing what they
+   * see against what was shipped can read it.
+   *
+   * Bump it when this file changes in a way anyone would look for.
+   */
+  const OVERLAY_BUILD = '2026-09-18';
+
   // -------------------------------------------- survive a browser refresh
   /*
    * Keep the server-side extension host alive when this page goes away, so a
@@ -900,6 +915,88 @@
     }
   }
 
+  /*
+   * Why the install offer is missing, answered by the device rather than guessed at.
+   *
+   * "It says this app is already installed" is the report this exists for, and it
+   * cannot be reproduced anywhere but the phone that made it: whether Chrome offers
+   * an install depends on what is already on that home screen. Android matches an
+   * installed web app to a page by *scope*, and the chat app's manifest claims the
+   * whole origin — so with the chat icon installed, every project manifest served
+   * from this origin can look to Chrome like that same app, whatever its `id` says.
+   * That is a hypothesis, not a finding, which is exactly why this prints what it
+   * can see instead of asserting a cause:
+   *
+   *   - the build of this file, because a page open across a deploy is the other
+   *     explanation for a feature that appears to be missing;
+   *   - which manifest this page links, and what the server says is in it;
+   *   - whether this is a browser tab at all — an install can only be offered from
+   *     one, so doing this from inside an installed window explains the silence;
+   *   - whether Chrome fired `beforeinstallprompt` for this page;
+   *   - which installed app Chrome thinks belongs to this page, via
+   *     getInstalledRelatedApps(). It only answers about apps the manifest declares
+   *     as related, which is why manifest.js declares the chat app.
+   */
+  async function explainInstall() {
+    const say = (text) => {
+      const el = panel.querySelector('#cmo-install-status');
+      if (el) el.textContent = text;
+    };
+    say('Checking…');
+    const lines = [`Overlay ${OVERLAY_BUILD}.`];
+
+    const link = document.querySelector('link[rel="manifest"]');
+    if (!link) {
+      lines.push('This page links no manifest, so there is nothing here to install.');
+    } else {
+      lines.push(`Manifest: ${link.getAttribute('href')}`);
+      try {
+        const res = await fetch(link.href);
+        if (!res.ok) {
+          lines.push(
+            `The server answered ${res.status} for it, so the browser sees no manifest` +
+              (res.status === 401 ? ' — this is the chat service asking for its own sign-in.' : '.'),
+          );
+        } else {
+          const m = await res.json();
+          lines.push(`It describes “${m.short_name || m.name}”, id ${m.id}, scope ${m.scope}.`);
+        }
+      } catch (err) {
+        lines.push(`It could not be fetched: ${err.message}`);
+      }
+    }
+
+    const standalone = window.matchMedia?.('(display-mode: standalone)')?.matches;
+    lines.push(
+      standalone
+        ? 'This window is already an installed app, and an install is only ever offered from a browser tab — open this same address in Chrome to add another project.'
+        : 'This is a browser tab, which is where an install can be offered.',
+    );
+    lines.push(
+      installPrompt
+        ? 'Chrome has offered to install this project: the button above will do it.'
+        : 'Chrome has not offered to install this page. It stays silent when it considers the app already installed.',
+    );
+
+    if (navigator.getInstalledRelatedApps) {
+      try {
+        const apps = await navigator.getInstalledRelatedApps();
+        lines.push(
+          apps.length
+            ? `Chrome reports ${apps.length} installed app claiming this page: ` +
+              `${apps.map((a) => a.id || a.url || a.platform).join(', ')}. Removing that icon from the home screen frees this origin, and installing a project again gives it its own.`
+            : 'Chrome reports no installed app claiming this page.',
+        );
+      } catch (err) {
+        lines.push(`Chrome would not say what is installed: ${err.message}`);
+      }
+    } else {
+      lines.push('This browser cannot say which apps are installed.');
+    }
+
+    say(lines.join(' '));
+  }
+
   // --------------------------------------------------------- project switcher
   async function openProjects() {
     openSheet('<p class="cmo-title">Open project</p><p class="cmo-hint">Loading…</p>');
@@ -983,6 +1080,7 @@
         projectOf(current)
           ? `<div class="cmo-row">
         <button class="cmo-action cmo-alt" id="cmo-install">&#8962; Give ${projectOf(current)} its own window</button>
+        <button class="cmo-action cmo-alt" id="cmo-install-why">&#9906; Check this install</button>
       </div>
       <p class="cmo-status" id="cmo-install-status"></p>`
           : ''
@@ -997,6 +1095,7 @@
     panel.querySelector('#cmo-close-projects').addEventListener('click', closeSheet);
     panel.querySelector('#cmo-new-project').addEventListener('click', openNewProject);
     panel.querySelector('#cmo-install')?.addEventListener('click', addToHomeScreen);
+    panel.querySelector('#cmo-install-why')?.addEventListener('click', explainInstall);
     // Only the row itself. The ⧉ anchor next to it is deliberately left to the
     // browser: `target="_blank"` with no JavaScript in the way is what makes it a
     // navigation iOS trusts rather than a popup it blocks. The sheet stays open

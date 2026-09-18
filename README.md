@@ -393,6 +393,15 @@ you had open. This is the only way to get a second window on Android — Chrome 
 an installed web app exactly one, and no API opens another — so it is one install
 per project, once. Same origin, same login, same notifications.
 
+If Chrome answers **"this app is already installed"**, it is matching this page
+against something on the home screen already: Android matches an installed web app to
+a page by scope, and the chat app claims the whole site. **Check this install**, beside
+that button, asks the phone what it can see — which manifest this page links, whether
+Chrome offered an install, and which installed app it thinks this page belongs to — and
+names the icon in the way. Removing that icon frees the origin for per-project ones. It
+also prints the version of the overlay it is running, because a workbench left open
+across a deploy keeps the script it loaded; reloading the page is the fix for that one.
+
 ## Cost
 
 Roughly **$75/month** left running: `t4g.large` ~$49, ALB ~$16, 100 GB gp3 ~$8, 40

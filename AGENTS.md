@@ -637,6 +637,33 @@ same reason the chat's own link does. The install itself is a button in the proj
 sheet, using `beforeinstallprompt` where Chrome offers it and telling the user which
 menu item to use where it does not (every iOS browser).
 
+**Chrome can still refuse the install, and the reason only exists on the phone.**
+Android matches an installed web app to a page by *scope*, and the chat app's manifest
+claims `/` — the whole origin, including every `/editor/` URL — so with the chat icon
+on the home screen Chrome answers "this app is already installed" for a project
+manifest whatever its `id` says. That is the leading hypothesis for a report from a
+real phone, not a finding, so what is shipped is a diagnostic rather than a fix:
+**Check this install** in the project sheet (`explainInstall`) prints the build of the
+overlay, the manifest this page links and what the server says is in it, whether this
+is a browser tab at all, whether `beforeinstallprompt` fired, and — via
+`navigator.getInstalledRelatedApps()` — which installed app Chrome thinks this page
+belongs to. That last answer is only possible because `manifest.js` declares the chat
+app in `related_applications`; the API answers about nothing else.
+`prefer_related_applications: false` is stated explicitly there, because `true` is the
+one member that would suppress the install offer this is trying to explain.
+
+If the hypothesis holds, the fix is to narrow the chat app's scope to `/chat/`, which
+is not free: its `start_url` moves, `/login` and the `/editor/` shortcut fall out of
+scope, and a lapsed session then opens the app in a browser bar. Confirm on a device
+before paying that — removing the chat icon and installing a project is a thirty-second
+experiment that settles it.
+
+**A workbench left open across a deploy runs the script it loaded**, which is
+indistinguishable from a feature that does not work. `/mobile-overlay.js` is served
+`Cache-Control: no-cache`, so a reload is enough — and `OVERLAY_BUILD`, printed by the
+install check, is how to tell the two apart without arguing about it. Bump it when this
+file changes in a way anyone would go looking for.
+
 `GET /manifest.webmanifest?project=<name>` is gated like everything else, and is in
 `auth-test.js` for a reason that is easy to miss: it answers 200 for a project that
 exists and 404 for one that does not, so ungated it would enumerate the project
