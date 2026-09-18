@@ -146,6 +146,19 @@ step "Checking the editor overlay"
 ) || { echo "editor overlay test failed — not deploying." >&2; exit 1; }
 
 # ---------------------------------------------------------------------------
+step "Checking the voice that reads messages aloud"
+# ---------------------------------------------------------------------------
+# Polly bills per character, so most of what this checks is what the voice
+# *refuses*: the daily budget, a message too long to read aloud, an id nobody
+# prepared, and audio replayed from the cache rather than bought twice. It also
+# checks where a message is cut into pieces, which is the part of this a listener
+# can hear. Runs against a fake synthesiser — no credentials, nothing spent.
+(
+  cd chat-service
+  node speak-test.js
+) || { echo "voice tests failed — not deploying." >&2; exit 1; }
+
+# ---------------------------------------------------------------------------
 step "Checking the project lifecycle"
 # ---------------------------------------------------------------------------
 # Removing a project deletes a directory tree, so this exercises the refusals

@@ -180,6 +180,12 @@ const guarded = [
   // Spends Bedrock tokens on caller-supplied text, so it is a paid endpoint as
   // well as a private one.
   ['POST', '/api/polish'],
+  // Read aloud. `prepare` takes a message and hands back an id; `/api/speak`
+  // turns an id into audio, which is Polly at $30 per million characters. So the
+  // pair is a paid endpoint *and* a way to read a private conversation back — and
+  // the id alone, being a hash of text nobody else has, is not a credential.
+  ['POST', '/api/speak/prepare'],
+  ['GET', '/api/speak?id=0123456789abcdef&segment=0'],
   ['POST', '/api/client-error'],
   // The operations surface. `/admin` is the reason this list matters most: it
   // enumerates every process on the box and can signal three of them, so an

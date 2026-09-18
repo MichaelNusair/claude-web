@@ -153,8 +153,86 @@ const polishCalls = [];
 let statusReply = null;
 const statusCalls = [];
 
+/*
+ * The server voice, which is off until the section that tests it.
+ *
+ * `null` is a deployment that cannot synthesise — no Polly permission, an older
+ * server with no such route, or a chat-service session that has lapsed — and it is
+ * the state every other section here runs in, because the browser's own voice is
+ * what those are about and it has to keep working with no server behind it.
+ */
+let voiceReply = null;
+const voiceCalls = [];
+/** What /api/speak/prepare was asked, and what it answers. */
+const prepareCalls = [];
+let prepareStatus = 0;
+/** Which segments were fetched, and which one to refuse. */
+const segmentCalls = [];
+let refuseSegment = -1;
+
 w.fetch = (url, options = {}) => {
   const target = String(url);
+  if (target.includes('/api/voice-status')) {
+    voiceCalls.push(target);
+    if (!voiceReply) {
+      return Promise.resolve({ ok: false, status: 401, json: () => Promise.resolve({}) });
+    }
+    // Shaped like the real route: transcription's answer with the voice's nested
+    // inside it, because they are two halves of one question.
+    return Promise.resolve({
+      ok: true,
+      status: 200,
+      json: () => Promise.resolve({ configured: true, backend: 'local', speech: voiceReply }),
+    });
+  }
+  if (target.includes('/api/speak/prepare')) {
+    const body = JSON.parse(options.body || '{}');
+    prepareCalls.push(body);
+    // No server voice means no route to read with either, which is what a device
+    // with a lapsed chat-service session gets — and it is what the sections after
+    // this one run against, so they fall back to the browser's voice as before.
+    if (!voiceReply) {
+      return Promise.resolve({
+        ok: false,
+        status: 401,
+        json: () => Promise.resolve({ error: 'not signed in' }),
+      });
+    }
+    if (prepareStatus) {
+      return Promise.resolve({
+        ok: false,
+        status: prepareStatus,
+        json: () => Promise.resolve({ error: 'the voice has read 300000 characters today' }),
+      });
+    }
+    // Three pieces, like a real summary: enough to prove the chain and the
+    // one-ahead prefetch, few enough to step through by hand.
+    return Promise.resolve({
+      ok: true,
+      status: 200,
+      json: () => Promise.resolve({
+        id: 'aa11bb22cc33dd44',
+        voice: body.voice || 'Ruth',
+        engine: 'generative',
+        segments: 3,
+        chars: (body.text || '').length,
+      }),
+    });
+  }
+  if (target.includes('/api/speak?')) {
+    const segment = Number(new w.URL(target, 'https://claude.example.com').searchParams.get('segment'));
+    segmentCalls.push(segment);
+    if (segment === refuseSegment) {
+      return Promise.resolve({
+        ok: false,
+        status: 502,
+        json: () => Promise.resolve({ error: 'the voice failed' }),
+      });
+    }
+    // A Blob is opaque here; what matters is that it becomes a URL and that the
+    // URL is handed to the element. `createObjectURL` below turns this into one.
+    return Promise.resolve({ ok: true, status: 200, blob: () => Promise.resolve({ segment }) });
+  }
   if (target.includes('/api/claude-status')) {
     statusCalls.push(target);
     if (!statusReply) {
@@ -1379,6 +1457,360 @@ ok(
   utterances.length === 0,
 );
 speechMs = 0;
+
+// ------------------------------------------------------------- the server voice
+/*
+ * Reading with Polly instead of with `speechSynthesis`.
+ *
+ * Everything above is the browser's own voice, which is the fallback and has to
+ * keep working on its own — those sections run with /api/voice-status answering
+ * 401, which is a real deployment (the editor and the chat API are gated
+ * separately) and the one this must not break.
+ *
+ * This section is the other half: audio synthesised on the box, fetched a piece at
+ * a time and played in a chain. Four things about it can fail in ways nothing
+ * would report, and they are what is checked here.
+ *
+ *   **The tap.** iOS grants audio permission to an element, inside a gesture, and
+ *   the audio being played does not exist yet at that moment — so the element has
+ *   to be unlocked *during* the tap and given its real source afterwards. Get this
+ *   wrong and the feature works everywhere except the phone it was written for.
+ *
+ *   **The chain.** A message is several files. If the next one is not fetched
+ *   while the current one plays there are gaps, and if `ended` does not chain, a
+ *   phone says the first sentence of a summary and stops — which is worse than
+ *   saying nothing, because you would believe it had finished.
+ *
+ *   **Stop.** Every fetch and every handler outlives the read that started it, so
+ *   a piece arriving after Stop must not start playing.
+ *
+ *   **The fallback.** Every refusal — no budget left, no permission, no network —
+ *   has to end with the message being read in the robotic voice rather than with
+ *   silence, and the sheet has to say which voice it ended up using.
+ */
+const audioSrcs = [];   // every src handed to the element, in order
+const revoked = [];     // every blob URL released
+let audioElements = 0;  // how many elements were created, ever
+let audioNode = null;   // the element the overlay is holding
+
+class FakeAudio {
+  constructor() {
+    audioElements += 1;
+    audioNode = this;
+    this.src = '';
+    this.paused = true;
+    this.onended = null;
+    this.onerror = null;
+    this.preload = '';
+  }
+  play() {
+    audioSrcs.push(this.src);
+    this.paused = false;
+    return Promise.resolve();
+  }
+  pause() {
+    this.paused = true;
+  }
+  load() {}
+  removeAttribute(name) {
+    if (name === 'src') this.src = '';
+  }
+  /** What the browser does when a file finishes: the chain hangs off this. */
+  finish() {
+    if (this.onended) this.onended();
+  }
+}
+w.Audio = FakeAudio;
+w.URL.createObjectURL = (blob) => `blob:segment-${blob.segment}`;
+w.URL.revokeObjectURL = (url) => revoked.push(String(url));
+
+voiceReply = {
+  configured: true,
+  engine: 'generative',
+  voice: 'Ruth',
+  voices: [
+    { id: 'Ruth', gender: 'Female', language: 'en-US' },
+    { id: 'Matthew', gender: 'Male', language: 'en-US' },
+    { id: 'Lupe', gender: 'Female', language: 'es-US' },
+  ],
+  budget: { day: '2026-09-18', chars: 0, limit: 300000 },
+  firstSegmentChars: 160,
+};
+
+// The page loaded before any of this was available, which is the normal way round:
+// the editor has its own password and the chat service has another, so a phone is
+// routinely signed into one and not the other. The voice has to arrive without a
+// reload.
+const voiceAsks = voiceCalls.length;
+statusReply = {
+  ...statusReply,
+  state: 'idle',
+  // An ordinary finished turn: the section above left a cut-off one behind, and
+  // what is being checked here is the voice, not the lead-in that explains a turn
+  // that stopped.
+  cutOff: null,
+  last: { role: 'assistant', text: finalMessage, at: new Date().toISOString() },
+};
+await tapStatus();
+ok(
+  'the overlay never asked about voices again, so a phone that loaded before it was ' +
+    'signed in is stuck with the robotic voice until it is reloaded',
+  voiceCalls.length > voiceAsks,
+);
+
+const voiceSelect = () => doc.getElementById('cmo-voice');
+ok('the sheet offers no way to choose the voice', voiceSelect());
+const options = [...(voiceSelect()?.options ?? [])].map((o) => o.value);
+ok(
+  `the voice picker does not offer the voices the server has: ${options.join(', ')}`,
+  options.includes('Ruth') && options.includes('Matthew'),
+);
+ok(
+  'the picker offers voices for a language this phone does not read in, which is ' +
+    'thirty options to scroll past on the way to the local ones',
+  !options.includes('Lupe'),
+);
+ok(
+  'the robotic voice cannot be chosen, so there is no way back from a voice that ' +
+    'costs money or a server that is refusing',
+  options.includes('browser'),
+);
+ok(
+  `the picker does not start on the server's own default: ${voiceSelect()?.value}`,
+  voiceSelect()?.value === 'Ruth',
+);
+ok(
+  'the sheet does not say what the server voice costs, which is the one thing about ' +
+    'it that is not obvious from hearing it',
+  /seven cents/.test(doc.getElementById('cmo-voice-note')?.textContent || ''),
+);
+
+// -------------------------------------------------------------- one tap, one read
+utterances.length = 0;
+audioSrcs.length = 0;
+prepareCalls.length = 0;
+segmentCalls.length = 0;
+tapSpeak();
+
+ok(
+  'the audio element was not unlocked inside the tap — a silent file has to be played ' +
+    'during the gesture, because the real audio does not exist yet and iOS will not ' +
+    'play what no gesture started',
+  audioSrcs.length === 1 && audioSrcs[0].startsWith('data:audio/wav'),
+);
+ok(
+  'the bar does not show that it is reading until the network answers, so a tap looks ' +
+    'like it did nothing',
+  barBtn.classList.contains('cmo-speaking'),
+);
+ok('the sheet button did not turn into Stop', speakBtn()?.textContent === 'Stop');
+ok(
+  'the robotic voice spoke as well, so the message is read twice at once',
+  utterances.length === 0,
+);
+
+await settle();
+ok('the server was not asked to prepare anything', prepareCalls.length === 1);
+ok(
+  `a device that has never chosen a voice named one anyway: ${JSON.stringify(prepareCalls[0]?.voice)} ` +
+    '— the default belongs in one place, on the server, and a copy frozen into a ' +
+    'phone at first use is a copy that never changes',
+  prepareCalls[0]?.voice === '',
+);
+ok(
+  'the markdown was sent as-is, so the voice reads out every asterisk and every slash ' +
+    'of every path',
+  !/[*`#]|\/workspace\//.test(prepareCalls[0]?.text || 'x*'),
+);
+ok(
+  'the message was sent without the reduction that makes a path a word',
+  /auth\.js, line 42 to 51/.test(prepareCalls[0]?.text || ''),
+);
+ok(
+  `the pieces were not fetched one ahead: ${segmentCalls.join(', ')}`,
+  segmentCalls.length === 2 && segmentCalls[0] === 0 && segmentCalls[1] === 1,
+);
+ok(
+  `the first piece was not played: ${audioSrcs.join(', ')}`,
+  audioSrcs[audioSrcs.length - 1] === 'blob:segment-0',
+);
+
+// ------------------------------------------------------------------- the chain
+ok(
+  'a second audio element was created, and only the first one is unlocked — on iOS ' +
+    'every read after the first would be silent',
+  audioElements === 1,
+);
+revoked.length = 0;
+audioNode.finish();
+await settle();
+ok(
+  `the message stopped after its first piece — a phone that says one sentence of a ` +
+    `summary reads as one that finished: ${audioSrcs.join(', ')}`,
+  audioSrcs[audioSrcs.length - 1] === 'blob:segment-1',
+);
+ok(
+  'the piece that finished was not released, so a long read holds every file it has ' +
+    'already played',
+  revoked.includes('blob:segment-0'),
+);
+ok(
+  `the piece after the one now playing was not fetched: ${segmentCalls.join(', ')}`,
+  segmentCalls.includes(2),
+);
+ok('the bar stopped showing that it is reading mid-message', barBtn.classList.contains('cmo-speaking'));
+
+audioNode.finish();
+await settle();
+audioNode.finish();
+await settle();
+ok(
+  'the bar still says it is reading after the last piece finished, so the only Stop ' +
+    'on screen is one that stops nothing',
+  !barBtn.classList.contains('cmo-speaking'),
+);
+ok('the sheet button did not go back to Read aloud', speakBtn()?.textContent === 'Read aloud');
+ok(
+  'the last piece was not released at the end of the message',
+  revoked.includes('blob:segment-2'),
+);
+
+// ----------------------------------------------------------------------- stopping
+segmentCalls.length = 0;
+audioSrcs.length = 0;
+revoked.length = 0;
+tapSpeak();
+await settle();
+const playing = audioNode;
+barBtn.dispatchEvent(new w.MouseEvent('click', { bubbles: true }));
+ok('Stop left the audio playing', playing.paused);
+ok('Stop left the source attached, so the browser keeps buffering it', playing.src === '');
+ok(
+  'the audio that had been fetched was not released on Stop',
+  revoked.length > 0,
+);
+const afterStop = audioSrcs.length;
+playing.finish();
+await settle();
+ok(
+  'a piece that arrived after Stop went on playing, which is the one thing Stop has ' +
+    'to prevent',
+  audioSrcs.length === afterStop,
+);
+ok('Stop left the bar looking like it is still reading', !barBtn.classList.contains('cmo-speaking'));
+
+// -------------------------------------------------------------- when it refuses
+/*
+ * A refusal has to end with the message being read, not with silence. The budget
+ * is the one that will actually happen — it is a 429 with a sentence explaining
+ * itself, and the answer is the robotic voice and a note saying so.
+ */
+await tapStatus();
+prepareStatus = 429;
+utterances.length = 0;
+audioSrcs.length = 0;
+tapSpeak();
+await settle();
+ok(
+  'a server that refused to read left the phone silent, with no fallback to the voice ' +
+    'the browser has',
+  utterances.length > 0,
+);
+ok(
+  'the fallback did not read the message from the top',
+  /Fixed the guard/.test(utterances.join(' ')),
+);
+ok(
+  'the sheet does not say which voice it ended up reading with, or why',
+  /browser|300000/.test(doc.getElementById('cmo-status-detail')?.textContent || ''),
+);
+await drain();
+prepareStatus = 0;
+
+/*
+ * A piece that fails *after* one has played is the opposite case: starting the
+ * message again in a different voice is worse than stopping, because what you hear
+ * is the same summary twice in two voices with no explanation.
+ */
+await tapStatus();
+refuseSegment = 1;
+utterances.length = 0;
+tapSpeak();
+await settle();
+audioNode.finish();
+await settle();
+ok(
+  'a failure halfway through restarted the whole message in the robotic voice',
+  utterances.length === 0,
+);
+ok(
+  'nothing says why the reading stopped halfway through',
+  /Stopped reading/.test(doc.getElementById('cmo-status-detail')?.textContent || ''),
+);
+ok('a failed read left the bar showing Stop', !barBtn.classList.contains('cmo-speaking'));
+refuseSegment = -1;
+
+// ------------------------------------------------------- choosing the other voice
+await tapStatus();
+prepareCalls.length = 0;
+utterances.length = 0;
+voiceSelect().value = 'browser';
+voiceSelect().dispatchEvent(new w.Event('change'));
+ok(
+  'choosing a voice does not say what it means',
+  /satnav/.test(doc.getElementById('cmo-voice-note')?.textContent || ''),
+);
+tapSpeak();
+await settle();
+ok('the server was still asked to read, after the browser voice was chosen', prepareCalls.length === 0);
+ok('the browser voice was not used, after being chosen', utterances.length > 0);
+ok(
+  'the choice was not remembered, so it has to be made again on every message',
+  w.localStorage.getItem('cmo-voice') === 'browser',
+);
+await drain();
+
+// Back to the server voice, and it has to be remembered as an explicit choice too.
+await tapStatus();
+prepareCalls.length = 0;
+voiceSelect().value = 'Matthew';
+voiceSelect().dispatchEvent(new w.Event('change'));
+tapSpeak();
+await settle();
+ok(
+  `choosing a named voice did not ask for it: ${prepareCalls[0]?.voice}`,
+  prepareCalls[0]?.voice === 'Matthew',
+);
+ok('switching back to a server voice was not remembered', w.localStorage.getItem('cmo-voice') === 'Matthew');
+barBtn.dispatchEvent(new w.MouseEvent('click', { bubbles: true }));
+
+/*
+ * A message arriving while the sheet is open is read out — the one thing here that
+ * is not driven by a tap, and the reason the element is unlocked when the sheet is
+ * opened rather than only when Read aloud is pressed.
+ */
+await tapStatus();
+prepareCalls.length = 0;
+statusReply = {
+  ...statusReply,
+  last: { role: 'assistant', text: 'The seventh answer, which arrived by itself.', at: new Date().toISOString() },
+};
+w.dispatchEvent(new w.Event('focus'));
+await settle();
+ok(
+  'a message that arrived while the sheet was open was not read out in the server voice',
+  prepareCalls.length === 1 && /seventh answer/.test(prepareCalls[0]?.text || ''),
+);
+ok(
+  'the arriving message was not announced as one that just landed',
+  /^Claude finished\./.test(prepareCalls[0]?.text || ''),
+);
+barBtn.dispatchEvent(new w.MouseEvent('click', { bubbles: true }));
+
+// Leave the surface as the rest of the file expects to find it: no server voice, so
+// the sections after this one exercise the browser's own again.
+voiceReply = null;
+w.localStorage.removeItem('cmo-voice');
 
 // ----------------------------------------------------- being told from here
 /*

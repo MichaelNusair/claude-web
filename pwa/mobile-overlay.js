@@ -53,7 +53,7 @@
    *
    * Bump it when this file changes in a way anyone would look for.
    */
-  const OVERLAY_BUILD = '2026-09-18.5';
+  const OVERLAY_BUILD = '2026-09-18.6';
 
   // -------------------------------------------- survive a browser refresh
   /*
@@ -254,6 +254,23 @@
     margin: 4px 0 2px; font-size: 14.5px; color: #d7d4cc;
   }
   .cmo-check input { width: 19px; height: 19px; accent-color: #d97757; }
+  /*
+   * Which voice reads the message. A select, unlike the conversation list below:
+   * this is one short label per option and there are a dozen of them, which is
+   * what a native picker is for — and on a phone it opens as the platform's own
+   * wheel rather than as a list to scroll past.
+   */
+  .cmo-voice {
+    display: flex; align-items: center; gap: 9px;
+    margin: 10px 0 0; font-size: 14px; color: #a8a49b;
+  }
+  .cmo-voice select {
+    flex: 1 1 auto; min-width: 0;
+    background: #272725; color: #f5f4ef;
+    border: 1px solid #34342f; border-radius: 10px; padding: 9px 10px;
+    /* 16px minimum or iOS zooms the page and never zooms back. */
+    font: 16px/1.3 inherit;
+  }
 
   /*
    * Docked to the TOP, for the same reason the bar is docked to the left: the
@@ -2196,7 +2213,14 @@
     // No button when there is nothing to say or nothing to say it with, rather
     // than a disabled one: this sheet is answering a question, and an inert
     // control in it reads as something being broken.
-    const canSpeak = Boolean(said) && speechAvailable();
+    const canSpeak = Boolean(said) && (speechAvailable() || serverVoiceReady());
+    /*
+     * A tap is the only chance to make the audio element playable — see
+     * `unlockAudio`. Doing it here, rather than only on the Read aloud button,
+     * is what lets the sheet read out a message that arrives while it is open:
+     * that read is on a timer, and by then there is no gesture to borrow.
+     */
+    if (!auto && serverVoiceReady()) unlockAudio();
 
     const others = Array.isArray(s.conversations) ? s.conversations : [];
 
@@ -2231,6 +2255,11 @@
         <button class="cmo-action cmo-alt" id="cmo-status-refresh">Refresh</button>
         <button class="cmo-action cmo-alt" id="cmo-status-close">Close</button>
       </div>
+      ${canSpeak && serverVoiceReady() ? `
+        <label class="cmo-voice">Voice
+          <select id="cmo-voice" aria-label="Which voice reads the message"></select>
+        </label>
+        <p class="cmo-hint" id="cmo-voice-note"></p>` : ''}
       <p class="cmo-hint">${
         working
           ? 'The panel is still loading the history; the end of it has not been written yet.'
@@ -2382,9 +2411,65 @@
         const started = speak(said, note ? `${note} Last message:` : '');
         if (!started) {
           panel.querySelector('#cmo-status-detail').textContent =
-            'Nothing was spoken — this browser has no speech, or the mic is live.';
+            'Nothing was spoken — there is no voice on this device, or the mic is live.';
         }
       });
+    }
+
+    /*
+     * Which voice reads it.
+     *
+     * Options as nodes, not as interpolated markup: the names come from the AWS
+     * API rather than from this file, and the rule on this surface is that nothing
+     * from outside it is ever built into a string of HTML.
+     *
+     * Only the voices for this phone's own language, which turns forty-three
+     * options into a dozen. The rest are a language nobody here reads in, and a
+     * picker that has to be scrolled past ten of those to reach the local ones is
+     * worse than one that offers fewer.
+     */
+    const voiceSelect = panel.querySelector('#cmo-voice');
+    if (voiceSelect) {
+      const add = (value, label) => {
+        const option = document.createElement('option');
+        option.value = value;
+        option.textContent = label;
+        voiceSelect.appendChild(option);
+      };
+      const lang = (navigator.language || 'en').slice(0, 2).toLowerCase();
+      const all = serverSpeech.voices || [];
+      const mine = all.filter((v) => String(v.language || '').toLowerCase().startsWith(lang));
+      for (const voice of (mine.length ? mine : all)) {
+        add(voice.id, `${voice.id} · ${voice.language}${voice.gender ? ` · ${voice.gender}` : ''}`);
+      }
+      if (speechAvailable()) add('browser', 'This browser’s own voice');
+
+      // A stored voice this deployment no longer offers leaves the select empty,
+      // which is the moment to fall back to the default rather than to show a
+      // blank picker and then read in something else.
+      voiceSelect.value = voicePref() || serverSpeech.voice || '';
+      if (!voiceSelect.value) voiceSelect.value = serverSpeech.voice || '';
+
+      const paintVoiceNote = () => {
+        const noteEl = panel.querySelector('#cmo-voice-note');
+        if (!noteEl) return;
+        noteEl.textContent =
+          voiceSelect.value === 'browser'
+            ? 'Instant, free, and it sounds like a satnav. Works with no AWS permission and no network.'
+            : `Synthesised on the server by Polly’s generative engine — about two seconds before the first word, then continuous. A full-length message costs about seven cents.`;
+      };
+
+      voiceSelect.addEventListener('change', () => {
+        setVoicePref(voiceSelect.value);
+        // Whatever is playing is in the old voice, and hearing the rest of it in
+        // that voice after choosing another one reads as the setting not working.
+        stopSpeech();
+        // A change is a gesture too, so this is a free chance to make the element
+        // playable — which is what the auto-read while this sheet is open needs.
+        if (voiceSelect.value !== 'browser') unlockAudio();
+        paintVoiceNote();
+      });
+      paintVoiceNote();
     }
 
     /*
@@ -2395,7 +2480,7 @@
     const following = Date.now() < sheetFollowUntil;
     panel.querySelector('#cmo-status-follow').textContent = !following
       ? 'This has stopped refreshing itself — tap Refresh, or reopen it, to follow along again.'
-      : speechAvailable()
+      : speechAvailable() || serverVoiceReady()
         ? 'Refreshing every 5 seconds while this is open, and reading out anything new that Claude says. Stop silences the message being read; closing this stops it following.'
         : 'Refreshing every 5 seconds while this is open.';
 
@@ -2678,6 +2763,22 @@
    * workbench page can, and it is also the one place that already has the text,
    * from /api/claude-status. So the overlay speaks, and the panel is untouched.
    *
+   * There are two voices, and which one is used is a setting in this sheet.
+   *
+   *   The **server voice** is the default and the reason this feature is worth
+   *   using: Amazon Polly's generative engine, synthesised by /api/speak and
+   *   played here as ordinary audio. It sounds like a person reading — see
+   *   chat-service/speak.js. It costs about seven cents for a full-length message
+   *   and takes about two seconds to say the first word, which is why the server
+   *   cuts a message into pieces and this plays them in a chain.
+   *
+   *   The **browser voice** is `speechSynthesis`, which was all of this feature
+   *   until now. It is instant and free and it sounds like a satnav from 2009. It
+   *   stays for three reasons that are all real: it works with no AWS permission
+   *   at all, it is what answers when the server refuses or the network is gone,
+   *   and it is the only one that starts the very instant a thumb comes off the
+   *   button. Anyone who prefers it can pick it.
+   *
    * Two constraints shape the rest, and both are ones the dictation sheet already
    * lives with:
    *
@@ -2710,6 +2811,109 @@
   const speechAvailable = () =>
     typeof window.speechSynthesis !== 'undefined' &&
     typeof window.SpeechSynthesisUtterance === 'function';
+
+  /*
+   * What /api/voice-status said about the server voice: which voices there are,
+   * which is the default, and whether this box can synthesise at all. Asked once
+   * per page load, and it has to be in hand *before* the tap — iOS will not let a
+   * fetch happen between the gesture and the sound, so a read that had to ask
+   * first would be a read that never started.
+   *
+   * Null means no server voice, for any reason: an older deployment with no such
+   * route, a lapsed chat-service session (this surface is gated separately from
+   * code-server), an instance role without Polly, or no network. All four have the
+   * same answer — the browser's own voice, silently.
+   */
+  let serverSpeech = null;
+  const serverVoiceReady = () =>
+    Boolean(serverSpeech?.configured) &&
+    Array.isArray(serverSpeech.voices) &&
+    serverSpeech.voices.length > 0 &&
+    typeof window.Audio === 'function';
+
+  async function loadSpeechVoices() {
+    try {
+      const res = await fetch('/api/voice-status', { headers: { Accept: 'application/json' } });
+      if (!res.ok) return;
+      const body = await res.json();
+      serverSpeech = body?.speech?.configured ? body.speech : null;
+    } catch {
+      /* no server voice available; speechSynthesis is the answer and needs no fetch */
+    }
+  }
+
+  /*
+   * Which voice, remembered per device.
+   *
+   * Empty means "whatever the server's default is", rather than a copy of the
+   * server's default frozen at first use: the default is set in one place
+   * (SPEAK_VOICE in chat-service/speak.js) and a phone that never chose should
+   * follow it. 'browser' is the explicit choice of the local voice.
+   */
+  const VOICE_KEY = 'cmo-voice';
+  function voicePref() {
+    try {
+      return localStorage.getItem(VOICE_KEY) || '';
+    } catch {
+      return '';
+    }
+  }
+  function setVoicePref(value) {
+    try {
+      if (value) localStorage.setItem(VOICE_KEY, value);
+      else localStorage.removeItem(VOICE_KEY);
+    } catch {
+      /* private mode: the choice holds for this page and no longer */
+    }
+  }
+  /** The voice to ask for, or '' to let the server pick. */
+  function chosenVoice() {
+    const wanted = voicePref();
+    if (!wanted || wanted === 'browser') return '';
+    return (serverSpeech?.voices || []).some((v) => v.id === wanted) ? wanted : '';
+  }
+  /** Is the browser's own voice the one that has been asked for? */
+  const wantsBrowserVoice = () => voicePref() === 'browser';
+
+  /*
+   * The audio element, and the tap that makes it usable.
+   *
+   * iOS will not play audio that no gesture asked for, and the permission is
+   * granted to *an element*, not to the page: an `<audio>` that has been played
+   * once inside a tap can be given a new `src` and played again from a timer
+   * afterwards. That is what makes the two things this needs possible at all —
+   * fetching the audio after the tap (there is no way around that; it does not
+   * exist yet when the button is pressed), and reading out a message that arrives
+   * while the sheet is open, which is not a tap at all.
+   *
+   * So one element, created and unlocked on the first tap and then kept for the
+   * life of the page, and a silent WAV to unlock it with. Never replaced: a new
+   * element would be locked again, and the next read would be silence.
+   */
+  const SILENCE =
+    'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YQAAAAA=';
+  let audioEl = null;
+
+  function unlockAudio() {
+    if (typeof window.Audio !== 'function') return false;
+    if (!audioEl) {
+      audioEl = new window.Audio();
+      audioEl.preload = 'auto';
+    }
+    try {
+      audioEl.onended = null;
+      audioEl.onerror = null;
+      audioEl.src = SILENCE;
+      const played = audioEl.play();
+      // Older browsers return undefined here rather than a promise, and a rejection
+      // is not a failure worth reporting: it means this was not a gesture, and the
+      // read that follows will say so if it turns out to matter.
+      if (played && typeof played.catch === 'function') played.catch(() => {});
+    } catch {
+      /* as above */
+    }
+    return true;
+  }
 
   /**
    * Markdown as something worth listening to.
@@ -2968,7 +3172,238 @@
         /* a synthesiser that refuses to be cancelled is still one we forget */
       }
     }
+    stopServerRead();
     paintSpeech();
+  }
+
+  /*
+   * Reading with the server voice.
+   *
+   * The shape is forced by what the audio is: a message is several complete mp3s,
+   * fetched one at a time and played in a chain, and none of them exist until they
+   * are asked for. Which gives three things to be careful about.
+   *
+   *   **The chain has to survive Stop.** Every fetch and every `ended` handler
+   *   outlives the read that started it, and a piece that arrives after Stop must
+   *   not begin playing — so each read gets a generation, and everything checks it
+   *   before doing anything. Same reason `sayNext` checks `speaking`.
+   *
+   *   **The next piece is fetched while this one plays.** Synthesis takes about a
+   *   fifth of the time the audio takes to play (measured; see speak.js), so one
+   *   piece ahead is enough to make a message continuous, and fetching further
+   *   ahead than that would pay for audio that Stop is about to discard.
+   *
+   *   **The first failure is recoverable and the rest are not.** If nothing has
+   *   been heard yet, the browser's own voice can still read the whole message and
+   *   the listener hears one voice reading one message. Once a piece has played,
+   *   falling back would start the message again in a different voice, which is
+   *   worse than stopping and saying why.
+   */
+  let read = null;
+  let readGeneration = 0;
+
+  function releaseSegment(index) {
+    const url = read?.urls.get(index);
+    if (!url) return;
+    read.urls.delete(index);
+    try {
+      window.URL.revokeObjectURL(url);
+    } catch {
+      /* nothing to release, or a browser that never made one */
+    }
+  }
+
+  function stopServerRead() {
+    readGeneration += 1;
+    if (read) {
+      for (const index of [...read.urls.keys()]) releaseSegment(index);
+      read = null;
+    }
+    if (!audioEl) return;
+    audioEl.onended = null;
+    audioEl.onerror = null;
+    try {
+      audioEl.pause();
+      // Detached rather than set to '': an empty src is a request for the page's
+      // own URL, which some browsers will actually go and fetch.
+      audioEl.removeAttribute('src');
+      if (typeof audioEl.load === 'function') audioEl.load();
+    } catch {
+      /* the element keeps its unlock either way, which is the part that matters */
+    }
+  }
+
+  /** Say why, on the sheet, if the sheet is open to be told. */
+  function sayWhy(text) {
+    const detail = panel.querySelector('#cmo-status-detail');
+    if (detail) detail.textContent = text;
+  }
+
+  /** The sentence the server sent with a refusal, or the status on its own. */
+  async function refusalReason(res) {
+    try {
+      const body = await res.json();
+      if (body?.error) return String(body.error);
+    } catch {
+      /* not JSON: the status is all there is to go on */
+    }
+    return res.status === 401
+      ? 'the chat service is not signed in on this device'
+      : `the server answered ${res.status}`;
+  }
+
+  /**
+   * One piece of audio, as a URL that can be played. Started once and shared, so
+   * asking for the piece that is already on its way is free.
+   */
+  function segmentUrl(index, generation) {
+    if (!read || index < 0 || index >= read.total) return null;
+    const already = read.fetching.get(index);
+    if (already) return already;
+    const pending = fetch(`/api/speak?id=${encodeURIComponent(read.id)}&segment=${index}`)
+      .then(async (res) => {
+        if (!res.ok) throw new Error(await refusalReason(res));
+        const blob = await res.blob();
+        const url = window.URL.createObjectURL(blob);
+        // Stop happened while this was in flight: hand back nothing, and do not
+        // leak the URL that was just created for it.
+        if (generation !== readGeneration || !read) {
+          try {
+            window.URL.revokeObjectURL(url);
+          } catch {
+            /* as above */
+          }
+          return null;
+        }
+        read.urls.set(index, url);
+        return url;
+      });
+    read.fetching.set(index, pending);
+    return pending;
+  }
+
+  /** Play piece `index`, then the one after it, until Stop or the end. */
+  async function playSegment(index, generation) {
+    let url = null;
+    try {
+      url = await segmentUrl(index, generation);
+    } catch (err) {
+      readTrouble(index, generation, err.message);
+      return;
+    }
+    if (generation !== readGeneration || !read || !url) return;
+
+    // One ahead, while this one plays. Failures here are not reported: this piece
+    // is about to be asked for properly, and that is where it will be handled.
+    if (index + 1 < read.total) {
+      const ahead = segmentUrl(index + 1, generation);
+      if (ahead) ahead.catch(() => {});
+    }
+
+    audioEl.onended = () => {
+      if (generation !== readGeneration) return;
+      releaseSegment(index);
+      if (read && index + 1 < read.total) {
+        playSegment(index + 1, generation);
+        return;
+      }
+      // The end of the message: keep the element and its unlock, drop everything
+      // else, and put the bar back to being a status button.
+      stopServerRead();
+      speaking = false;
+      paintSpeech();
+    };
+    audioEl.onerror = () => {
+      if (generation === readGeneration) readTrouble(index, generation, 'the audio would not play');
+    };
+
+    try {
+      audioEl.src = url;
+      const played = audioEl.play();
+      if (played && typeof played.catch === 'function') {
+        played.catch((err) => {
+          if (generation === readGeneration) {
+            readTrouble(index, generation, err?.message || 'the browser refused to play it');
+          }
+        });
+      }
+    } catch (err) {
+      readTrouble(index, generation, err?.message || 'the browser refused to play it');
+    }
+  }
+
+  /**
+   * Something went wrong. Fall back to the browser's voice if nothing has been
+   * heard yet, and otherwise stop and say so.
+   */
+  function readTrouble(index, generation, why) {
+    if (generation !== readGeneration) return;
+    const text = read?.text || '';
+    if (index === 0 && text) {
+      fallBackToBrowser(text, why);
+      return;
+    }
+    stopSpeech();
+    sayWhy(`Stopped reading: ${why}. The rest of the message is above.`);
+  }
+
+  /**
+   * Read the whole message with the browser's own voice instead.
+   *
+   * Best-effort by nature: on iOS this is past the gesture, so it may itself be
+   * refused — which is exactly the state the sheet then reports rather than
+   * leaving a phone that was told to read and then said nothing.
+   */
+  function fallBackToBrowser(text, why) {
+    stopServerRead();
+    speaking = false;
+    if (speechAvailable() && speakInBrowser(text)) {
+      sayWhy(`Reading with this browser's own voice: ${why}.`);
+      return;
+    }
+    paintSpeech();
+    sayWhy(`Nothing was read aloud: ${why}.`);
+  }
+
+  /**
+   * Start a server read. Synchronous up to the point where it cannot be — the
+   * element is unlocked inside the tap, and everything that has to wait for the
+   * network happens after this has already returned.
+   */
+  function speakOnServer(text) {
+    if (!unlockAudio()) return false;
+    readGeneration += 1;
+    const generation = readGeneration;
+    speaking = true;
+    paintSpeech();
+
+    fetch('/api/speak/prepare', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text, voice: chosenVoice() }),
+    })
+      .then(async (res) => {
+        if (!res.ok) throw new Error(await refusalReason(res));
+        return res.json();
+      })
+      .then((prepared) => {
+        if (generation !== readGeneration) return;
+        if (!prepared?.id || !prepared.segments) throw new Error('the server prepared nothing to play');
+        read = {
+          id: prepared.id,
+          total: prepared.segments,
+          voice: prepared.voice,
+          text,
+          urls: new Map(),
+          fetching: new Map(),
+        };
+        playSegment(0, generation);
+      })
+      .catch((err) => {
+        if (generation !== readGeneration) return;
+        fallBackToBrowser(text, err?.message || 'the server voice is unavailable');
+      });
+    return true;
   }
 
   /** Say the next piece, and the one after it, until Stop or the end. */
@@ -3000,20 +3435,35 @@
     }
   }
 
+  /** Read with the browser's own voice. Returns whether anything will be said. */
+  function speakInBrowser(text) {
+    if (!speechAvailable()) return false;
+    speechChunks = speechPieces(text);
+    if (!speechChunks.length) return false;
+    speaking = true;
+    paintSpeech();
+    sayNext();
+    return true;
+  }
+
   /**
-   * Start reading. Returns whether anything will actually be said, so the caller
-   * can label its own button honestly.
+   * Start reading, in whichever voice this device is set to. Returns whether
+   * anything will actually be said, so the caller can label its own button
+   * honestly.
    *
    * `lead` is spoken first and is plain speech, not markdown — it goes on *after*
    * the reduction rather than in front of the message, because the strips that
    * remove headings and bullets are anchored to the start of a line, and anything
    * put in front of the first line hides the marker on it.
    *
-   * Must be called inside the tap: see the note at the top of this section.
+   * Must be called inside the tap: see the note at the top of this section. That
+   * is true of both voices, for different reasons — `speechSynthesis.speak` is
+   * refused outside a gesture, and the audio element has to be unlocked by one.
    */
   function speak(markdown, lead = '') {
     stopSpeech();
-    if (!speechAvailable()) return false;
+    const canRead = speechAvailable() || serverVoiceReady();
+    if (!canRead) return false;
     /*
      * Never over a live microphone. The recognizer would hear this and dictate
      * Claude's own words back into the composer, and the whisper path would
@@ -3029,12 +3479,12 @@
     // announcing itself and saying nothing, which is worse than the button
     // reporting that there was nothing to read.
     if (!body) return false;
-    speechChunks = speechPieces(lead ? `${lead} ${body}` : body);
-    if (!speechChunks.length) return false;
-    speaking = true;
-    paintSpeech();
-    sayNext();
-    return true;
+    const text = lead ? `${lead} ${body}` : body;
+    // The server voice unless this device asked for the local one — and the local
+    // one whenever the server has nothing to offer, which is what makes this work
+    // on a deployment with no Polly permission at all.
+    if (!wantsBrowserVoice() && serverVoiceReady()) return speakOnServer(text);
+    return speakInBrowser(text);
   }
 
   // -------------------------------------------------------------- wiring
@@ -3062,9 +3512,23 @@
       stopSpeech();
       return;
     }
+    // Before the await, not after it: this is the gesture, and by the time the
+    // status has been fetched iOS no longer counts anything as one. See
+    // `unlockAudio` — the sheet's own read, and the auto-read, both depend on it.
+    if (serverVoiceReady()) unlockAudio();
     // Refreshed before opening, because this button is also "ask again" — and a
     // minutes-old snapshot is exactly the wrong thing to answer that with.
     await checkStatus();
+    /*
+     * Ask about voices again if the page has never had an answer.
+     *
+     * A phone that loaded before the chat service was signed in — which is the
+     * normal way round, since the editor has its own password — got nothing at
+     * startup and would otherwise be stuck with the robotic voice until it was
+     * reloaded. The ask is cheap and the server caches its own answer, including
+     * the failure.
+     */
+    if (!serverSpeech) await loadSpeechVoices();
     openStatus();
   });
   chip.addEventListener('click', () => {
@@ -3126,6 +3590,15 @@
    */
   checkStatus();
   startStatusHeartbeat();
+  /*
+   * Which voices this box can read in, asked once and early.
+   *
+   * Early because the answer has to be in hand before the first tap: iOS refuses
+   * audio that a gesture did not start, so a read that had to ask this first would
+   * be a read that never happened. It fails silently by design — no server voice
+   * means `speechSynthesis`, which needs no answer from anywhere.
+   */
+  loadSpeechVoices();
   /*
    * Repair a subscription that has gone quiet, silently and without prompting.
    *

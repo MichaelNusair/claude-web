@@ -123,6 +123,7 @@ npm run test:client
 npm run test:panes     # several projects at once; what closing a tab must not do
 npm run test:overlay   # 106/106; the editor overlay: chords, drafts, clipboard, speech
 npm run test:polish    # 19/19; the dictation cleanup's bounds, and its failure paths
+npm run test:speak     # 64/64; where a read-aloud message is cut, and every refusal
 npm run test:projects  # 53/53; real git repos, real pushes
 npm run test:admin     # the operations surface, and every refusal it makes
 npm run test:status    # 42/42; which conversation a device is told about, and from where
@@ -182,6 +183,12 @@ chat-service/            The chat backend + PWA client. The security boundary.
   polish.js              Makes a finished dictation readable: punctuation,
                          capitals, misheard names. Bedrock Haiku, one bounded
                          pass, returns the raw transcript on any failure.
+  speak.js               The other direction: reads a message out loud in
+                         Amazon Polly's generative voice. Cut into segments so
+                         the voice starts ~2s after the tap, cached by a hash of
+                         what it says, and capped by a daily character budget —
+                         Polly bills per character, so most of this file is
+                         about not buying the same audio twice.
   smoke-test.js          Boots app.js in jsdom — catches load-time breakage.
                          Also the notification switch, against stubbed
                          Notification/PushManager/serviceWorker: every way that
@@ -189,6 +196,11 @@ chat-service/            The chat backend + PWA client. The security boundary.
   polish-test.js         The cleanup's guard rails: what `looksLikeCleanup`
                          must reject, and that every failure path hands the
                          raw transcript back.
+  speak-test.js          Where a message gets cut, which is the part of the
+                         voice a listener can hear, and every refusal: the daily
+                         budget, an id that aged out, a segment that does not
+                         exist. Runs against a fake synthesiser, so a test run
+                         needs no credentials and spends nothing.
   overlay-test.js        Boots pwa/mobile-overlay.js in jsdom. Nothing else
                          loads that file, and it drives the editor by
                          keybinding, so this is what checks both. Also the
@@ -1016,20 +1028,45 @@ Things that have burned people, in this codebase specifically:
   mic: dictation carries a phone-shaped question in, this carries the answer back
   out. It cannot be done from the extension — the panel is a proprietary webview,
   and the extension host is a node process with no audio device, so neither can
-  make a sound — and it needs no new route, because `/api/claude-status` already
-  returns the text. So the workbench page speaks, using the Web Speech API, and the
-  panel is untouched. Two rules hold it together, both of them ones the dictation
-  sheet already lives with: the first utterance is queued **synchronously inside the
-  click**, because iOS refuses speech that did not start in a gesture (the same
-  reason `Copy` writes the clipboard before it awaits anything), and utterances are
-  queued **one at a time, chained on `end`**, because iOS speaks the first of a long
-  queue and drops the rest. It is also a button on purpose and has no timer or
+  make a sound — and the text itself needs no new route, because
+  `/api/claude-status` already returns it. So the workbench page speaks and the panel
+  is untouched. It speaks in one of two voices, and which one is the device's own
+  choice, remembered in `cmo-voice`: Amazon Polly's generative voice, through
+  `/api/speak/prepare` and `/api/speak` (see `chat-service/speak.js`), or the
+  browser's own `speechSynthesis` — instant, free and robotic — which is both the
+  fallback whenever the server voice is unavailable or refuses and a choice in the
+  picker for anyone who prefers it. Whichever one speaks, the same iOS rule shapes
+  the code: audio has to start in a gesture. The browser voice queues its first
+  utterance **synchronously inside the click** (the same reason `Copy` writes the
+  clipboard before it awaits anything) and then queues **one at a time, chained on
+  `end`**, because iOS speaks the first of a long queue and drops the rest. The
+  server voice can do neither — at the moment of the tap its audio does not exist
+  yet — so what happens inside the tap is `unlockAudio()`, which plays a silent wav
+  on a single long-lived `<audio>` element. On iOS the permission belongs to *that
+  element*, and once it has it the element can be re-sourced and played from a
+  network callback for the rest of the page's life. That is why it is created once
+  and never replaced, why the sheet, the bar button and the voice picker all unlock
+  it on the way past, and why the auto-read of a turn that finishes while the sheet
+  is open works with server audio at all. The split between the two routes is what
+  keeps a read quick and cheap: `prepare` is free — it hashes the text, cuts it into
+  segments and hands back an id — and each `GET /api/speak?id=…&segment=n` buys one
+  segment, delivered as a complete mp3 with a `Content-Length`, because iOS is
+  unreliable about byte ranges on a streamed body. The first segment is deliberately
+  short (160 characters) so the voice starts about two seconds after the tap, the
+  later ones are long (700) so a message is not dozens of round trips, and the next
+  is fetched while the current one plays. Stop after one sentence and the rest was
+  never synthesised, so it was never billed — which is the reason the whole message
+  is not bought in a single POST. It is also a button on purpose and has no timer or
   subscription anywhere: a turn can end while you are talking to someone, and a
   phone that starts speaking by itself is worse than one that stays quiet. While it
   reads, the bar's status button *is* Stop — it pulses, its glyph changes, and it
   does not reopen the sheet — because the sheet is dismissed by tapping beside it
   and the voice carries on afterwards, so at that point the bar holds the only
-  control there is. Do not "fix" it back into a plain open-the-sheet button. And it
+  control there is. Do not "fix" it back into a plain open-the-sheet button. Stop
+  has more to undo than it looks: as well as cancelling `speechSynthesis` it pauses
+  the element, detaches its `src`, revokes the blob URLs and bumps a generation
+  counter — a segment already in flight will still arrive, and it must not be heard
+  after Stop. And it
   never speaks over a live microphone — `startDictation` stops it and `speak`
   refuses while the mic button carries `cmo-rec` — because the recognizer would
   otherwise dictate Claude's own reply into the composer and the whisper recorder
@@ -1052,8 +1089,13 @@ Things that have burned people, in this codebase specifically:
   the strips are anchored to the start of a line, so text put ahead of the first line
   hides the marker on it (`## Done` was read out as "hash hash Done" that way). It is
   all deterministic and local rather than a call to `polish.js`, which would do it
-  better: a model round trip between the tap and the first word is exactly what iOS
-  will not allow.
+  better. For the browser voice that is forced: a model round trip between the tap
+  and the first word is exactly what iOS will not allow, because the utterance has to
+  be queued inside the click. The server voice does make a round trip, so the rule
+  binds it less tightly — but the answer is the same, because reducing the text
+  through a model first would put a second wait ahead of synthesis and roughly double
+  the two seconds before the first word, on text that is about to be spoken once and
+  thrown away.
 - **Three things now read the same markdown, and they want different reductions.**
   `renderMarkdown()` draws the status sheet, `plainLine()` feeds the chip and the
   conversation list, `speakable()` feeds the voice — and the temptation on finding

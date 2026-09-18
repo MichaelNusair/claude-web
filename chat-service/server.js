@@ -19,6 +19,12 @@ import { WebSocketServer } from 'ws';
 import { SessionManager, PROJECTS_ROOT, DEFAULT_MODEL } from './session-manager.js';
 import { transcribe, voiceStatus, resetConfigCache } from './transcribe.js';
 import { polish } from './polish.js';
+import {
+  prepare as prepareSpeech,
+  speakSegment,
+  speechStatus,
+  resetSpeech,
+} from './speak.js';
 import { claudeStatus } from './claude-status.js';
 import { manifestForProject } from './manifest.js';
 import { vapidPublicKey, addSubscription, removeSubscription, listSubscriptions, notifyAll, topicFor } from './push.js';
@@ -71,6 +77,24 @@ const json = (res, code, body) => {
     'Content-Length': Buffer.byteLength(payload),
   });
   res.end(payload);
+};
+
+/**
+ * A refusal from the voice, answered with the status it carries.
+ *
+ * None of these are bugs, and each one has something the client can do about it:
+ * 404 means prepare the text again (which is free), 429 means the day's character
+ * budget is spent, 403 means this instance's role cannot call Polly. The overlay's
+ * response to all of them is the same — go back to the browser's own voice — so
+ * the sentence travels in the body, where the status sheet can show it instead of
+ * the read just going quiet. Anything without a status is a real error and is left
+ * to the handler's own catch, which logs it and answers 500.
+ */
+const speakRefusal = (res, err) => {
+  if (err?.name !== 'SpeakError') throw err;
+  // The ones an operator has to fix, rather than the ones a client causes.
+  if (err.status === 403 || err.status >= 500) console.warn('speak:', err.message);
+  json(res, err.status, { error: err.message });
 };
 
 async function readBody(req, limit = 32 * 1024 * 1024) {
@@ -407,8 +431,19 @@ const server = http.createServer(async (req, res) => {
     if (pathname === '/api/voice-status' && req.method === 'GET') {
       // ?refresh=1 re-reads the secret, so a rotated key or a newly created
       // deployment takes effect without restarting the service.
-      if (url.searchParams.get('refresh')) resetConfigCache();
-      json(res, 200, await voiceStatus());
+      if (url.searchParams.get('refresh')) {
+        resetConfigCache();
+        resetSpeech();
+      }
+      // Both directions in one answer: which engine will hear you (transcribe.js)
+      // and which voice will read to you (speak.js). The overlay asks once and
+      // builds its mic button and its voice picker from the reply, and `speech`
+      // never throws — a box that cannot synthesise says so and keeps the
+      // browser's own voice.
+      json(res, 200, {
+        ...(await voiceStatus()),
+        speech: await speechStatus({ lang: url.searchParams.get('lang') || 'en' }),
+      });
       return;
     }
 
@@ -435,6 +470,65 @@ const server = http.createServer(async (req, res) => {
       const names = (await manager.listProjects().catch(() => [])).map((p) => p.name);
       const { text, changed } = await polish(body.text, { vocabulary: names });
       json(res, 200, { text, changed });
+      return;
+    }
+
+    /*
+     * Read a message out loud in a voice that sounds like a person, in two steps.
+     *
+     * The split is not ceremony: synthesis is billed per character and takes about
+     * a fifth of the time its own audio takes to play, so `prepare` registers the
+     * text and says how many pieces it is — free, instant, nothing synthesised —
+     * and each piece is then fetched as it is needed while the previous one plays.
+     * A read abandoned after the first sentence costs one short piece instead of a
+     * whole message. See speak.js for the measurements the sizes come from.
+     *
+     * The text is whatever the client wants said. It is already the caller's own
+     * conversation, reduced from markdown in the overlay, and it goes nowhere but
+     * Polly.
+     */
+    if (pathname === '/api/speak/prepare' && req.method === 'POST') {
+      const body = JSON.parse((await readBody(req, 64 * 1024)).toString() || '{}');
+      try {
+        json(res, 200, prepareSpeech(body.text, { voice: body.voice }));
+      } catch (err) {
+        speakRefusal(res, err);
+      }
+      return;
+    }
+
+    /*
+     * One piece of a prepared message, as a complete mp3.
+     *
+     * Complete, with a Content-Length, rather than streamed: iOS Safari is
+     * unreliable about playing a media response it cannot range-request, and this
+     * feature exists for a phone. The short first piece is what keeps the wait
+     * before the first word to a couple of seconds.
+     *
+     * Cacheable because it is content-addressed — the id is a hash of the engine,
+     * the voice and the words, and Polly is deterministic, so the same id can only
+     * ever mean the same audio. `private` because it is a private conversation
+     * being read aloud.
+     */
+    if (pathname === '/api/speak' && req.method === 'GET') {
+      const id = url.searchParams.get('id') || '';
+      if (!/^[0-9a-f]{8,64}$/.test(id)) {
+        json(res, 400, { error: 'id is not a prepared message' });
+        return;
+      }
+      try {
+        const { audio, cached } = await speakSegment(id, Number(url.searchParams.get('segment') || 0));
+        res.writeHead(200, {
+          'Content-Type': 'audio/mpeg',
+          'Content-Length': audio.length,
+          'Cache-Control': 'private, max-age=600',
+          // So `journalctl` and the tests can tell a synthesis from a re-read.
+          'X-Speak-Cached': cached ? '1' : '0',
+        });
+        res.end(audio);
+      } catch (err) {
+        speakRefusal(res, err);
+      }
       return;
     }
 

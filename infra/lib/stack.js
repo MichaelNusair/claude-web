@@ -162,6 +162,21 @@ export class ClaudeWebStack extends Stack {
         resources: ['*'],
       }),
     );
+    // Read aloud: the generative voice that speaks a finished message, and the
+    // voice list the picker in the status sheet is built from. Two actions, and
+    // neither leaves anything behind — `polly:StartSpeechSynthesisTask`, the
+    // asynchronous form, writes mp3s into a bucket of the caller's choosing and is
+    // deliberately not granted. There is nothing to scope these to: a Polly ARN
+    // names a custom lexicon, and this deployment has none. Without this grant the
+    // app still runs and still reads messages aloud — `/api/voice-status` reports
+    // the voice as unavailable and every device falls back to its own browser
+    // voice — so a deployer who declines it loses the good voice, not the feature.
+    role.addToPolicy(
+      new iam.PolicyStatement({
+        actions: ['polly:SynthesizeSpeech', 'polly:DescribeVoices'],
+        resources: ['*'],
+      }),
+    );
     passwordSecret.grantRead(role);
     sessionSecret.grantRead(role);
     whisperSecret.grantRead(role);
