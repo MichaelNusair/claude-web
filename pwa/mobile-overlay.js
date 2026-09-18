@@ -53,7 +53,7 @@
    *
    * Bump it when this file changes in a way anyone would look for.
    */
-  const OVERLAY_BUILD = '2026-09-18';
+  const OVERLAY_BUILD = '2026-09-18.2';
 
   // -------------------------------------------- survive a browser refresh
   /*
@@ -284,13 +284,38 @@
   }
   .cmo-dot.cmo-busy { background: #d97757; animation: cmo-blink 1.2s infinite; }
   @keyframes cmo-blink { 0%,100% { opacity: 1 } 50% { opacity: .25 } }
-  /* Whitespace preserved: it is Claude's message, and it was written with shape. */
   .cmo-said {
     margin: 10px 0 0; padding: 12px; border-radius: 12px;
     background: #272725; color: #f5f4ef;
-    font: 14px/1.5 inherit; white-space: pre-wrap; overflow-wrap: anywhere;
+    font: 14px/1.5 inherit; overflow-wrap: anywhere;
     max-height: 46vh; overflow-y: auto;
   }
+  /*
+   * Claude's message is markdown, and it is rendered rather than shown as its
+   * source — see renderMarkdown. The block elements below carry the spacing, so the
+   * container no longer preserves newlines; the paragraphs and list items still do,
+   * because a table or a diagram written without a fence has a shape, and losing it
+   * is the one thing the plain-text version was already getting right.
+   */
+  .cmo-said p, .cmo-said li { white-space: pre-wrap; margin: 0 0 8px; }
+  .cmo-said ul, .cmo-said ol { margin: 0 0 8px; padding-left: 22px; }
+  .cmo-said li { margin: 0 0 4px; }
+  .cmo-said > :last-child { margin-bottom: 0; }
+  .cmo-said strong { color: #fff; }
+  .cmo-said a { color: #d97757; }
+  .cmo-said hr { border: none; border-top: 1px solid #34342f; margin: 10px 0; }
+  .cmo-md-h { font-weight: 600; color: #fff; margin: 12px 0 6px; white-space: pre-wrap; }
+  .cmo-said code {
+    background: #1f1f1d; border-radius: 5px; padding: 1px 4px;
+    font: 12.5px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  /* A fenced block scrolls sideways rather than wrapping: code you have to push
+     along is better than code that wraps, and a wrapped diff is unreadable. */
+  .cmo-said pre {
+    margin: 0 0 8px; padding: 10px; border-radius: 8px; background: #1f1f1d;
+    overflow-x: auto; white-space: pre;
+  }
+  .cmo-said pre code { background: none; padding: 0; }
   /*
    * The other conversations in this project. Rows rather than a select, because
    * each one carries three things — what it is, what it is doing, and how long ago
@@ -1595,6 +1620,40 @@
   }
 
   /**
+   * One line of a message, with its markdown taken off rather than rendered.
+   *
+   * The chip and the conversation list are single lines of plain text — a heading or
+   * a `<strong>` has nowhere to go in them — so what they need is not the renderer
+   * that draws the sheet but the same message with its markers removed. Stripping
+   * before the line is cut also matters: an answer that opens with `**Shipped**`
+   * used to arrive in the list as a stray `**` hanging off the end of the previous
+   * sentence, because the cut landed between the marker and its text.
+   */
+  function plainLine(markdown) {
+    return (
+      String(markdown == null ? '' : markdown)
+        // A fenced block is not a line of prose. Unterminated counts: a transcript
+        // is read while it is still being written.
+        .replace(/```[\s\S]*?(```|$)/g, ' ')
+        .replace(/~~~[\s\S]*?(~~~|$)/g, ' ')
+        .replace(/!\[[^\]]*\]\([^)]*\)/g, ' ')
+        .replace(/\[([^\]]*)\]\([^)]*\)/g, '$1')
+        // Line markers while the lines are still lines: a `*` opening a bullet and
+        // a `*` opening emphasis are told apart by where they sit.
+        .replace(/^\s{0,3}#{1,6}\s+/gm, '')
+        .replace(/^\s{0,3}([-*_])(?:[ \t]*\1){2,}[ \t]*$/gm, ' ')
+        .replace(/^\s{0,3}([-*+]|\d{1,3}[.)])\s+/gm, '')
+        // Then the inline ones, bold before italic so `**` never leaves a lone `*`.
+        .replace(/`+([^`]*)`+/g, '$1')
+        .replace(/\*\*([^*]+?)\*\*/g, '$1')
+        .replace(/__([^_]+?)__/g, '$1')
+        .replace(/\*([^*\s][^*]*?)\*/g, '$1')
+        .replace(/\s+/g, ' ')
+        .trim()
+    );
+  }
+
+  /**
    * A name for a conversation.
    *
    * Claude Code's own title where there is one — it is written into the transcript
@@ -1603,8 +1662,7 @@
    */
   function nameOf(c) {
     if (c?.title) return c.title;
-    const said = c?.said || c?.last?.text || '';
-    const line = said.replace(/\s+/g, ' ').trim();
+    const line = plainLine(c?.said || c?.last?.text || '');
     return line ? line.slice(0, 48) : 'Untitled conversation';
   }
 
@@ -1614,7 +1672,7 @@
       s.state === 'working'
         ? 'Claude is working…'
         : s.last?.text
-          ? s.last.text.replace(/\s+/g, ' ').trim()
+          ? plainLine(s.last.text)
           : s.state === 'unknown'
             ? 'Claude — tap for status'
             : 'Claude is waiting for you';
@@ -1796,6 +1854,172 @@
     if (said) speak(text, status.state === 'working' ? 'Still working.' : 'Claude finished.');
   }
 
+  // --------------------------------------------------- the message, rendered
+  /*
+   * Markdown as something worth looking at — the counterpart of `speakable` below,
+   * and here for the same reason. A final message is *written*: bold, bullets,
+   * backticks, a fenced diff in the middle of it. This sheet was showing the
+   * asterisks, and on a phone this sheet is the whole of what you read of an answer,
+   * so the source is not the thing to show.
+   *
+   * Nodes, never a string of markup. Every character here is model output, it
+   * routinely contains angle brackets, and `innerHTML` behind an escaping function
+   * is one careless edit away from executing what a message asked for. Elements
+   * cannot go wrong that way: text only ever arrives through `textContent`, and the
+   * one attribute taken from the message is an href whose scheme is checked.
+   *
+   * The subset is what Claude actually writes and what fits in a sheet: fenced
+   * code, headings, bullet and numbered lists, rules, inline code, bold, italic,
+   * links. No tables, no nesting, no blockquotes — anything unrecognised is left as
+   * the text it was, which is exactly what this sheet did before.
+   */
+  const MD_FENCE = /^\s*(```|~~~)/;
+  const MD_HEADING = /^\s*(#{1,6})\s+(.*)$/;
+  const MD_RULE = /^\s*([-*_])(?:\s*\1){2,}\s*$/;
+  const MD_BULLET = /^\s*[-*+]\s+(.*)$/;
+  const MD_NUMBER = /^\s*(\d{1,3})[.)]\s+(.*)$/;
+  /*
+   * One pass over the inline forms, in this order for a reason: a backtick span
+   * wins outright, because `**` inside code is code and not bold; `**` is tried
+   * before `*`, so bold is never read as two italics; and the italic form requires
+   * a non-space after the marker, which is what keeps "2 * 3 * 4" and a `*` bullet
+   * that reached here as prose from turning the rest of a line into emphasis.
+   */
+  const MD_INLINE = new RegExp(
+    [
+      '(`+)([^`]+?)\\1', // 1,2  inline code
+      '\\*\\*([^*]+?)\\*\\*', // 3  **bold**
+      '__([^_]+?)__', // 4  __bold__
+      '\\[([^\\]]+?)\\]\\(([^)\\s]+)\\)', // 5,6  [label](href)
+      '\\*([^*\\s][^*]*?)\\*', // 7  *italic*
+    ].join('|'),
+    'g',
+  );
+
+  const mdNode = (tag, text) => {
+    const el = document.createElement(tag);
+    el.textContent = text;
+    return el;
+  };
+
+  /*
+   * A link a tap can follow, or the text it was.
+   *
+   * `javascript:` in a message from a model is a script this page would run on a
+   * tap, and there is no version of this feature that is worth that; anything but
+   * http(s) or a path on this origin stays as characters. The rest opens in a new
+   * tab, because the sheet is over a workbench with a conversation in it.
+   */
+  function mdLink(label, href) {
+    if (!/^(https?:\/\/|\/)/i.test(href)) return document.createTextNode(`${label} (${href})`);
+    const a = mdNode('a', label);
+    a.href = href;
+    a.target = '_blank';
+    a.rel = 'noopener';
+    return a;
+  }
+
+  function mdInline(text, into) {
+    const source = String(text);
+    let last = 0;
+    for (const m of source.matchAll(MD_INLINE)) {
+      if (m.index > last) into.appendChild(document.createTextNode(source.slice(last, m.index)));
+      last = m.index + m[0].length;
+      if (m[2] !== undefined) into.appendChild(mdNode('code', m[2]));
+      else if (m[3] !== undefined) into.appendChild(mdNode('strong', m[3]));
+      else if (m[4] !== undefined) into.appendChild(mdNode('strong', m[4]));
+      else if (m[5] !== undefined) into.appendChild(mdLink(m[5], m[6]));
+      else into.appendChild(mdNode('em', m[7]));
+    }
+    if (last < source.length) into.appendChild(document.createTextNode(source.slice(last)));
+    return into;
+  }
+
+  function renderMarkdown(markdown) {
+    const out = document.createDocumentFragment();
+    const lines = String(markdown == null ? '' : markdown).split('\n');
+    // The block being filled, so consecutive lines join instead of each becoming its
+    // own paragraph: a wrapped sentence is one paragraph, and a run of bullets is
+    // one list.
+    let para = null;
+    let list = null;
+    const flush = () => {
+      if (para) {
+        mdInline(para.join('\n'), out.appendChild(document.createElement('p')));
+        para = null;
+      }
+      list = null;
+    };
+
+    for (let i = 0; i < lines.length; i += 1) {
+      const line = lines[i];
+      const fence = MD_FENCE.exec(line);
+      if (fence) {
+        flush();
+        const body = [];
+        i += 1;
+        // An unterminated block is normal here: this is a transcript being read
+        // while it is still being written, so it ends where the message ends.
+        while (i < lines.length && !new RegExp(`^\\s*${fence[1]}`).test(lines[i])) {
+          body.push(lines[i]);
+          i += 1;
+        }
+        const pre = document.createElement('pre');
+        pre.appendChild(mdNode('code', body.join('\n')));
+        out.appendChild(pre);
+        continue;
+      }
+      if (!line.trim()) {
+        flush();
+        continue;
+      }
+      if (MD_RULE.test(line)) {
+        flush();
+        out.appendChild(document.createElement('hr'));
+        continue;
+      }
+      const heading = MD_HEADING.exec(line);
+      if (heading) {
+        flush();
+        const el = document.createElement('p');
+        el.className = 'cmo-md-h';
+        mdInline(heading[2], el);
+        out.appendChild(el);
+        continue;
+      }
+      const bullet = MD_BULLET.exec(line);
+      const numbered = bullet ? null : MD_NUMBER.exec(line);
+      if (bullet || numbered) {
+        if (para) flush();
+        const want = bullet ? 'UL' : 'OL';
+        if (!list || list.tagName !== want) {
+          list = document.createElement(want);
+          // Numbered lists keep the number they were written with, so a message
+          // that resumes at 4 does not silently restart at 1.
+          if (numbered && Number(numbered[1]) !== 1) list.start = Number(numbered[1]);
+          out.appendChild(list);
+        }
+        mdInline(bullet ? bullet[1] : numbered[2], list.appendChild(document.createElement('li')));
+        continue;
+      }
+      /*
+       * Prose. A line under a list item that is not itself an item continues that
+       * item — which is how a wrapped bullet arrives — rather than starting a
+       * paragraph inside the list.
+       */
+      if (list) {
+        const item = list.lastElementChild;
+        item.appendChild(document.createTextNode('\n'));
+        mdInline(line, item);
+        continue;
+      }
+      if (!para) para = [];
+      para.push(line);
+    }
+    flush();
+    return out;
+  }
+
   /** The whole of what Claude last said, for when one line was not enough. */
   function openStatus({ auto = false } = {}) {
     /*
@@ -1887,10 +2111,19 @@
       .filter(Boolean)
       .join(' · ');
 
-    // textContent, not innerHTML: this is a message from a model, it routinely
-    // contains code and angle brackets, and it is not markup.
-    panel.querySelector('#cmo-status-said').textContent =
-      s.last?.text || 'Nothing has been said in this conversation yet.';
+    /*
+     * Rendered, not shown as source — on a phone this sheet is the whole of the
+     * answer, and an answer is written with bold and bullets in it. Still nodes and
+     * never `innerHTML`: renderMarkdown builds elements and only ever puts model
+     * text through textContent, so a message containing markup stays text.
+     */
+    const saidEl = panel.querySelector('#cmo-status-said');
+    saidEl.textContent = '';
+    saidEl.appendChild(
+      said
+        ? renderMarkdown(said)
+        : document.createTextNode('Nothing has been said in this conversation yet.'),
+    );
     panel.querySelector('#cmo-status-detail').textContent = [
       ago === null ? null : ago === 0 ? 'just now' : `${ago} min ago`,
       // Where the verdict came from, because the two are not equally certain: the

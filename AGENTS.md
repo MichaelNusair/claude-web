@@ -982,6 +982,23 @@ Things that have burned people, in this codebase specifically:
   all deterministic and local rather than a call to `polish.js`, which would do it
   better: a model round trip between the tap and the first word is exactly what iOS
   will not allow.
+- **Three things now read the same markdown, and they want different reductions.**
+  `renderMarkdown()` draws the status sheet, `plainLine()` feeds the chip and the
+  conversation list, `speakable()` feeds the voice — and the temptation on finding
+  three is to unify them. Don't: a heading is an element in the sheet, nothing at all
+  on a one-line chip, and a sentence boundary out loud. What *is* shared is the one
+  rule none of them may break, which is that a message from a model is text.
+  `renderMarkdown` returns a `DocumentFragment` built with `createElement` and
+  `textContent`; it never assembles markup, and the escape-then-`innerHTML` pattern
+  in `chat-service/public/app.js` is not the precedent to copy into the editor,
+  because this script runs in a page that can drive the workbench. The single
+  attribute taken from a message is a link's `href`, and it is only set when it
+  matches `/^(https?:\/\/|\/)/` — a `javascript:` URL in a reply must never become
+  something a tap runs. `overlay-test.js` puts an `<img onerror=…>`, a `<b>` inside a
+  fence and a `javascript:` link through it for exactly that reason, and those three
+  checks are the ones to keep if anything here is ever rewritten. One consequence
+  worth knowing before you write an assertion: the sheet's `textContent` is no longer
+  the message, because the markers are gone from it.
 - **A `setTimeout(closeSheet, …)` closes whatever sheet is open when it fires, not
   the one that scheduled it.** Tap `Copy & close` in the dictation sheet and then
   open the status sheet within 700 ms, and the delayed close dismisses the new one.

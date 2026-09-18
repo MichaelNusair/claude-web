@@ -295,6 +295,15 @@ talking on its own after you have put it down is worse than one that stays quiet
 It names the conversation it is talking about, since the panel and the chat app can
 be in different ones.
 
+The message is **rendered, not shown as source**: bold, headings, bullets, links and
+fenced code come out as themselves, because on a phone that sheet is the whole of
+what you read of an answer and an answer is written to be read. The one-line
+surfaces — the chip and the conversation list — get the markers stripped instead,
+since a heading has nowhere to go on one line. Nothing about a message is ever
+treated as markup: the renderer builds elements and puts model text through
+`textContent`, and a link is only tappable if it points at http(s) or at this
+origin.
+
 That sheet is also where you **ask to be buzzed when a turn ends** — one tap, and it
 sends itself a test notification so you know it works rather than assuming. It is the
 same switch as the one in the chat app's settings and the same subscription behind it;

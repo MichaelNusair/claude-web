@@ -690,14 +690,30 @@ ok(
   'the status sheet did not open',
   sheet.classList.contains('cmo-open') && doc.getElementById('cmo-status-said'),
 );
+/*
+ * The message is rendered as markdown, so the sheet's text is the message *without*
+ * its markers — the backticked span here becomes an element and its backticks stop
+ * being characters. What has to survive is every other character, including the ones
+ * that look like markup.
+ */
+const saidEl = () => doc.getElementById('cmo-status-said');
 ok(
   'the sheet shows a truncated message — the point of it is that one line was not enough',
-  doc.getElementById('cmo-status-said')?.textContent === said,
+  (saidEl()?.textContent ?? '').includes('Done. Try <img src=x onerror="alert(1)"> and'),
+);
+ok(
+  'the second paragraph of the message is missing from the sheet',
+  /Second line\./.test(saidEl()?.textContent ?? ''),
 );
 ok(
   'the message was injected as markup, not text: an <img> from a model reply built ' +
     'an element in the editor',
   !doc.querySelector('#cmo-status-said img'),
+);
+ok(
+  'a backticked span in the message was not rendered as code, so the sheet still ' +
+    'shows the backticks it was written with',
+  saidEl()?.querySelector('code')?.textContent === 'a < b',
 );
 ok(
   'the sheet does not say where the verdict came from — the broker knows, the ' +
@@ -1620,6 +1636,179 @@ ok(
 ok(
   'the install check names the app in the way but not what to do about it',
   /home screen/.test(why),
+);
+
+// --------------------------------------------------------- markdown, rendered
+/*
+ * The sheet is where a final message is read on a phone, and a final message is
+ * written: bold, bullets, a fenced diff in the middle of it. It used to show the
+ * asterisks.
+ *
+ * Two kinds of check here, and the second kind is the one that matters. The first
+ * is that each form becomes the element it should. The second is that *no* model
+ * text ever becomes markup — the renderer builds nodes and puts text through
+ * `textContent`, and the way that regresses is someone finding it easier to
+ * assemble a string and assign `innerHTML`. Both the HTML in the fenced block and
+ * the `javascript:` URL below are there to fail loudly if that happens.
+ */
+const openFresh = async (text) => {
+  doc.getElementById('cmo-status-close')?.dispatchEvent(new w.MouseEvent('click', { bubbles: true }));
+  await settle(30);
+  statusReply = answer(text);
+  await tapStatus();
+  await settle(30);
+  return doc.getElementById('cmo-status-said');
+};
+
+const md = await openFresh(
+  [
+    '## Heading with `code` in it',
+    '',
+    'Paragraph with **bold**, *italic*, __also bold__ and a [link](https://example.com/x).',
+    'Wrapped onto a second line.',
+    '',
+    '- first bullet, **emphasised**',
+    '- second bullet',
+    '',
+    '3. step three',
+    '4. step four',
+    '',
+    '---',
+    '',
+    '```js',
+    'const a = 1 < 2;',
+    '  if (a) console.log("<b>hi</b>");',
+    '```',
+    '',
+    'Tap [here](javascript:alert(1)) to see.',
+  ].join('\n'),
+);
+
+ok(
+  'the message is still shown as its own source — the markdown markers are on screen',
+  !/[*`#]/.test(md?.textContent ?? '') && !/^\s*-\s/m.test(md?.textContent ?? ''),
+);
+ok('a heading was not rendered as one', /Heading with/.test(md?.querySelector('.cmo-md-h')?.textContent ?? ''));
+ok(
+  'inline markdown inside a heading was left as source, so a heading is the one place ' +
+    'backticks still show',
+  md?.querySelector('.cmo-md-h code')?.textContent === 'code',
+);
+ok(
+  '**bold** did not become bold, which is the marker that started this',
+  [...(md?.querySelectorAll('strong') ?? [])].some((el) => el.textContent === 'bold'),
+);
+ok('__bold__ did not become bold', [...(md?.querySelectorAll('strong') ?? [])].some((el) => el.textContent === 'also bold'));
+ok('*italic* did not become italic', md?.querySelector('em')?.textContent === 'italic');
+ok(
+  'a wrapped sentence became two paragraphs, so a message reads as though it were ' +
+    'broken up',
+  [...(md?.querySelectorAll('p') ?? [])].some(
+    (el) => /Paragraph with/.test(el.textContent) && /second line/.test(el.textContent),
+  ),
+);
+ok('a bulleted list did not become a list', md?.querySelectorAll('ul li').length === 2);
+ok(
+  'inline markdown inside a list item was left as source',
+  md?.querySelector('ul li strong')?.textContent === 'emphasised',
+);
+ok('a numbered list did not become one', md?.querySelectorAll('ol li').length === 2);
+ok(
+  'a numbered list that starts at 3 restarts at 1, so the steps are renumbered under ' +
+    'the reader',
+  md?.querySelector('ol')?.getAttribute('start') === '3',
+);
+ok('a rule between sections did not become one', md?.querySelectorAll('hr').length === 1);
+ok(
+  'a fenced block did not become a code block',
+  md?.querySelector('pre code')?.textContent ===
+    'const a = 1 < 2;\n  if (a) console.log("<b>hi</b>");',
+);
+ok(
+  'HTML inside a fenced block became an element: model output is being assigned as ' +
+    'markup somewhere in the renderer',
+  !md?.querySelector('pre b'),
+);
+ok(
+  'a link in the message is not tappable',
+  md?.querySelector('a[href="https://example.com/x"]')?.textContent === 'link',
+);
+ok(
+  'a link opens over the workbench instead of beside it',
+  md?.querySelector('a[href="https://example.com/x"]')?.target === '_blank' &&
+    /noopener/.test(md?.querySelector('a[href="https://example.com/x"]')?.rel ?? ''),
+);
+ok(
+  'a javascript: URL from a model became a link — one tap would run whatever the ' +
+    'message asked for, in a page that can drive the editor',
+  ![...(md?.querySelectorAll('a') ?? [])].some((el) =>
+    /^javascript:/i.test(el.getAttribute('href') || ''),
+  ),
+);
+ok(
+  'a link that was refused vanished instead of staying readable as text',
+  /here \(javascript:alert\(1\)\)/.test(md?.textContent ?? ''),
+);
+
+/*
+ * The chip and the conversation list are one line of plain text each, so they get
+ * the markers taken off instead of rendered. The fixture is the artefact from the
+ * phone: an answer whose second paragraph opens with `**`, cut to length, arriving
+ * in the list as a stray pair of asterisks hanging off the previous sentence.
+ */
+const marked = 'Done with my half. Here is where things stand.\n\n**Shipped** the `renderer` and:\n\n- one\n- two';
+statusReply = {
+  ...answer(marked),
+  conversations: [
+    { sessionId: 'abc123', state: 'idle', said: marked, at: Date.now() },
+    { sessionId: 'def456', state: 'idle', said: '## Heading\n\nA second one.', at: Date.now() },
+  ],
+};
+doc.getElementById('cmo-status-close')?.dispatchEvent(new w.MouseEvent('click', { bubbles: true }));
+await settle(30);
+await tapStatus();
+await settle(30);
+ok(
+  'the chip shows the markdown it was written with, so a one-line summary ends in a ' +
+    'stray marker',
+  !/[*`#]/.test(doc.getElementById('cmo-chip')?.querySelector('.cmo-chip-text')?.textContent ?? ''),
+);
+ok(
+  'stripping the markers ate the words with them',
+  /Done with my half/.test(
+    doc.getElementById('cmo-chip')?.querySelector('.cmo-chip-text')?.textContent ?? '',
+  ),
+);
+const listText = [...doc.querySelectorAll('#cmo-convos .cmo-convo-label')]
+  .map((el) => el.textContent)
+  .join(' | ');
+ok(
+  'the conversation list shows raw markdown — the list is where a stray ** was ' +
+    'noticed on the phone',
+  listText && !/[*`#]/.test(listText),
+);
+
+/*
+ * A transcript is read while it is still being written, so the fence at the end of
+ * a half-written block has not arrived yet. Dropping the block until it closes
+ * would blank the most recent thing Claude said.
+ */
+const partial = await openFresh('Here it is:\n\n```\nunfinished output');
+ok(
+  'a code block that has not been closed yet is dropped, so a message being written ' +
+    'loses its tail',
+  partial?.querySelector('pre code')?.textContent === 'unfinished output',
+);
+
+/*
+ * Anything unrecognised has to come out as the characters it went in as — an ASCII
+ * diagram or a stack trace is not markdown, and this sheet showed it correctly
+ * before there was a renderer at all.
+ */
+const plain = await openFresh('Layout:\n  a -> b\n  b -> c');
+ok(
+  'an indented diagram lost its leading spaces, so anything drawn in text collapses',
+  /Layout:\n {2}a -> b\n {2}b -> c/.test(plain?.textContent ?? ''),
 );
 
 // ------------------------------------------------------------------- results
