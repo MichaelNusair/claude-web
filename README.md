@@ -414,14 +414,21 @@ installed". A project therefore gets a path of its own, which nginx proxies to t
 same code-server `/editor/` does. Both addresses still work; only the per-project one
 can be installed.
 
-If Chrome still answers **"this app is already installed"**, it is matching this page
-against something on the home screen already — the chat app's own manifest claims the
-whole site, and it is now the only thing left that can. **Check this install**, beside
-that button, asks the phone what it can see: which manifest this page links, whether
-this page is inside that manifest's scope, whether Chrome offered an install, and which
-installed app it thinks this page belongs to. Removing that icon frees the origin. It
-also prints the version of the overlay it is running, because a workbench left open
-across a deploy keeps the script it loaded; reloading the page is the fix for that one.
+**The chat app lives at `/chat/` for the same reason.** It used to be served at the
+root and to claim the whole site as its scope, which meant one chat icon on the home
+screen claimed every project too, and Chrome refused each project install after it as
+"already installed". The bare URL now redirects there, so nothing changes about how
+you open it.
+
+If Chrome still answers **"this app is already installed"**, the likeliest cause is an
+icon added before that move: a phone keeps the scope an app was installed with until
+Chrome refreshes it, so an old chat icon is still claiming the whole site. Remove it
+from the home screen and add it again. **Check this install**, beside the project
+button, asks the phone what it can see rather than guessing: which manifest this page
+links, whether this page is inside that manifest's scope, whether Chrome offered an
+install, and which installed app it thinks this page belongs to. It also prints the
+version of the overlay it is running, because a workbench left open across a deploy
+keeps the script it loaded; reloading the page is the fix for that one.
 
 ## Cost
 

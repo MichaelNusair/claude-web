@@ -21,6 +21,13 @@
  * projects that differ only in `?folder=` are one app to Android whatever their ids
  * say — see projectWindowPath below, which is why /p/<name>/ exists.
  *
+ * Nor was a path per project enough on its own, because the chat app's scope was `/`
+ * and a path under `/` is still inside it. An installed app claims every URL in its
+ * scope, so the chat icon claimed every project, and Chrome answered each project
+ * install after it with "already installed". That is why the chat app now starts at
+ * /chat/ and scopes itself there — see pwa/manifest.webmanifest, and the redirect
+ * from `/` in infra/userdata/bootstrap.sh that keeps the bare domain working.
+ *
  * So this hands out one manifest per project, differing in `id`, `start_url`, `scope`
  * and the name on the icon. Same origin, same code, same login, same push
  * subscription — one install per project, once.
@@ -125,11 +132,13 @@ export function projectManifest({ project, path }) {
      * `navigator.getInstalledRelatedApps()` only answers about applications the
      * current page's manifest declares, and this is the one question worth asking on
      * Android: which installed app does Chrome think this page belongs to? Chrome
-     * matches an installed web app to a URL by *scope*, and the chat app's manifest
-     * claims `/` — the whole origin, including every /p/<name>/ URL here — so when
-     * Chrome refuses a project install as "already installed", the chat icon is the
-     * first suspect, and this is what lets the editor's install check name it
-     * instead of guessing. See explainInstall in pwa/mobile-overlay.js.
+     * matches an installed web app to a URL by *scope*, and the chat app claimed `/`
+     * — the whole origin, every /p/<name>/ URL here included — until it was moved to
+     * /chat/ for exactly that reason. This is how the answer is checked rather than
+     * assumed: a phone whose chat icon was installed while the old manifest was live
+     * still holds a WebAPK claiming the origin, and it will keep refusing project
+     * installs until Chrome updates it or the icon is removed. See explainInstall in
+     * pwa/mobile-overlay.js.
      *
      * `prefer_related_applications` is stated rather than left to its default,
      * because it is the one member that would turn this diagnostic into a

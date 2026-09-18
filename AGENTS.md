@@ -773,14 +773,39 @@ same reason the chat's own link does. The install itself is a button in the proj
 sheet, using `beforeinstallprompt` where Chrome offers it and telling the user which
 menu item to use where it does not (every iOS browser).
 
-**Chrome can still refuse the install, and the remaining reason only exists on the
-phone: the chat app's own manifest still claims `scope: '/'`** — the whole origin,
-including every `/p/<name>/` URL — so a home screen with the chat icon on it may
-still answer "already installed" for a project. Narrowing it to `/chat/` is an
-app-file-only change that ships with `--app-only`, and it is not free: the chat's
-`start_url` moves and `/login` falls out of *its* scope too. Confirm on a device
-before paying that, which is what **Check this install** in the project sheet
-(`explainInstall`) is for. It prints the build of the overlay, the manifest this page
+**A path per project was still not enough, and the other half is that the chat app
+had to get out of the way.** Its manifest claimed `scope: '/'` — the whole origin,
+every `/p/<name>/` URL included — and an installed app claims every URL inside its
+scope, so one chat icon on a home screen claimed every project and Chrome answered
+each project install after it with "already installed". The phone reported exactly
+that, on a freshly moved domain where the chat icon was the first thing installed.
+So the chat app now lives at `/chat/`:
+
+- `pwa/manifest.webmanifest`: `start_url` and `scope` are `/chat/`, and `id` is
+  pinned to `"/"`. The `id` is explicit because it otherwise defaults to `start_url`
+  — and a changed `id` is a *different application*, so every phone with the chat
+  icon already on it would keep a dead one and install a second beside it instead of
+  updating the one it has.
+- `infra/userdata/bootstrap.sh`: `location = /` is now a path-only 302 to `/chat/`.
+  That redirect is not a courtesy. An install can only be offered from a page inside
+  the scope of the manifest it links, so a bare domain still serving the shell in
+  place would be a chat app nobody could add to a home screen.
+- The `Editor` shortcut points at `/chat/editor/`, which is inside the scope and
+  redirects out, because a browser drops an out-of-scope shortcut **silently** — a
+  menu item that quietly stops existing.
+- `manifest-test.js` asserts the two scopes do not overlap in either direction, that
+  `id` stays pinned, that every shortcut is in scope, and that both nginx redirects
+  exist and are path-only. Nothing can see that collision by reading either file
+  alone, which is how it survived a release.
+
+The same accepted cost applies as for a project: `/login` is outside `/chat/`, so
+signing in after a lapsed session shows Chrome's toolbar until it lands back.
+
+A phone that installed the chat icon *before* this shipped still holds a WebAPK
+claiming `/`, and will keep refusing project installs until Chrome updates it.
+Removing the icon and adding it again is the immediate fix, and **Check this install**
+in the project sheet (`explainInstall`) is how to confirm that is what is happening
+rather than guess. It prints the build of the overlay, the manifest this page
 links and what the server says is in it, whether this page is inside that manifest's
 scope, whether this is a browser tab at all, whether `beforeinstallprompt` fired, and
 — via `navigator.getInstalledRelatedApps()` — which installed app Chrome thinks this

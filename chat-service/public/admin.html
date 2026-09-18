@@ -15,7 +15,10 @@
 
 <section class="screen active">
   <header class="bar">
-    <a class="icon-btn back" href="/" aria-label="Back to chats">
+    <!-- /chat/, not /: that is where the chat app lives and what its manifest
+         scopes, so this link stays inside the installed window instead of
+         bouncing out to the redirect and back. -->
+    <a class="icon-btn back" href="/chat/" aria-label="Back to chats">
       <svg viewBox="0 0 24 24"><path d="M15.4 7.4 14 6l-6 6 6 6 1.4-1.4L10.8 12z"/></svg>
     </a>
     <div class="bar-title">

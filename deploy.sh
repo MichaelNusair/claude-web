@@ -620,6 +620,11 @@ verify_closed() {
 AUTH_OK=0
 verify_closed /api/projects  "GET /api/projects"  || AUTH_OK=1
 verify_closed /api/models    "GET /api/models"    || AUTH_OK=1
+# /chat/ and not /: the chat shell moved there so that an installed project icon
+# stops colliding with the chat app's scope, and / is now an nginx redirect that
+# would answer 302 — "closed" to the case below — whatever the app decided. This
+# asks the page that actually holds the shell.
+verify_closed /chat/         "GET /chat/"         || AUTH_OK=1
 verify_closed /              "GET /"              || AUTH_OK=1
 
 if [ "$AUTH_OK" -ne 0 ]; then

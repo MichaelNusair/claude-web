@@ -53,7 +53,7 @@
    *
    * Bump it when this file changes in a way anyone would look for.
    */
-  const OVERLAY_BUILD = '2026-09-18.6';
+  const OVERLAY_BUILD = '2026-09-18.7';
 
   // -------------------------------------------- survive a browser refresh
   /*
@@ -993,11 +993,12 @@
    * "It says this app is already installed" is the report this exists for, and it
    * cannot be reproduced anywhere but the phone that made it: whether Chrome offers
    * an install depends on what is already on that home screen. Android matches an
-   * installed web app to a page by *scope*, and the chat app's manifest claims the
-   * whole origin — so with the chat icon installed, every project manifest served
-   * from this origin can look to Chrome like that same app, whatever its `id` says.
-   * That is a hypothesis, not a finding, which is exactly why this prints what it
-   * can see instead of asserting a cause:
+   * installed web app to a page by *scope*, and the chat app's manifest used to claim
+   * the whole origin — so with the chat icon installed, every project manifest served
+   * from this origin looked to Chrome like that same app, whatever its `id` said. The
+   * chat app has since been narrowed to /chat/, but a WebAPK installed before that
+   * still holds the old scope until Chrome updates it, so this remains the way to
+   * find out rather than assume:
    *
    *   - the build of this file, because a page open across a deploy is the other
    *     explanation for a feature that appears to be missing;
@@ -1070,7 +1071,7 @@
         lines.push(
           apps.length
             ? `Chrome reports ${apps.length} installed app claiming this page: ` +
-              `${apps.map((a) => a.id || a.url || a.platform).join(', ')}. Removing that icon from the home screen frees this origin, and installing a project again gives it its own.`
+              `${apps.map((a) => a.id || a.url || a.platform).join(', ')}. The chat app no longer claims anything outside /chat/, so an icon added before that change is holding the old scope: remove it from the home screen, add it again, and this project will install on its own.`
             : 'Chrome reports no installed app claiming this page.',
         );
       } catch (err) {

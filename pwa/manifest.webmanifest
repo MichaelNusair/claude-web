@@ -1,9 +1,10 @@
 {
+  "id": "/",
   "name": "Claude",
   "short_name": "Claude",
   "description": "Chat with Claude Code on your projects, from any device",
-  "start_url": "/",
-  "scope": "/",
+  "start_url": "/chat/",
+  "scope": "/chat/",
   "display": "standalone",
   "orientation": "portrait-primary",
   "background_color": "#141413",
@@ -32,11 +33,11 @@
   "shortcuts": [
     {
       "name": "New chat",
-      "url": "/?new=1"
+      "url": "/chat/?new=1"
     },
     {
       "name": "Editor",
-      "url": "/editor/"
+      "url": "/chat/editor/"
     }
   ]
 }

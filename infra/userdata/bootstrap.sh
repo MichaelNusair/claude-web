@@ -554,14 +554,16 @@ CLAUDESETTINGS
 chown -R "$USER_NAME:$USER_NAME" "$DATA_MNT/claude"
 
 # ---------------------------------------------------------------------------
-# nginx: chat at /, VS Code at /editor/
+# nginx: chat at /chat/, VS Code at /editor/
 # ---------------------------------------------------------------------------
 # Routing, and why it is shaped this way:
 #
-#   = /          the chat shell, so the bare domain opens the phone UI
-#   /chat/       the chat's own static assets, prefix stripped by proxy_pass
+#   = /          a redirect to /chat/, so the bare domain still opens the chat
+#   /chat/       the chat app: its shell and its own static assets, prefix
+#                stripped by proxy_pass
 #   /login /api/ /ws   the chat service's endpoints
 #   /editor/     code-server's entry point, prefix stripped
+#   /p/<name>/   code-server again, on a path that belongs to one project
 #   /            catch-all to code-server, which serves its own absolute asset
 #                URLs (/static/..., /stable-.../...) from here
 #
@@ -629,8 +631,31 @@ server {
     location = /mobile-overlay.js { root /opt/claude-web/pwa; add_header Cache-Control "no-cache"; }
 
     # --- Chat (primary interface) -------------------------------------------
-    # The bare domain is the chat shell.
+    # The bare domain sends you to the chat, which lives at /chat/ and not here.
+    #
+    # It used to be served here, and moving it is what lets a project be
+    # installed at all. A manifest's scope is a path prefix, an installed web app
+    # on Android claims every URL under its scope, and the chat app's scope was
+    # '/' — the whole origin, every /p/<name>/ included — so with the chat icon on
+    # the home screen Chrome answered every project install with "already
+    # installed". Narrowing the chat app to /chat/ is what leaves those paths
+    # unclaimed. See pwa/manifest.webmanifest and chat-service/manifest.js.
+    #
+    # The redirect is not a courtesy: an install can only be offered from a page
+    # inside the scope of the manifest it links, so a bare domain that served the
+    # shell in place would be a chat app nobody could install. Path-only, for the
+    # same reason the project route is — nginx behind the load balancer would
+    # otherwise name the port it listens on.
     location = / {
+        absolute_redirect off;
+        port_in_redirect off;
+        return 302 /chat/;
+    }
+
+    # The chat app, and its own static assets. The trailing slash on proxy_pass
+    # strips /chat/, so the chat service sees / and /app.js while the browser asks
+    # for /chat/ and /chat/app.js.
+    location /chat/ {
         proxy_pass http://127.0.0.1:9997/;
         proxy_http_version 1.1;
         proxy_set_header Host \$host;
@@ -640,16 +665,17 @@ server {
         proxy_buffering off;
     }
 
-    # Chat assets. The trailing slash on proxy_pass strips /chat/, so the chat
-    # service sees /app.js while the browser asks for /chat/app.js.
-    location /chat/ {
-        proxy_pass http://127.0.0.1:9997/;
-        proxy_http_version 1.1;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto https;
-        proxy_buffering off;
+    # The chat app's "Editor" shortcut, which has to live inside the app's scope.
+    # A browser drops a manifest shortcut whose URL is outside it — silently, so
+    # pointing that shortcut straight at /editor/ would simply lose it. Nothing new
+    # reaches code-server here: this answers with a redirect and the browser
+    # follows it to the one route that has always served the workbench. An exact
+    # match, so it takes precedence over the /chat/ prefix above without depending
+    # on the order they are written in.
+    location = /chat/editor/ {
+        absolute_redirect off;
+        port_in_redirect off;
+        return 302 /editor/;
     }
 
     location /login {

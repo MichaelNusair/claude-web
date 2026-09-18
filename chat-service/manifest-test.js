@@ -159,6 +159,50 @@ ok(
 ok(demo.theme_color === base.theme_color, 'the theme colour drifted from the chat app');
 ok(demo.background_color === base.background_color, 'the background colour drifted from the chat app');
 
+section('And the chat app leaves the projects alone, which is the other half of it:');
+/*
+ * A path per project was necessary and still not sufficient, because the chat app
+ * scoped itself to `/` and a path under `/` is inside it. An installed web app claims
+ * every URL in its scope, so one chat icon on the home screen claimed every project,
+ * and Chrome answered each project install after it with "already installed" — the
+ * same symptom the per-project paths were meant to end, arriving from the other
+ * direction. Hence /chat/, and hence this: the two scopes must not overlap, and
+ * nothing here can tell that they do by looking at either file alone.
+ */
+ok(base.scope !== '/', 'the chat app claims the whole origin again, so no project can be installed beside it');
+ok(
+  !projectWindowPath('demo').startsWith(base.scope),
+  'a project path falls inside the chat app’s scope, so the chat icon claims it and ' +
+    'Chrome refuses the install as "already installed"',
+);
+ok(
+  !base.scope.startsWith(projectWindowPath('demo')),
+  'the chat app falls inside a project’s scope, which is the same collision upside down',
+);
+ok(
+  base.start_url.startsWith(base.scope),
+  'the chat app starts outside its own scope, so the browser discards that scope and ' +
+    'falls back to one derived from start_url',
+);
+/*
+ * `id` is explicit for one reason: absent, it defaults to start_url, and start_url
+ * just moved. A changed id is a different application, so every phone with the chat
+ * icon already on it would keep a dead one and install a second beside it rather than
+ * updating the one it has.
+ */
+ok(base.id === '/', 'the chat app’s id is not pinned to where it used to start, so moving it orphans every installed icon');
+/*
+ * Shortcut URLs have to be inside the scope too. A browser drops an out-of-scope
+ * shortcut without saying so, so the failure is a menu item that quietly stops
+ * existing — which is why /chat/editor/ exists as a route at all.
+ */
+for (const s of base.shortcuts ?? []) {
+  ok(
+    s.url.startsWith(base.scope),
+    `the "${s.name}" shortcut points outside the chat app’s scope, so the browser drops it`,
+  );
+}
+
 section('A name that cannot be a directory cannot be a manifest:');
 for (const bad of ['../etc', 'a/b', '.hidden', '', 'has space']) {
   let refused = false;
@@ -276,6 +320,47 @@ ok(
   'the project window gets no overlay injected, so it opens with no switcher, no mic ' +
     'and no way back',
 );
+
+section('And the two addresses the chat app’s move depends on:');
+/*
+ * Moving the chat app to /chat/ left the bare domain with nothing to serve, and a
+ * bare domain is what people type and what every old bookmark and installed icon
+ * points at. It also cannot simply serve the shell in place: an install is only
+ * offered from a page inside the scope of the manifest it links, so a chat app served
+ * at `/` while scoped to /chat/ is one nobody can add to a home screen. The redirect
+ * is what makes the move survive contact with a phone, and it lives in another
+ * language in another directory from the manifest that needs it.
+ */
+const rootRoute = blockFor('= /');
+ok(rootRoute, 'nginx no longer routes the bare domain, so / falls through to code-server’s catch-all');
+const rootBody = rootRoute?.[2] ?? '';
+const rootRedirect = /return\s+30[12]\s+(\S+);/.exec(rootBody);
+ok(
+  rootRedirect && rootRedirect[1].startsWith(base.scope),
+  'the bare domain does not send you into the chat app’s scope, so the app it links ' +
+    'cannot be installed from the page most people arrive on',
+);
+ok(
+  /absolute_redirect\s+off;/.test(rootBody) && /port_in_redirect\s+off;/.test(rootBody),
+  'the bare domain builds an absolute redirect, so it names the port nginx listens on ' +
+    'behind the load balancer instead of the one the world speaks to',
+);
+/*
+ * And the shortcut target. /chat/editor/ is inside the scope so the browser keeps the
+ * shortcut; without an exact-match route of its own it would fall to the /chat/ prefix
+ * and be asked of the chat service, which has never served an editor.
+ */
+const shortcutRoutes = (base.shortcuts ?? [])
+  .map((s) => s.url.split('?')[0])
+  .filter((url) => url !== base.start_url);
+for (const url of shortcutRoutes) {
+  const exact = blockFor(`= ${url}`);
+  ok(
+    exact && /return\s+30[12]\s+\S+;/.test(exact[2]),
+    `nginx has no route for the ${url} shortcut, so the menu item opens a page the chat ` +
+      'service does not serve',
+  );
+}
 
 /*
  * One trap in writing that config, met twice while writing this route: the nginx
