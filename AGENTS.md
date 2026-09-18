@@ -528,8 +528,9 @@ of the box and `/api/admin/kill` a remote kill.
 
 **It is served at `/chat/admin`** because nginx already routes `/chat/` to the
 service with the prefix stripped. A new nginx location would mean editing
-`bootstrap.sh`, which `--app-only` cannot apply and a full deploy may answer by
-replacing the instance.
+`bootstrap.sh` — which `--app-only` does ship now, but which cloud-init will not
+apply on its own, and which is therefore still the slowest thing in this repository
+to get live. See the gotchas.
 
 **The broker is inspected from the outside, with `ps` and `/proc`.** Adding a
 list/kill op to `broker.js` is the obvious move and the wrong one: its
@@ -578,6 +579,20 @@ because the failure it prevents would make the feature something you turn off:
   behind it.
 - **Nothing older than ten minutes**, and a content digest so a rewritten
   transcript is not a new answer.
+- **A turn that was *killed* says so, instead of claiming it finished.** Claude Code
+  writes an interrupted turn as an assistant entry with `stop_reason:
+  'stop_sequence'` and the text `No response requested.`, and a context overflow the
+  same way with `Prompt is too long` — both of which `inferState()` read as idle, so
+  the phone got "Claude finished" over a body quoting the artifact. That is the one
+  moment the person has to come back and say `continue`, announced as the one moment
+  they need not. `NO_ANSWER` in `claude-status.js` maps those two strings to a
+  `cutOff` of `interrupted` or `overflow`, exposed on `/api/claude-status`; the
+  watcher titles it "Claude stopped" and says which, and the overlay's sheet, chip
+  and spoken line follow the same field. Two traps, both covered by tests: the
+  artifact is *not* the last thing said (the real last message is the one before it,
+  so that is what gets previewed), and because that message was usually announced
+  already, `cutOff` is part of the digest — otherwise the stop looks like a repeat
+  and is swallowed, losing the only notification worth having.
 
 **Notifications are switched on from either surface, and there is only one of
 them.** The chat app's Settings sheet has a checkbox; the editor overlay's status
@@ -645,9 +660,14 @@ needs a *path* per project:
 - `pwa/mobile-overlay.js` sends every navigation there through `projectHref()`, so
   the switcher rows, their ⧉ new-tab siblings and the redirect after creating a
   project all land inside the scope the manifest claims.
-- `infra/userdata/bootstrap.sh` routes it, which means **this cannot be changed by
-  `deploy.sh --app-only`**: the route is a nginx location, so it needs a full deploy
-  and therefore an instance replacement.
+- `infra/userdata/bootstrap.sh` routes it. That route is a nginx location, and the
+  first attempt to ship it found the trap that cost this feature a day: the stack
+  went green, `cdk diff` said there were no differences, and the route had never
+  reached the running nginx, because cloud-init does not re-run its user-data stage
+  on a stop/start. `deploy.sh --app-only` now installs the payload's `bootstrap.sh`
+  before reprovisioning, so an edit here does ship — but verify the route through the
+  public domain, not `localhost`, because that is what caught the redirect leaking
+  `:8080`.
 
 `?folder=<path>` stays in the URL because it is what code-server reads to open the
 folder and what the overlay's `folder()` reads to know which project it is in; the
@@ -724,26 +744,37 @@ Things that have burned people, in this codebase specifically:
   edits are free.** The bootstrap script's S3 asset hash is in userdata, so
   leaving the flag on replaced the instance on every script edit; `deploy.sh`
   re-runs `/opt/bootstrap.sh` on the live instance instead, which is why
-  `bootstrap.sh` must stay idempotent. But CloudFormation's own update behaviour
-  for `UserData` on a running instance is *replacement*, so a changed bootstrap
-  asset hash still replaces the box — observed 2026-09-15, when a deploy carrying
-  one moved the whole thing to a new instance. `cdk diff` says "may be replaced"
-  when this is about to happen, and it is worth reading, because two things follow:
-  `/opt/claude-web` lives on the root volume and dies with the instance, and the
-  payload that recreates it is pushed by `deploy.sh` *after* the stack completes.
-  So drive that deploy from a machine other than the one being replaced. From the
-  instance itself it only worked because CloudFormation deletes the old instance
-  last, which is luck rather than design.
+  `bootstrap.sh` must stay idempotent. What CloudFormation does with a changed
+  `UserData` on a *running* EBS-root instance is stop → `ModifyInstanceAttribute` →
+  start, not replacement — measured 2026-09-18 from CloudTrail: change set executed
+  09:47:17, `StopInstances` 09:47:24, `ModifyInstanceAttribute` 09:47:47,
+  `StartInstances` 09:47:48, box up 09:47:54, `UPDATE_COMPLETE` 09:48:02. Same
+  instance id, same volumes, so `/opt/claude-web` and `/workspace` both survive.
+  Two things follow anyway. First, every process on the box dies at 09:47:24,
+  **including a `deploy.sh` being driven from the box** — the stages after
+  `cdk deploy` (SSM waits, payload upload, verification) never run, and the shell
+  reports nothing because it is gone. Proven the same morning: a `cdk deploy` from
+  here was killed seven seconds in, and no payload reached the instance. So drive a
+  full deploy from another machine. Second, a stop/start does *not* re-run
+  cloud-init's user-data stage, so the new bootstrap script is fetched and installed
+  by nobody — see the cloud-init gotcha near the end of this file, and the
+  `--app-only` bullet below for what does apply it now.
 - **`./deploy.sh --app-only` is how you deploy from the box itself.** It runs
   every test, packages both extensions, pushes the payload to the instance that
   is already running, and skips `cdk deploy` — so it cannot race its own
   replacement. Use it for the chat service, the extensions, the overlay and `cc`.
   It reads the running stack's outputs into `dist/outputs.json` so the stages
-  after it are the same code path as a full deploy. What it cannot do is apply an
-  edit to `infra/userdata/bootstrap.sh`: it re-runs the `/opt/bootstrap.sh`
-  already on disk, and the new one only arrives through UserData. Check with
-  `cdk diff` — if the instance would be replaced, that part needs a full deploy
-  from somewhere else.
+  after it are the same code path as a full deploy. **It applies edits to
+  `infra/userdata/bootstrap.sh` too**, since 2026-09-18: the script ships in the
+  payload, and before the reprovision step the instance re-runs its *own* UserData
+  with the S3 fetch swapped for the payload copy and the final `bash` dropped. That
+  reuses the `sed` substitutions CloudFormation wrote — four Secrets Manager ARNs
+  and the domain — so `/opt/bootstrap.sh` is replaced with the new script, fully
+  substituted, and then re-run. It refuses rather than half-does it: no
+  `__PLACEHOLDER__` may survive, and if the instance's UserData no longer looks like
+  the script this expects, it says so and re-runs the copy on disk. What
+  `--app-only` still cannot do is change an AWS resource in `infra/lib` — a security
+  group, an ALB rule, an IAM policy. That needs a full deploy, from another machine.
 - **A deploy ends every chat conversation, and only the chat's.** `deploy.sh` runs
   `systemctl restart claude-chat`, and a conversation is a child of that unit, so
   its cgroup takes all of them with it — the cgroup rule above, seen from the other
@@ -1113,15 +1144,24 @@ Things that have burned people, in this codebase specifically:
   stale when you switch conversation" was. A silent refresh only puts the chip back
   when the conversation changed or a turn finished — never merely because the timer
   fired, or a dismissed chip would return every fifteen seconds.
-- **A deploy cannot apply an `infra/userdata/bootstrap.sh` edit to a running
-  instance.** cloud-init runs `scripts-user` once per instance *ever*
-  (`/var/lib/cloud/instances/<id>/sem/config_scripts_user`), so `/opt/bootstrap.sh`
-  stays whatever first boot wrote, and the deploy's reprovision step re-runs that
-  stale copy. A stack update usually stop/starts the instance rather than replacing
-  it — verified on 2026-09-17: same instance id, new boot time, `/opt/bootstrap.sh`
-  two days old, zsh and `claude-tmux.service` simply absent after a "successful"
-  deploy. Anything that must actually land goes in the payload, which is why
-  `claude-broker/install.sh` exists and why `cc` is installed from there too.
+- **cloud-init will not re-run your `bootstrap.sh` edit, and a green stack does not
+  mean it ran.** cloud-init runs `scripts-user` once per instance *ever*
+  (`/var/lib/cloud/instances/<id>/sem/config_scripts_user`), and a stack update
+  stop/starts this instance rather than replacing it, so `/opt/bootstrap.sh` stays
+  whatever first boot wrote — verified 2026-09-17 (same instance id, new boot time,
+  `/opt/bootstrap.sh` two days old, zsh and `claude-tmux.service` absent after a
+  "successful" deploy) and again 2026-09-18, when the `/p/` nginx route was in the
+  stack, in the S3 asset and *not* in the running nginx config. The trap is what
+  happens next: the stack is `UPDATE_COMPLETE` and `cdk diff` reports "There were no
+  differences", so a re-deploy is a no-op and there is nothing left to notice. Do not
+  trust the stack for this; read the thing itself on the box (`grep` the live
+  `/etc/nginx/conf.d/claude-web.conf`, `systemctl is-active`, the unit you expected
+  to exist). `deploy.sh` now closes the loop by installing the payload's copy of the
+  script (the `--app-only` bullet above), but the general rule holds: **anything that
+  must actually land goes in the payload**, which is why `claude-broker/install.sh`
+  exists and why `cc` is installed from there too. A full deploy from another machine
+  is still what re-aligns the stack's UserData, so that if the instance is ever
+  genuinely replaced it boots the same script.
 
 ## Things not to do
 

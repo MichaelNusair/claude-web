@@ -114,6 +114,67 @@ section('A restart announces nothing:');
   ok(sent.length === 0, 'a scan with nothing new notified anyway');
 }
 
+section('A turn that was killed says so, instead of claiming it finished:');
+{
+  /*
+   * The bug this was written after, reported from a phone: "I get a 'Claude
+   * finished' message". The turn had been killed, and Claude Code marks that by
+   * writing an assistant entry reading "No response requested." with a terminal
+   * stop_reason — so it read as a finished turn, and the body quoted the artifact
+   * as though it were the answer.
+   *
+   * The second assertion is the one with a trap in it. Skipping the artifact means
+   * the last thing really *said* is the message before it, which is usually one
+   * already announced — so a watcher that decides "new" on the text alone would see
+   * a repeat and stay silent, swallowing the one notification that matters: the turn
+   * you are waiting on has stopped and will not resume by itself.
+   */
+  const { watcher, sent } = watcherWith();
+  await write(DEMO, S3, userText('ship it'), assistant('Deployed. 144/144 checks passed.'));
+  await watcher.scan(); // seed: this answer is already known and already announced
+
+  await write(
+    DEMO,
+    S3,
+    userText('ship it'),
+    assistant('Deployed. 144/144 checks passed.'),
+    assistant('No response requested.', { stop: 'stop_sequence' }),
+  );
+  await watcher.scan();
+
+  ok(sent.length === 1, `${sent.length} notifications for a killed turn — a repeat digest swallowed it`);
+  const { payload } = sent[0] || { payload: {} };
+  ok(payload.title === 'Claude stopped · demo', `the title is ${JSON.stringify(payload.title)}`);
+  ok(payload.cutOff === 'interrupted', 'the payload does not say why it stopped');
+  ok(
+    /needs a nudge/.test(payload.body || ''),
+    `the body does not say what to do about it: ${JSON.stringify(payload.body)}`,
+  );
+  ok(
+    !/No response requested/.test(payload.body || ''),
+    'the harness artifact is read out as though Claude had said it',
+  );
+  ok(
+    /Deployed\. 144/.test(payload.body || ''),
+    'the body does not say what it was in the middle of, which is what makes it recognisable',
+  );
+
+  // And once, not once per poll: a lock screen that repeats itself is one people turn off.
+  await watcher.scan();
+  ok(sent.length === 1, 'the same cut-off turn notified twice');
+
+  await write(
+    DEMO,
+    S3,
+    userText('ship it'),
+    assistant('Deployed. 144/144 checks passed.'),
+    assistant('No response requested.', { stop: 'stop_sequence' }),
+    userText('continue'),
+  );
+  await watcher.scan();
+  ok(sent.length === 1, 'a cut-off turn that was picked up again notified again');
+}
+
 section('A finished turn, on a session this app is not driving:');
 {
   const { watcher, sent } = watcherWith();

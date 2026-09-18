@@ -132,6 +132,42 @@ status = await claudeStatus(CWD);
 ok(status.state === 'working', 'a question with no answer under it is working');
 ok(status.last?.text === 'done', 'and the last thing said is still reported, not the question');
 
+section('A turn that was killed is idle, and is not finished:');
+/*
+ * The distinction this section exists for, and the bug it was written after. When a
+ * turn is cut off, Claude Code writes an assistant entry saying "No response
+ * requested." with a terminal stop_reason — so it reads as a completed turn, and 91
+ * of them across the transcripts on this box had each announced itself to a phone as
+ * "Claude finished", over a body quoting that artifact as though Claude had said it.
+ *
+ * Both halves matter. The state is genuinely idle (nothing is running), so a sheet
+ * saying "Claude is working" would be wrong too; what is wrong is calling it
+ * finished, and reporting a harness artifact as the last thing said.
+ */
+write(assistant('half of an ans'), assistant('No response requested.', 'stop_sequence'));
+status = await claudeStatus(CWD);
+ok(status.state === 'idle', 'a killed turn is not left looking like a turn still running');
+ok(status.cutOff === 'interrupted', 'a killed turn is indistinguishable from a finished one');
+ok(
+  status.last?.text === 'half of an ans',
+  'the artifact is reported as the last thing Claude said, which it never said',
+);
+
+write(assistant('a real answer'), assistant('Prompt is too long', 'stop_sequence'));
+status = await claudeStatus(CWD);
+ok(status.cutOff === 'overflow', 'a turn that could not run at all is reported as interrupted');
+
+write(assistant('half of an ans'), assistant('No response requested.', 'stop_sequence'), userText('continue'));
+status = await claudeStatus(CWD);
+ok(
+  status.state === 'working' && status.cutOff === null,
+  'a cut-off turn that was picked up again still says it stopped — the news is stale',
+);
+
+write(assistant('the whole answer'));
+status = await claudeStatus(CWD);
+ok(status.cutOff === null, 'an ordinary finished turn is reported as cut off');
+
 section('A big tool result does not hide the message behind it:');
 /*
  * One 400KB tool result pushes the last real reply outside any small window. The

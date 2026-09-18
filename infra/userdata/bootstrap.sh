@@ -743,6 +743,14 @@ server {
         # project called "login", which redirects to ./login again — a loop the browser
         # gives up on. 302 rather than 301: nothing links this form, so there is no
         # reason to leave it in anyone's cache.
+        #
+        # Path-only, because nginx does not know its own address. It listens on
+        # __APP_PORT__ behind the load balancer that terminates TLS, so left to build
+        # an absolute Location it names the port it can see and the scheme it is spoken
+        # to in: http://cc.strikelabs.tech:8080/p/<name>/, which is unreachable from a
+        # phone. Verified in production, where that is exactly what it sent.
+        absolute_redirect off;
+        port_in_redirect off;
         rewrite ^/p/([A-Za-z0-9][A-Za-z0-9._-]*)\$ /p/\$1/ redirect;
         rewrite ^/p/[A-Za-z0-9][A-Za-z0-9._-]*/?(.*)\$ /\$1 break;
         proxy_pass http://127.0.0.1:9999;

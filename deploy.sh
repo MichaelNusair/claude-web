@@ -6,16 +6,28 @@ cd "$ROOT"
 step() { printf '\n\033[1;36m==> %s\033[0m\n' "$1"; }
 
 # --app-only ships the payload to the instance that is already running and skips
-# `cdk deploy` entirely. It exists because changing UserData replaces the EC2
-# instance, and the payload is pushed *after* the stack finishes — so a full
-# deploy driven from the box itself races its own replacement and cannot finish.
-# The escape hatch is: run --app-only from the box for app changes, and a full
-# deploy from somewhere else when the stack really has to change.
+# `cdk deploy` entirely. It exists because a full deploy driven from the box
+# itself cannot finish: CloudFormation applies a UserData change by *stopping*
+# this instance, rewriting the attribute and starting it again, and every stage
+# after `cdk deploy` — the SSM waits, the payload push, the verification — dies
+# with the box. Measured on 2026-09-18: change set executed 09:47:17, instance
+# stopped 09:47:24, started 09:47:48, stack green at 09:48:02 with no payload
+# ever pushed.
 #
 # It applies everything in the payload — chat service, both extensions, the
-# overlay, `cc` — and re-runs the /opt/bootstrap.sh already on disk. It does NOT
-# apply edits to infra/userdata/bootstrap.sh, because that file reaches the
-# instance through UserData. If your change is in there, you need a full deploy.
+# overlay, `cc` — *and* the provisioning script itself: infra/userdata/bootstrap.sh
+# now ships in the payload and is installed the way a boot installs it, then run.
+# That is deliberate, and it is the fix for the second half of the trap above: the
+# stop/start means cloud-init never re-runs (its scripts-user stage is once per
+# instance, not per boot), so nothing else on the box ever refreshes
+# /opt/bootstrap.sh. The stack would go green carrying a new script that the
+# running instance had never executed — which is how a /p/ route sat in the
+# template for fifteen minutes without existing in nginx.
+#
+# So: --app-only from the box ships app *and* provisioning changes. A full deploy
+# from a machine that is not the box is still what updates the stack, so that a
+# replacement boots the same script this installs, and it is the only thing that
+# can change AWS resources.
 APP_ONLY=0
 for arg in "$@"; do
   case "$arg" in
@@ -202,7 +214,9 @@ stack, src, dst = sys.argv[1:4]
 outputs = json.load(open(src)) or []
 json.dump({stack: {o['OutputKey']: o['OutputValue'] for o in outputs}}, open(dst, 'w'))
 PY
-echo "  using the running stack; changes to infra/ are NOT applied by this run"
+echo "  using the running stack: no AWS resource changes from infra/lib are applied,"
+echo "  but infra/userdata/bootstrap.sh is — it ships in the payload and is installed"
+echo "  and re-run on the instance below."
 else
 # ---------------------------------------------------------------------------
 step "Deploying infrastructure"
@@ -312,6 +326,10 @@ mkdir -p dist/stage/pwa && cp pwa/mobile-overlay.js dist/stage/pwa/
 # Ships in the payload rather than baked into userdata, so `cc` can be updated
 # without replacing the instance.
 mkdir -p dist/stage/scripts && cp scripts/cc-session.sh dist/stage/scripts/
+# The provisioning script, as the template it is — placeholders unsubstituted. The
+# instance's own UserData is what substitutes them (see the refresh block below),
+# because it already holds the values CloudFormation wrote and this deploy does not.
+mkdir -p dist/stage/userdata && cp infra/userdata/bootstrap.sh dist/stage/userdata/
 # The broker that keeps one `claude` per conversation for the editor's panel. No
 # dependencies beyond node, so it ships as plain files with no npm install.
 mkdir -p dist/stage/claude-broker
@@ -331,7 +349,7 @@ cp pwa-icons/*.png dist/stage/chat-service/public/pwa-icons/
 # as phantom files in the editor, and left a non-empty directory behind that
 # broke the vsix cleanup below.
 COPYFILE_DISABLE=1 tar -czf dist/payload.tar.gz -C dist/stage \
-  chat-service pwa vsix scripts claude-broker
+  chat-service pwa vsix scripts claude-broker userdata
 
 # Staged through S3 rather than inlined into the SSM command.
 #
@@ -400,6 +418,45 @@ cmds = [
   "systemctl enable --now claude-chat",
   "systemctl restart claude-chat",
   "systemctl restart code-server",
+  # Install the provisioning script from the payload, the way a boot installs it.
+  #
+  # Nothing else does. UserData is what writes /opt/bootstrap.sh, and it runs once
+  # per instance: CloudFormation applies a UserData change to a running box by
+  # stopping it, rewriting the attribute and starting it again, and cloud-init does
+  # not re-run its scripts-user stage on a restart. So an edit to
+  # infra/userdata/bootstrap.sh used to reach this box only via a replacement that
+  # no longer happens, and the deploy below would re-run whatever ancient copy was
+  # on disk while reporting success.
+  #
+  # The substitution values are the ones CloudFormation wrote, and they live in the
+  # instance UserData rather than in this deploy — so the boot script is reused
+  # verbatim with two edits: its S3 fetch becomes a copy from the payload, and its
+  # own install and run are cut off so the placeholder check below happens before
+  # anything reaches /opt.
+  "BOOTSRC=/opt/claude-web/userdata/bootstrap.sh",
+  "IMDS=$(curl -sf -X PUT http://169.254.169.254/latest/api/token"
+  " -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' || true)",
+  "curl -sf -H \"X-aws-ec2-metadata-token: $IMDS\" -o /tmp/userdata.boot"
+  " http://169.254.169.254/latest/user-data || true",
+  "if [ -s \"$BOOTSRC\" ] && grep -q '__PASSWORD_SECRET_ARN__' \"$BOOTSRC\""
+  " && grep -q 'install -m 0755 /tmp/bootstrap.sh /opt/bootstrap.sh' /tmp/userdata.boot; then"
+  # The boot script names /tmp/bootstrap.sh, and this now runs on every deploy
+  # rather than once on a fresh instance — so the predictable path is cleared
+  # first. rm -f unlinks a symlink rather than following it, which is the point:
+  # everything below this line runs as root.
+  " rm -f /tmp/bootstrap.sh /tmp/userdata.local;"
+  " sed -E -e \"s#^aws s3 cp .*bootstrap[.]sh.*#cp $BOOTSRC /tmp/bootstrap.sh#\""
+  " -e '/^install -m 0755 .tmp.bootstrap[.]sh/d' -e '/^bash .opt.bootstrap[.]sh/d'"
+  " /tmp/userdata.boot > /tmp/userdata.local;"
+  " bash /tmp/userdata.local > /var/log/bootstrap-refresh.log 2>&1 || "
+  "{ echo 'bootstrap refresh failed:'; tail -20 /var/log/bootstrap-refresh.log; exit 1; };"
+  # A leftover __PLACEHOLDER__ would write a config with no secret in it, so this
+  # is checked while the file is still in /tmp and nothing has run it.
+  " if grep -qE '__[A-Z_]+__' /tmp/bootstrap.sh; then"
+  " echo 'bootstrap refresh left placeholders unsubstituted'; exit 1; fi;"
+  " install -m 0755 /tmp/bootstrap.sh /opt/bootstrap.sh;"
+  " echo 'bootstrap refreshed from payload';"
+  " else echo \"WARNING: no bootstrap refresh; re-running the copy on disk\" >&2; fi",
   # Re-run provisioning on the live instance. The instance is no longer
   # replaced on every script edit (see userDataCausesReplacement in stack.js),
   # so this is what applies bootstrap changes — nginx routing, editor settings,

@@ -53,7 +53,7 @@
    *
    * Bump it when this file changes in a way anyone would look for.
    */
-  const OVERLAY_BUILD = '2026-09-18.4';
+  const OVERLAY_BUILD = '2026-09-18.5';
 
   // -------------------------------------------- survive a browser refresh
   /*
@@ -1883,6 +1883,27 @@
   }
 
   /**
+   * The one thing to know before hearing the message, or nothing.
+   *
+   * A message read out with no lead-in is heard as the answer, and three times out of
+   * four that is what it is. The exceptions are what this exists for: a turn still
+   * running, whose last message answers the question *before* the one you asked, and
+   * a turn that was killed partway — `cutOff` from /api/claude-status, see NO_ANSWER
+   * in chat-service/claude-status.js. Being read a half-finished thought as though it
+   * were the conclusion is how you end up waiting for a turn that has already stopped.
+   *
+   * Null rather than 'Claude finished.' so the two callers can differ: the sheet's own
+   * button says nothing in the ordinary case, because you just tapped Read aloud on a
+   * message you are looking at.
+   */
+  function statusNote(s = status) {
+    if (s?.state === 'working') return 'Still working.';
+    if (s?.cutOff === 'overflow') return 'Claude stopped: this conversation is too long to continue.';
+    if (s?.cutOff) return 'Claude stopped before finishing.';
+    return null;
+  }
+
+  /**
    * Put a changed answer on the open sheet, and say the new message out loud.
    *
    * Called from `refreshStatus`, so it runs for every fetch however it was
@@ -1899,7 +1920,7 @@
       Boolean(text) && Boolean(before) && text !== before.text && status.sessionId === before.sessionId;
     openStatus({ auto: true });
     // After the redraw, so the button it draws says Stop rather than Read aloud.
-    if (said) speak(text, status.state === 'working' ? 'Still working.' : 'Claude finished.');
+    if (said) speak(text, statusNote() || 'Claude finished.');
   }
 
   // --------------------------------------------------- the message, rendered
@@ -2197,7 +2218,9 @@
           '<p class="cmo-status" id="cmo-notify-status"></p>';
 
     openSheet(`
-      <p class="cmo-title">${working ? 'Claude is working' : 'Your turn'}</p>
+      <p class="cmo-title">${
+        working ? 'Claude is working' : s.cutOff ? 'Claude stopped' : 'Your turn'
+      }</p>
       <p class="cmo-hint" id="cmo-status-name"></p>
       <p class="cmo-hint" id="cmo-status-detail"></p>
       <div class="cmo-said" id="cmo-status-said"></div>
@@ -2211,7 +2234,11 @@
       <p class="cmo-hint">${
         working
           ? 'The panel is still loading the history; the end of it has not been written yet.'
-          : 'This is the last thing Claude said. The panel is still rendering the history above it.'
+          : s.cutOff === 'overflow'
+            ? 'The last turn could not run: this conversation is too long to continue. Start a new one to carry on.'
+            : s.cutOff
+              ? 'The last turn was cut off before it finished — this is the last thing said before that. Send “continue” and it picks up where it stopped.'
+              : 'This is the last thing Claude said. The panel is still rendering the history above it.'
       }${size ? ` This conversation is ${size} on disk, which is what the panel is reading.` : ''}</p>
       <p class="cmo-hint" id="cmo-status-follow"></p>
       ${notify}
@@ -2297,7 +2324,9 @@
         const meta = document.createElement('span');
         meta.className = 'cmo-convo-meta';
         meta.textContent = [
-          c.state === 'working' ? 'working' : 'your turn',
+          // "stopped" earns its place in a list: it is the row you would otherwise
+          // keep opening to see whether the answer had landed yet.
+          c.state === 'working' ? 'working' : c.cutOff ? 'stopped' : 'your turn',
           sinceText(c.at),
           c.live === false ? 'not running' : null,
         ]
@@ -2347,9 +2376,10 @@
           stopSpeech();
           return;
         }
-        // Said first, when a turn is still running: otherwise the previous
-        // message is heard as the answer to the thing still being worked on.
-        const started = speak(said, working ? 'Still working. Last message:' : '');
+        // Said first, when a turn is still running or was cut off: otherwise the
+        // previous message is heard as the answer to the thing still being worked on.
+        const note = statusNote(s);
+        const started = speak(said, note ? `${note} Last message:` : '');
         if (!started) {
           panel.querySelector('#cmo-status-detail').textContent =
             'Nothing was spoken — this browser has no speech, or the mic is live.';

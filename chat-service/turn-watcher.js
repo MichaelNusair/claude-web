@@ -30,6 +30,13 @@
  *   per conversation, so anything older than ten minutes is read for its state and
  *   never announced.
  *
+ * A turn that was *killed* is idle by both of those tests and is not finished, which
+ * this used to announce as "Claude finished" over a body reading "No response
+ * requested." — the harness artifact that stands where the answer would have been.
+ * That is the one moment the person has to do something (come back and say
+ * continue), described as the one moment they do not. So a cut-off turn is announced
+ * in its own words; `cutOff` from claude-status.js is what tells them apart.
+ *
  * And the first scan of a process announces nothing at all: a deploy restarts this
  * service, and a restart is not something Claude just said.
  */
@@ -81,6 +88,24 @@ export function preview(text, limit = PREVIEW_CHARS) {
   const cut = flat.slice(0, limit);
   const space = cut.lastIndexOf(' ');
   return `${(space > limit * 0.6 ? cut.slice(0, space) : cut).trimEnd()}…`;
+}
+
+/**
+ * What to say when the turn did not finish — see NO_ANSWER in claude-status.js.
+ *
+ * The distinction is the whole value of these two words on a lock screen: an
+ * interrupted turn is waiting for one word to carry on, and an overflowed one cannot
+ * carry on in that conversation at all. The last thing really said is appended when
+ * there is one, because "stopped" is more useful with "in the middle of what".
+ */
+const CUT_OFF_REASON = {
+  interrupted: 'Stopped before finishing — it needs a nudge to carry on.',
+  overflow: 'Stopped: this conversation is too long to continue. Start a new one.',
+};
+
+export function cutOffBody(reason, text = '') {
+  const said = preview(text, 70);
+  return `${CUT_OFF_REASON[reason] || CUT_OFF_REASON.interrupted}${said ? ` Last said: ${said}` : ''}`;
 }
 
 /**
@@ -205,7 +230,17 @@ export function createTurnWatcher({
         const exchange = await lastExchange(file, WINDOWS);
         if (!exchange) continue;
         const text = exchange.last?.text || '';
-        const record = { mtimeMs, text: text ? digest(text) : '' };
+        /*
+         * The cut-off reason is part of what makes a turn new, not just its text.
+         *
+         * A killed turn leaves an artifact where its answer would be (see NO_ANSWER
+         * in claude-status.js), so the last thing really *said* is the message before
+         * it — usually one already announced. Digesting the text alone would make
+         * that look like a repeat and swallow the one notification worth having: the
+         * turn you are waiting on has stopped and needs a nudge.
+         */
+        const mark = exchange.cutOff ? `${exchange.cutOff}|${text}` : text;
+        const record = { mtimeMs, text: mark ? digest(mark) : '' };
         const changed = Boolean(record.text) && record.text !== before?.text;
         seen.set(file, record);
 
@@ -217,13 +252,19 @@ export function createTurnWatcher({
         if (now() - at > FRESH_MS) continue;
 
         const project = names.get(dir.name) || dir.name;
+        const cut = exchange.cutOff;
         const notification = {
-          title: `Claude finished · ${project}`,
-          body: preview(text),
+          // "Finished" is a claim, and it was being made about turns that were
+          // killed partway — the one case where the person needs to come back and
+          // say "continue", and the one case the old wording talked them out of.
+          title: `${cut ? 'Claude stopped' : 'Claude finished'} · ${project}`,
+          body: cut ? cutOffBody(cut, text) : preview(text),
           // Per conversation, so a session that finishes twice replaces its own
           // notification rather than stacking two on the lock screen.
           tag: `turn-${topicFor(`${dir.name}|${sessionId}`)}`,
           project,
+          // So a client can tell the two apart without parsing the title.
+          cutOff: cut || null,
           sessionId,
           conversation: exchange.title || null,
           at: new Date(at).toISOString(),

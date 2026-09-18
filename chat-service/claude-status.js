@@ -168,6 +168,32 @@ function inferState(entry) {
   return 'working';
 }
 
+/**
+ * What Claude Code writes into a transcript *instead of* an answer.
+ *
+ * These are harness artifacts, not messages. They are assistant entries with a
+ * terminal `stop_reason`, so `inferState` correctly calls them idle — nothing is
+ * running any more — but they are the opposite of a finished turn: the work was cut
+ * off partway. Read as answers they are actively misleading, and they were: 91 of
+ * them across the 68 transcripts on this box, each one having announced itself to a
+ * phone as "Claude finished · <project>" with the body "No response requested.",
+ * which is neither what Claude said nor what happened.
+ *
+ * So they are recognised by text, which is unpleasant and is also the only signal
+ * there is — the stop_reason of a killed turn (`stop_sequence`) is the same one a
+ * genuinely completed turn can carry. The failure mode of getting this wrong is
+ * bounded in the right direction: an unrecognised artifact reads as a finished turn,
+ * which is today's behaviour, and a false positive would only downgrade a
+ * notification's wording.
+ *
+ * The value is why it stopped, because the two want different words on a lock
+ * screen: one needs a nudge to carry on, the other cannot carry on at all.
+ */
+const NO_ANSWER = new Map([
+  ['No response requested.', 'interrupted'],
+  ['Prompt is too long', 'overflow'],
+]);
+
 const textOf = (message) => {
   const content = message?.content;
   if (typeof content === 'string') return content;
@@ -204,6 +230,7 @@ export async function lastExchange(file, windows = TAIL_WINDOWS) {
     let state = null;
     let last = null;
     let title = null;
+    let cutOff = null;
 
     for (let i = lines.length - 1; i >= 0; i -= 1) {
       if (!lines[i].trim()) continue;
@@ -222,23 +249,32 @@ export async function lastExchange(file, windows = TAIL_WINDOWS) {
       }
       if (entry.type !== 'assistant' && entry.type !== 'user') continue;
 
-      // The nearest message decides the state, even if it carries no text of its
-      // own — a tool_use turn is what "working" looks like.
-      if (!state) state = inferState(entry);
-
       const text = textOf(entry.message).trim();
-      if (!last && entry.type === 'assistant' && text) {
+      // See NO_ANSWER: an artifact stands where an answer would be, so it is never
+      // reported as one — the walk continues past it to the last thing really said.
+      const artifact = entry.type === 'assistant' ? NO_ANSWER.get(text) : undefined;
+
+      // The nearest message decides the state, even if it carries no text of its
+      // own — a tool_use turn is what "working" looks like. An artifact is only the
+      // *last* word if nothing came after it: reply to a cut-off turn and the
+      // trailing entry is that reply, which is a conversation owed an answer.
+      if (!state) {
+        state = inferState(entry);
+        if (artifact) cutOff = artifact;
+      }
+
+      if (!last && entry.type === 'assistant' && text && !artifact) {
         last = { role: 'assistant', text, at: entry.timestamp || null };
       }
       // Both answers found; the rest of the window is history.
       if (last && title) break;
     }
 
-    if (last || tail.complete) return { state: state || 'idle', last, title, ...meta };
+    if (last || tail.complete) return { state: state || 'idle', last, title, cutOff, ...meta };
     // Nothing sayable in this window and there is more file behind it: widen.
   }
 
-  return { state: 'unknown', last: null, title: null, ...meta };
+  return { state: 'unknown', last: null, title: null, cutOff: null, ...meta };
 }
 
 /** Every conversation in a project, newest first. One `stat` each, no reads. */
@@ -377,6 +413,13 @@ export async function claudeStatus(cwd, { sessionId: asked = null } = {}) {
     idleMs: mine?.idleMs ?? null,
     spokeMs: mine?.spokeMs ?? null,
     last: transcript?.last || null,
+    /*
+     * Why the last turn produced no answer, when that is what happened: see
+     * NO_ANSWER. Only ever reported for a conversation that is idle now — a turn
+     * that was cut off and then picked up again is working, and "stopped" would be
+     * yesterday's news told in the present tense.
+     */
+    cutOff: state === 'idle' ? transcript?.cutOff || null : null,
     transcriptAt: transcript?.mtimeMs || null,
     // Why the panel is slow, in one number the client can show instead of
     // guessing. The wait scales with this.
@@ -403,17 +446,21 @@ async function summarise(dir, files, { liveFor, live, sessionId }) {
       const running = liveFor(file.sessionId);
       const tail = await lastExchange(join(dir, `${file.sessionId}.jsonl`), SUMMARY_WINDOW);
       const quiet = running ? running.idleMs > OVERRIDE_QUIET_MS : false;
+      const state = !live
+        ? tail?.state || 'unknown'
+        : running?.working && !(quiet && tail?.state === 'idle')
+          ? 'working'
+          : 'idle';
       return {
         sessionId: file.sessionId,
         title: tail?.title || null,
         // Deliberately one line: enough to recognise a conversation by, not enough
         // to be a second copy of the message.
         said: tail?.last?.text ? tail.last.text.replace(/\s+/g, ' ').slice(0, 140) : null,
-        state: !live
-          ? tail?.state || 'unknown'
-          : running?.working && !(quiet && tail?.state === 'idle')
-            ? 'working'
-            : 'idle',
+        state,
+        // As above: a list is where "this one stopped without answering" is most
+        // worth seeing, because it is the one you would otherwise keep waiting on.
+        cutOff: state === 'idle' ? tail?.cutOff || null : null,
         live: live ? Boolean(running) : null,
         clients: running?.clients ?? null,
         at: file.mtimeMs,

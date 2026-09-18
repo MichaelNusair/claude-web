@@ -1317,6 +1317,32 @@ ok(
 await drain();
 
 /*
+ * The other message that is not the answer: the turn was killed partway, so the last
+ * thing said is a half-finished thought and nothing is coming after it. Read out bare
+ * it is heard as the conclusion, which is how you sit waiting for a turn that has
+ * already stopped — the phone-side half of the "Claude finished" bug. `cutOff` comes
+ * from /api/claude-status; see NO_ANSWER in chat-service/claude-status.js.
+ */
+statusReply = { ...answer('Fifth answer, cut off halfway through the sen'), cutOff: 'interrupted' };
+utterances.length = 0;
+w.dispatchEvent(new w.Event('focus'));
+await settle();
+ok(
+  'a message from a killed turn was read out as though the turn had finished',
+  /^Claude stopped before finishing\./.test(utterances[0] || ''),
+);
+ok(
+  'the sheet still calls a killed turn "Your turn", which is what it looks like and ' +
+    'not what happened',
+  /Claude stopped/.test(doc.querySelector('.cmo-title')?.textContent || ''),
+);
+ok(
+  'the sheet does not say how to pick a cut-off turn back up',
+  /continue/.test(doc.getElementById('cmo-sheet')?.textContent || ''),
+);
+await drain();
+
+/*
  * Dismissing the sheet is how you stop it. The voice already reading a message
  * outlives the sheet on purpose — that is checked further up — but nothing new
  * starts. This is the worst outcome the feature has: a phone talking about a
