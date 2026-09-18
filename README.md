@@ -295,6 +295,13 @@ talking on its own after you have put it down is worse than one that stays quiet
 It names the conversation it is talking about, since the panel and the chat app can
 be in different ones.
 
+That sheet is also where you **ask to be buzzed when a turn ends** — one tap, and it
+sends itself a test notification so you know it works rather than assuming. It is the
+same switch as the one in the chat app's settings and the same subscription behind it;
+turning it on in either place turns it on for this device. Notifications are for the
+sessions out here — this panel, and anything under tmux — which is why the switch is
+here as well.
+
 The terminal button opens a second, plain shell, also in the editor area, and
 pressing it again hands the window back to Claude — with tabs hidden, the two just
 take turns. It reuses the shell you already had rather than opening another,

@@ -1704,7 +1704,12 @@
      * the poll is not, and must not extend its own licence to keep polling —
      * otherwise the limit above can never be reached.
      */
-    if (!auto) sheetFollowUntil = Date.now() + SHEET_FOLLOW_LIMIT;
+    if (!auto) {
+      sheetFollowUntil = Date.now() + SHEET_FOLLOW_LIMIT;
+      // A tap is a fresh look at this sheet, so the notification switch goes back to
+      // describing itself rather than reporting what a previous tap did.
+      notifyNote = '';
+    }
     const s = status;
     if (!s) {
       openSheet(`
@@ -1728,6 +1733,23 @@
 
     const others = Array.isArray(s.conversations) ? s.conversations : [];
 
+    /*
+     * Being told when this happens without watching for it.
+     *
+     * Drawn from what can be known synchronously — whether the browser has the APIs
+     * at all, and whether the site has been refused permission — because both of
+     * those are dead ends, and a dead end is better said in a sentence than offered
+     * as a button that does nothing. Whether this device is *subscribed* can only be
+     * answered asynchronously, so the button starts neutral and paintNotify (called
+     * at the end of this function) corrects it a tick later.
+     */
+    const notify = !pushSupported()
+      ? '<p class="cmo-hint">This browser cannot send notifications, so nothing here can tell you when a turn ends. On an iPhone that needs this page added to the home screen first.</p>'
+      : Notification.permission === 'denied'
+        ? '<p class="cmo-hint">Notifications are blocked for this site, and only the browser can undo that: Chrome → ⋮ → Site settings → Notifications.</p>'
+        : '<div class="cmo-row"><button class="cmo-action cmo-alt" id="cmo-notify">\u{1F514} Notify me when a turn ends</button></div>' +
+          '<p class="cmo-status" id="cmo-notify-status"></p>';
+
     openSheet(`
       <p class="cmo-title">${working ? 'Claude is working' : 'Your turn'}</p>
       <p class="cmo-hint" id="cmo-status-name"></p>
@@ -1746,6 +1768,7 @@
           : 'This is the last thing Claude said. The panel is still rendering the history above it.'
       }${size ? ` This conversation is ${size} on disk, which is what the panel is reading.` : ''}</p>
       <p class="cmo-hint" id="cmo-status-follow"></p>
+      ${notify}
       ${others.length > 1 ? `
         <p class="cmo-hint" id="cmo-convo-head"></p>
         <div id="cmo-convos" class="cmo-convos"></div>` : ''}`);
@@ -1781,6 +1804,7 @@
       .filter(Boolean)
       .join(' · ');
     panel.querySelector('#cmo-status-close').addEventListener('click', closeSheet);
+    panel.querySelector('#cmo-notify')?.addEventListener('click', toggleNotify);
 
     // Ask again, in place. The heartbeat is fifteen seconds and someone reading
     // this sheet has a more specific question than that.
@@ -1898,6 +1922,248 @@
     sheetShown = { state: s.state, text: s.last?.text || '', sessionId: s.sessionId };
     statusSheetGeneration = sheetGeneration;
     followStatusSheet();
+    // Correct the notification line, which cannot be drawn from anything the
+    // sheet already knows: only the browser can say whether this device is
+    // subscribed, and it answers asynchronously.
+    paintNotify();
+  }
+
+  // ------------------------------------------------------------ notifications
+  /*
+   * Ask to be told when a turn ends, from the surface the turns are on.
+   *
+   * The switch already existed — in the chat app's Settings sheet — and the
+   * sessions it notifies about are precisely the ones out here: the Claude Code
+   * panel in this editor, and anything under tmux. So someone who only ever opens
+   * the editor had no way to turn on the one feature written for them, and the
+   * honest answer to "how do I enable this" was "install a second app and go
+   * looking in a sheet". This is that switch, on the sheet that already answers
+   * "has Claude finished".
+   *
+   * Everything below it is shared with the chat app: one origin, one service worker
+   * under /chat/, one subscription, one row in the server's device list. Turning it
+   * on here is the same act as turning it on there, which is why the wording says
+   * "this device" and never "this app".
+   *
+   * The plumbing is repeated from chat-service/public/app.js rather than imported.
+   * This file is a plain script that nginx injects into code-server's HTML; an
+   * import would make the button depend on a second request and on whatever CSP
+   * code-server ships that week, and a notification switch that fails to load is
+   * worse than sixty duplicated lines. push-test.js covers the server side of it
+   * for both callers.
+   */
+  const PUSH_SW = '/chat/sw.js';
+  const PUSH_SCOPE = '/chat/';
+  const pushSupported = () =>
+    'serviceWorker' in navigator && 'PushManager' in window && 'Notification' in window;
+
+  /** base64url → bytes. `applicationServerKey` takes nothing else. */
+  function pushKeyBytes(base64url) {
+    const padded = base64url.replace(/-/g, '+').replace(/_/g, '/');
+    const raw = atob(padded + '='.repeat((4 - (padded.length % 4)) % 4));
+    return Uint8Array.from(raw, (c) => c.charCodeAt(0));
+  }
+
+  /** The key a subscription was made with, back in the form the server names it. */
+  const pushKeyOf = (subscription) => {
+    const key = subscription?.options?.applicationServerKey;
+    if (!key) return null;
+    let out = '';
+    for (const byte of new Uint8Array(key)) out += String.fromCharCode(byte);
+    return btoa(out).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  };
+
+  /**
+   * The worker if it is already there, without installing one.
+   *
+   * Everything that only reads the state goes through this, so opening the editor
+   * on a device that has never asked for notifications registers nothing.
+   */
+  async function pushWorkerIfAny() {
+    if (!pushSupported()) return null;
+    return navigator.serviceWorker.getRegistration(PUSH_SCOPE).catch(() => null);
+  }
+
+  /** Whether this device is subscribed, without asking or installing anything. */
+  async function pushSubscription() {
+    const reg = await pushWorkerIfAny();
+    if (!reg) return null;
+    return reg.pushManager.getSubscription().catch(() => null);
+  }
+
+  /**
+   * The chat service, with its two failures named.
+   *
+   * A 401 here is the ordinary one: the editor and the chat API are gated
+   * separately, so a device signed into code-server alone gets one — and unlike the
+   * status chip, which stays silent about it, a switch that was just tapped has to
+   * say why nothing happened.
+   */
+  async function pushApi(path, options) {
+    const res = await fetch(path, options);
+    if (res.status === 401) {
+      throw new Error(
+        'the chat service needs its own sign-in — open the project switcher and tap Sign in',
+      );
+    }
+    if (!res.ok) throw new Error(`the server answered ${res.status}`);
+    return res;
+  }
+
+  /**
+   * Subscribe this device and tell the server.
+   *
+   * `Notification.requestPermission()` is the caller's job, before anything is
+   * awaited: the prompt needs the tap that got here to still be the most recent
+   * thing that happened.
+   *
+   * Note what is *not* awaited: `navigator.serviceWorker.ready`. That promise
+   * resolves for the worker controlling *this page*, and this page is /editor/,
+   * which /chat/sw.js will never control — awaiting it here would hang forever.
+   * `register()` hands back the registration, and its pushManager works from it.
+   */
+  async function pushSubscribeHere() {
+    const reg = await navigator.serviceWorker.register(PUSH_SW);
+    const { key } = await pushApi('/api/push/key').then((r) => r.json());
+
+    let subscription = await reg.pushManager.getSubscription();
+    // A subscription is bound to the key it was made with. If the server's keypair
+    // has changed — a lost volume, a rebuilt box — the old subscription still looks
+    // healthy here while every notification sent to it fails at the push service.
+    if (subscription && pushKeyOf(subscription) !== key) {
+      await subscription.unsubscribe().catch(() => {});
+      subscription = null;
+    }
+    if (!subscription) {
+      subscription = await reg.pushManager.subscribe({
+        // Required by Chrome, and true: every push this app sends is shown.
+        userVisibleOnly: true,
+        applicationServerKey: pushKeyBytes(key),
+      });
+    }
+    await pushApi('/api/push/subscribe', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(subscription),
+    });
+    return subscription;
+  }
+
+  /** Stop this device, at both ends. */
+  async function pushUnsubscribeHere() {
+    const subscription = await pushSubscription();
+    if (!subscription) return;
+    // Server first: the endpoint is what identifies this device there, and once the
+    // browser has dropped the subscription that string is gone.
+    await fetch('/api/push/unsubscribe', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ endpoint: subscription.endpoint }),
+    }).catch(() => {});
+    await subscription.unsubscribe().catch(() => {});
+  }
+
+  /**
+   * Keep an existing subscription honest, at every load. Never prompts.
+   *
+   * Two silent failures this repairs, both of which read as "notifications just
+   * stopped" from the phone: the server losing its device list, which lives on
+   * disk, and a rotated keypair leaving a subscription that can no longer be sent
+   * to. The chat app does this at boot; on a phone that only opens the editor, this
+   * is the only place it can happen.
+   */
+  async function pushRepair() {
+    if (!pushSupported() || Notification.permission !== 'granted') return;
+    if (!(await pushSubscription())) return;
+    await pushSubscribeHere().catch(() => {});
+  }
+
+  /*
+   * The last thing this switch said about itself, kept across a redraw.
+   *
+   * The sheet it lives on redraws itself every five seconds, and a message that
+   * says "a test notification has just been sent" is worth nothing if it is wiped
+   * two seconds later by the poll. Opening the sheet by hand clears it: at that
+   * point it is describing something that happened a sheet ago.
+   */
+  let notifyNote = '';
+
+  /**
+   * What the button says, from what is true now.
+   *
+   * `note` is what just happened, when something did; without it the line describes
+   * the state, because this is also drawn when the sheet opens.
+   */
+  async function paintNotify(note) {
+    if (note !== undefined) notifyNote = note;
+    const btn = panel.querySelector('#cmo-notify');
+    if (!btn) return;
+    const on = Boolean(await pushSubscription());
+    // Re-queried: an await in a sheet is long enough for another sheet to replace it.
+    const button = panel.querySelector('#cmo-notify');
+    if (!button) return;
+    button.dataset.on = on ? '1' : '';
+    button.disabled = false;
+    button.textContent = on ? '\u{1F514} Turn off notifications' : '\u{1F514} Notify me when a turn ends';
+    const line = panel.querySelector('#cmo-notify-status');
+    if (!line) return;
+    line.textContent =
+      notifyNote ||
+      (on
+        ? 'On for this device. One notification per conversation when a turn ends out here — this panel, or anything under tmux — and nothing for a turn that ended more than ten minutes ago.'
+        : 'Buzzes this phone when Claude finishes a turn in the editor or under tmux, with the project and the first line of the answer. Asked for permission once.');
+  }
+
+  /**
+   * The tap.
+   *
+   * `Notification.requestPermission()` comes first, before any await, for the
+   * activation reason above. Off is the other direction and needs no permission.
+   */
+  async function toggleNotify() {
+    const btn = panel.querySelector('#cmo-notify');
+    if (!btn) return;
+    if (btn.dataset.on === '1') {
+      btn.disabled = true;
+      await pushUnsubscribeHere();
+      await paintNotify(
+        'Off for this device. Nothing will be sent here until this is turned back on.',
+      );
+      return;
+    }
+
+    const permission = await Notification.requestPermission();
+    if (permission !== 'granted') {
+      await paintNotify(
+        permission === 'denied'
+          ? 'Blocked for this site, and only the browser can undo that: Chrome → ⋮ → Site settings → Notifications. Android may also list this app under Settings › Apps.'
+          : 'Not enabled — the permission prompt was dismissed. Tapping this again asks once more.',
+      );
+      return;
+    }
+
+    btn.disabled = true;
+    const line = panel.querySelector('#cmo-notify-status');
+    if (line) line.textContent = 'Turning them on…';
+    try {
+      await pushSubscribeHere();
+      /*
+       * A test notification, sent by the server to this device.
+       *
+       * Everything can be correct at both ends and still produce nothing on the
+       * phone — permission granted to the browser but revoked for the site, a
+       * battery optimiser holding the worker down — and the alternative to finding
+       * that out now is finding it out by missing the notification that mattered.
+       */
+      const result = await pushApi('/api/push/test', { method: 'POST' }).then((r) => r.json());
+      await paintNotify(
+        result.sent
+          ? 'On, and a test notification has just been sent to this device. If it does not appear within a few seconds, Android is holding it: check Settings › Apps › Chrome › Notifications.'
+          : 'Subscribed, but the test notification could not be sent. The server has the device; something between here and the push service refused it.',
+      );
+    } catch (err) {
+      await paintNotify(`Could not turn them on: ${err.message}`);
+    }
   }
 
   // ------------------------------------------------------- reading it aloud
@@ -2375,6 +2641,15 @@
    */
   checkStatus();
   startStatusHeartbeat();
+  /*
+   * Repair a subscription that has gone quiet, silently and without prompting.
+   *
+   * This is the surface someone who only opens the editor ever loads, so it is the
+   * only place their subscription can be re-registered after the server's device
+   * list or its keypair changes underneath it. It does nothing at all unless
+   * notifications are already on for this device.
+   */
+  pushRepair();
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState !== 'visible') {
       stopStatusPoll();

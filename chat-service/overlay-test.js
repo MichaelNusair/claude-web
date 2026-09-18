@@ -1312,6 +1312,260 @@ ok(
 );
 speechMs = 0;
 
+// ----------------------------------------------------- being told from here
+/*
+ * The notification switch on the editor's own sheet.
+ *
+ * The push feature notifies about sessions *out here* — the Claude Code panel in
+ * this editor, and anything under tmux — and until now the only switch for it was
+ * in the chat app's Settings sheet. Someone who only ever opens the editor, which
+ * is how this box is actually used, had no way to turn on the one feature written
+ * for them; the report that started this was "I don't see push notifications, I
+ * don't know how to enable them".
+ *
+ * The order of the first three acts is the whole of what can go silently wrong:
+ * permission must be asked while the tap still counts as user activation (mobile
+ * Chrome refuses a prompt that comes after a network round trip), the worker must
+ * be the chat app's one so both surfaces share a subscription, and the key must be
+ * the server's — a subscription made with the wrong one looks healthy here and
+ * fails at the push service for good. None of those report themselves on a phone.
+ */
+const KEY = 'BOe1x_hUOKzZBnbTz5xLNlOaqZ3Ah3ll7SzKfHRSfrnRHkTKuNJlvBQCLGnJJKKUpUKzIxq2xR2oyF6qkkeGaAo';
+const ENDPOINT = 'https://push.example.com/device/abc123';
+// Ordered log of everything the switch did, so "asked permission first" and
+// "told the server before the browser forgot" can be asserted rather than assumed.
+const acts = [];
+const registered = [];
+const lookups = [];
+const posted = {};
+let subscribeOpts = null;
+let unsubscribeCalls = 0;
+let subscription = null;
+
+const makeSubscription = (key) => ({
+  endpoint: ENDPOINT,
+  options: { applicationServerKey: key },
+  // What the browser sends the server: the real thing has a toJSON, and posting
+  // the object without it would send `{}`.
+  toJSON: () => ({ endpoint: ENDPOINT, keys: { p256dh: 'p256dh-bytes', auth: 'auth-bytes' } }),
+  unsubscribe: () => {
+    acts.push('browser-unsubscribe');
+    unsubscribeCalls += 1;
+    subscription = null;
+    return Promise.resolve(true);
+  },
+});
+
+const registration = {
+  scope: 'https://claude.example.com/chat/',
+  pushManager: {
+    getSubscription: () => Promise.resolve(subscription),
+    subscribe: (opts) => {
+      acts.push('browser-subscribe');
+      subscribeOpts = opts;
+      subscription = makeSubscription(opts.applicationServerKey);
+      return Promise.resolve(subscription);
+    },
+  },
+};
+
+Object.defineProperty(w.navigator, 'serviceWorker', {
+  configurable: true,
+  value: {
+    register: (url) => {
+      acts.push('register');
+      registered.push(String(url));
+      return Promise.resolve(registration);
+    },
+    // Nothing to hand back until something has registered one, which is what makes
+    // "opening the editor installs nothing" checkable.
+    getRegistration: (scope) => {
+      // Logged in both places: `lookups` is which scope, and `acts` is when — the
+      // ordering check below is only worth anything if a read counts as an act, since
+      // reading the state is the easiest thing to accidentally await before the
+      // permission prompt.
+      lookups.push(String(scope));
+      acts.push('lookup');
+      return Promise.resolve(registered.length ? registration : null);
+    },
+  },
+});
+w.PushManager = function PushManager() {};
+class FakeNotification {}
+FakeNotification.permission = 'default';
+let permissionAnswer = 'granted';
+FakeNotification.requestPermission = () => {
+  acts.push('permission');
+  FakeNotification.permission = permissionAnswer;
+  return Promise.resolve(permissionAnswer);
+};
+w.Notification = FakeNotification;
+
+const jsonReply = (body, status = 200) =>
+  Promise.resolve({ ok: status < 400, status, json: () => Promise.resolve(body) });
+const priorFetch = w.fetch;
+w.fetch = (url, options = {}) => {
+  const target = String(url);
+  if (target.includes('/api/push/key')) {
+    acts.push('key');
+    return jsonReply({ key: KEY });
+  }
+  if (target.includes('/api/push/subscribe')) {
+    acts.push('server-subscribe');
+    posted.subscribe = JSON.parse(options.body || '{}');
+    return jsonReply({ ok: true });
+  }
+  if (target.includes('/api/push/unsubscribe')) {
+    acts.push('server-unsubscribe');
+    posted.unsubscribe = JSON.parse(options.body || '{}');
+    return jsonReply({ ok: true });
+  }
+  if (target.includes('/api/push/test')) {
+    acts.push('test');
+    return jsonReply({ sent: 1 });
+  }
+  if (target.includes('manifest.webmanifest')) {
+    return jsonReply({
+      id: '/editor/?folder=%2Fworkspace%2Fprojects%2Fdemo',
+      short_name: 'demo',
+      scope: '/',
+    });
+  }
+  return priorFetch(url, options);
+};
+
+const notifyBtn = () => doc.getElementById('cmo-notify');
+const notifyLine = () => doc.getElementById('cmo-notify-status')?.textContent ?? '';
+const tapNotify = async () => {
+  notifyBtn()?.dispatchEvent(new w.MouseEvent('click', { bubbles: true }));
+  await settle(80);
+};
+
+await tapStatus();
+await settle(40);
+ok(
+  'the status sheet offers no way to be told when a turn ends — the only switch for ' +
+    'it is in the chat app, which someone who lives in the editor never opens',
+  notifyBtn(),
+);
+ok(
+  'drawing the sheet registered a service worker uninvited — opening the editor must ' +
+    'install nothing on a device that has never asked for notifications',
+  registered.length === 0,
+);
+ok(
+  'the subscription was looked up outside the chat app’s scope, so the editor and the ' +
+    'chat app would each hold one and only one of them would be told to stop',
+  lookups.length > 0 && lookups.every((s) => s === '/chat/'),
+);
+ok(
+  'the switch does not say what the notifications are about, so it reads as "notify me ' +
+    'about something"',
+  /tmux/.test(notifyLine()),
+);
+
+// Cleared so that the first act *after the tap* is what is being asserted about,
+// rather than whatever drawing the sheet did before it.
+acts.length = 0;
+await tapNotify();
+ok(
+  `permission was asked after something was awaited (${acts.join(' → ')}) — mobile ` +
+    'Chrome refuses a prompt that is no longer the consequence of the tap',
+  acts[0] === 'permission',
+);
+ok(
+  `the worker registered was not the chat app’s: ${JSON.stringify(registered)} — a ` +
+    'second worker means a second subscription the chat app cannot see',
+  registered.length === 1 && registered[0] === '/chat/sw.js',
+);
+ok(
+  'the subscription was not made userVisibleOnly, which Chrome requires and which is ' +
+    'true of every push this app sends',
+  subscribeOpts?.userVisibleOnly === true,
+);
+const sentKey = subscribeOpts?.applicationServerKey;
+ok(
+  `the application server key is not a P-256 point: ${sentKey?.length} bytes starting ` +
+    `${sentKey?.[0]} — a subscription made with the wrong key looks healthy here and ` +
+    'fails at the push service forever',
+  sentKey?.length === 65 && sentKey[0] === 4,
+);
+ok(
+  'the server was never told which device to send to',
+  posted.subscribe?.endpoint === ENDPOINT && Boolean(posted.subscribe?.keys?.auth),
+);
+ok(
+  `the order was wrong: ${acts.join(' → ')} — the key has to be in hand before ` +
+    'subscribing, and the server told before anything is sent',
+  acts.indexOf('key') < acts.indexOf('browser-subscribe') &&
+    acts.indexOf('browser-subscribe') < acts.indexOf('server-subscribe') &&
+    acts.indexOf('server-subscribe') < acts.indexOf('test'),
+);
+ok(
+  'no test notification was sent, so a switch that has quietly failed looks exactly ' +
+    'like one that worked until the notification that mattered is missed',
+  acts.includes('test'),
+);
+ok(
+  'the switch still offers to turn notifications on after turning them on',
+  /Turn off/.test(notifyBtn()?.textContent ?? ''),
+);
+ok('nothing said that a test notification had been sent', /test notification/.test(notifyLine()));
+
+/*
+ * The sheet redraws itself every five seconds, and what the switch just said has to
+ * survive that: a line reading "a test notification has just been sent" is worth
+ * nothing if the poll wipes it two seconds later.
+ */
+statusReply = answer('Seventh answer, arriving just after the switch was used.');
+w.dispatchEvent(new w.Event('focus'));
+await settle(120);
+await drain();
+ok(
+  'the sheet’s own refresh wiped what the switch had just said',
+  /test notification/.test(notifyLine()),
+);
+ok(
+  'the switch forgot it was on when the sheet refreshed itself',
+  /Turn off/.test(notifyBtn()?.textContent ?? ''),
+);
+
+await tapNotify();
+ok(
+  'the server was not told the device is going away — it would go on sending to an ' +
+    'endpoint the browser has dropped',
+  posted.unsubscribe?.endpoint === ENDPOINT,
+);
+ok(
+  `the browser dropped the subscription before the server was told: ${acts.join(' → ')} ` +
+    '— after that the endpoint that identifies this device is gone',
+  acts.indexOf('server-unsubscribe') < acts.indexOf('browser-unsubscribe'),
+);
+ok('the browser still holds a subscription', unsubscribeCalls === 1 && subscription === null);
+ok(
+  'the switch does not offer to turn notifications back on',
+  /Notify me/.test(notifyBtn()?.textContent ?? ''),
+);
+
+/*
+ * A site that has been refused permission cannot ask again — the browser answers
+ * once — so a button there does nothing at all, and the only useful thing to show
+ * is where the setting now lives.
+ */
+FakeNotification.permission = 'denied';
+await tapStatus();
+await settle(40);
+ok(
+  'a site with notifications blocked still shows a switch, which cannot do anything ' +
+    'and reads as broken',
+  !notifyBtn(),
+);
+ok(
+  'a blocked site is not told where the setting now lives, which is the only place it ' +
+    'can be changed',
+  /Site settings/.test(doc.getElementById('cmo-panel')?.textContent ?? ''),
+);
+
 // ------------------------------------------------------------------- results
 if (failures.length) {
   console.error(`\noverlay test: ${failures.length} failure(s) of ${checks} checks\n`);

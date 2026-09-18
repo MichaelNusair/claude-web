@@ -574,6 +574,26 @@ because the failure it prevents would make the feature something you turn off:
 - **Nothing older than ten minutes**, and a content digest so a rewritten
   transcript is not a new answer.
 
+**Notifications are switched on from either surface, and there is only one of
+them.** The chat app's Settings sheet has a checkbox; the editor overlay's status
+sheet has a button (`toggleNotify` in `pwa/mobile-overlay.js`). Same origin, same
+worker under `/chat/`, same subscription, same row in the device list — turning it on
+in one place turns it on in both, which is why the wording says "this device" and
+never "this app". The editor needed its own switch because the sessions being watched
+are the editor's: someone who only ever opens `/editor/` could not reach the one
+feature written for them. The plumbing is deliberately duplicated rather than
+imported — the overlay is a plain script nginx injects into code-server's HTML, and a
+switch that depends on a second request and on code-server's CSP is a switch that
+fails where it is needed. Both copies obey the same two rules: ask
+`Notification.requestPermission()` before anything is awaited (mobile Chrome refuses a
+prompt that is no longer the consequence of the tap), and tell the server *before*
+the browser drops a subscription (the endpoint is what identifies the device, and it
+is gone afterwards). `overlay-test.js` and `smoke-test.js` each assert that order
+from a log of acts, and both checks were confirmed to fail when the order is swapped.
+One thing the overlay must not do: `await navigator.serviceWorker.ready`. That
+resolves for the worker controlling *this* page, and `/chat/sw.js` will never control
+`/editor/` — it hangs forever. `register()` returns the registration; use it.
+
 Push itself is `chat-service/push.js`, hand-rolled: VAPID plus RFC 8291, ~400 lines
 of node crypto and no new dependency on a box whose whole job is running shell
 commands. The keypair and the device list live under `CLAUDE_HOME` (not in
