@@ -998,7 +998,13 @@ Things that have burned people, in this codebase specifically:
   fence and a `javascript:` link through it for exactly that reason, and those three
   checks are the ones to keep if anything here is ever rewritten. One consequence
   worth knowing before you write an assertion: the sheet's `textContent` is no longer
-  the message, because the markers are gone from it.
+  the message, because the markers are gone from it. And one judgement already made
+  and reversed, so it does not get made again: tables were left out of the first
+  version on the grounds that they do not fit a phone. They are most of what a status
+  answer is made of — surface, check, result — and a table left as source does not fit
+  a phone either, it is a screenful of pipes. They render now, scrolling sideways as a
+  unit rather than wrapping every cell, which would lose the alignment that made the
+  thing a table.
 - **A `setTimeout(closeSheet, …)` closes whatever sheet is open when it fires, not
   the one that scheduled it.** Tap `Copy & close` in the dictation sheet and then
   open the status sheet within 700 ms, and the delayed close dismisses the new one.

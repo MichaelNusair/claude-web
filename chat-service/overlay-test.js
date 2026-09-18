@@ -1751,6 +1751,79 @@ ok(
 );
 
 /*
+ * Tables, which are most of what a status answer is made of — surface, check,
+ * result — and which were left out of the first version of the renderer on the
+ * grounds that they do not fit a phone. A table left as source does not fit a phone
+ * either; it is a screenful of pipes. The fixture is shaped like the real thing,
+ * including inline code in the cells and a row shorter than its header.
+ */
+const table = await openFresh(
+  [
+    'Checked rather than asserted:',
+    '',
+    '| Surface | Check | Result |',
+    '|---|---|---|',
+    '| `site/index.html` | local md5 vs S3 ETag | both |',
+    '| git | `git status`, `origin/main..HEAD` | clean |',
+    '| api/index.js | live |',
+    '',
+    'Nothing under api/ has changed.',
+  ].join('\n'),
+);
+ok('a table was not rendered as one', table?.querySelectorAll('table').length === 1);
+ok(
+  'the table has no header row, so the columns are unlabelled',
+  [...(table?.querySelectorAll('th') ?? [])].map((el) => el.textContent).join(',') ===
+    'Surface,Check,Result',
+);
+ok('the table lost or gained rows', table?.querySelectorAll('tbody tr').length === 3);
+ok(
+  'a row shorter than the header was not padded, so every column after the gap ' +
+    'misaligns',
+  [...(table?.querySelectorAll('tbody tr') ?? [])].every((tr) => tr.cells.length === 3),
+);
+ok(
+  'inline markdown inside a cell was left as source',
+  table?.querySelector('tbody td code')?.textContent === 'site/index.html',
+);
+ok(
+  'the alignment row was rendered as a row of dashes instead of being read',
+  !/-{3}/.test(table?.textContent ?? ''),
+);
+ok(
+  'the pipes are still on screen, which is the whole complaint',
+  !/\|/.test(table?.textContent ?? ''),
+);
+ok(
+  'the table is not wrapped in anything that can scroll sideways, so three columns ' +
+    'of prose either wrap into a wall or push the sheet off the screen',
+  table?.querySelector('.cmo-md-table > table'),
+);
+ok(
+  'the prose around the table was swallowed by it',
+  /Checked rather than asserted:/.test(table?.textContent ?? '') &&
+    /Nothing under api\/ has changed\./.test(table?.textContent ?? ''),
+);
+
+/*
+ * A header alone is ambiguous — plenty of sentences contain a pipe — so it is the
+ * alignment row underneath that makes a table. Without this check the renderer
+ * turns a shell pipeline into a one-row table.
+ */
+const piped = await openFresh('Run `ps aux | grep node` and read it.\nThen | tidy up.');
+ok(
+  'a sentence with a pipe in it became a table',
+  !piped?.querySelector('table') && /ps aux \| grep node/.test(piped?.textContent ?? ''),
+);
+
+const aligned = await openFresh('| a | b | c |\n|:---|---:|:---:|\n| 1 | 2 | 3 |');
+ok(
+  'the column alignments in the delimiter row were ignored',
+  [...(aligned?.querySelectorAll('thead th') ?? [])].map((el) => el.style.textAlign).join(',') ===
+    'left,right,center',
+);
+
+/*
  * The chip and the conversation list are one line of plain text each, so they get
  * the markers taken off instead of rendered. The fixture is the artefact from the
  * phone: an answer whose second paragraph opens with `**`, cut to length, arriving

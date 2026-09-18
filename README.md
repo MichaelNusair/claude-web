@@ -295,11 +295,13 @@ talking on its own after you have put it down is worse than one that stays quiet
 It names the conversation it is talking about, since the panel and the chat app can
 be in different ones.
 
-The message is **rendered, not shown as source**: bold, headings, bullets, links and
-fenced code come out as themselves, because on a phone that sheet is the whole of
+The message is **rendered, not shown as source**: bold, headings, bullets, tables,
+links and fenced code come out as themselves, because on a phone that sheet is the whole of
 what you read of an answer and an answer is written to be read. The one-line
 surfaces — the chip and the conversation list — get the markers stripped instead,
-since a heading has nowhere to go on one line. Nothing about a message is ever
+since a heading has nowhere to go on one line. Tables scroll sideways as a unit
+rather than wrapping every cell, because a wrapped table is a wall of words with the
+alignment that made it a table gone. Nothing about a message is ever
 treated as markup: the renderer builds elements and puts model text through
 `textContent`, and a link is only tappable if it points at http(s) or at this
 origin.

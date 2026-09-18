@@ -53,7 +53,7 @@
    *
    * Bump it when this file changes in a way anyone would look for.
    */
-  const OVERLAY_BUILD = '2026-09-18.2';
+  const OVERLAY_BUILD = '2026-09-18.3';
 
   // -------------------------------------------- survive a browser refresh
   /*
@@ -316,6 +316,20 @@
     overflow-x: auto; white-space: pre;
   }
   .cmo-said pre code { background: none; padding: 0; }
+  /*
+   * A table scrolls sideways as a unit, and its cells do not wrap.
+   *
+   * Three columns of prose will not fit across a phone, and the two ways out are
+   * wrapping every cell — which turns a comparison into a wall and loses the
+   * alignment that made it a table — or pushing it along. Pushing it along keeps
+   * rows readable, so the wrapper scrolls and the cells stay on one line.
+   */
+  .cmo-md-table { margin: 0 0 8px; overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  .cmo-said table { border-collapse: collapse; font-size: 12.5px; }
+  .cmo-said th, .cmo-said td {
+    border: 1px solid #34342f; padding: 4px 8px; text-align: left; white-space: nowrap;
+  }
+  .cmo-said th { color: #fff; font-weight: 600; background: #1f1f1d; }
   /*
    * The other conversations in this project. Rows rather than a select, because
    * each one carries three things — what it is, what it is doing, and how long ago
@@ -1638,6 +1652,10 @@
         .replace(/~~~[\s\S]*?(~~~|$)/g, ' ')
         .replace(/!\[[^\]]*\]\([^)]*\)/g, ' ')
         .replace(/\[([^\]]*)\]\([^)]*\)/g, '$1')
+        // A table has no one-line form. Its alignment row carries no words at all,
+        // and its cells read better separated than piped.
+        .replace(/^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?\s*$/gm, ' ')
+        .replace(/^\s*\|(.*)\|?\s*$/gm, (_, row) => row.split('|').join(' · '))
         // Line markers while the lines are still lines: a `*` opening a bullet and
         // a `*` opening emphasis are told apart by where they sit.
         .replace(/^\s{0,3}#{1,6}\s+/gm, '')
@@ -1869,9 +1887,14 @@
    * one attribute taken from the message is an href whose scheme is checked.
    *
    * The subset is what Claude actually writes and what fits in a sheet: fenced
-   * code, headings, bullet and numbered lists, rules, inline code, bold, italic,
-   * links. No tables, no nesting, no blockquotes — anything unrecognised is left as
+   * code, headings, bullet and numbered lists, rules, tables, inline code, bold,
+   * italic, links. No nesting and no blockquotes — anything unrecognised is left as
    * the text it was, which is exactly what this sheet did before.
+   *
+   * Tables were left out of the first version of this on the grounds that they do
+   * not fit a phone, which was the wrong call: a status answer is very often mostly
+   * table — surface, check, result — and a table left as source is not a wide table,
+   * it is a screenful of pipes.
    */
   const MD_FENCE = /^\s*(```|~~~)/;
   const MD_HEADING = /^\s*(#{1,6})\s+(.*)$/;
@@ -1901,6 +1924,37 @@
     el.textContent = text;
     return el;
   };
+
+  /*
+   * One row of a pipe table, split into cells.
+   *
+   * The outer pipes are optional in every dialect worth supporting, so they are
+   * dropped before the split rather than becoming empty leading and trailing cells.
+   * `\|` is a literal pipe inside a cell and must not split it.
+   */
+  const MD_DELIM_CELL = /^:?-+:?$/;
+  function mdCells(line) {
+    let text = line.trim();
+    if (text.startsWith('|')) text = text.slice(1);
+    if (/(^|[^\\])\|$/.test(text)) text = text.slice(0, -1);
+    return text.split(/(?<!\\)\|/).map((cell) => cell.trim().replace(/\\\|/g, '|'));
+  }
+
+  /**
+   * The alignment row, if the line after a candidate header is one.
+   *
+   * This is what tells a table from a sentence with pipes in it: a header alone is
+   * ambiguous, a header followed by `|---|---|` with a matching number of cells is
+   * not. Returning the alignments doubles as the answer to "was this a table".
+   */
+  function mdAlignments(header, next) {
+    if (next === undefined) return null;
+    const cells = mdCells(next);
+    if (cells.length !== header.length || !cells.every((c) => MD_DELIM_CELL.test(c))) return null;
+    return cells.map((c) =>
+      /^:.*:$/.test(c) ? 'center' : c.endsWith(':') ? 'right' : c.startsWith(':') ? 'left' : '',
+    );
+  }
 
   /*
    * A link a tap can follow, or the text it was.
@@ -1977,6 +2031,45 @@
         flush();
         out.appendChild(document.createElement('hr'));
         continue;
+      }
+      /*
+       * A table, if the next line says this one was a header. Checked before the
+       * inline forms get near it, because a cell is markdown in its own right and
+       * the pipes are structure rather than text.
+       */
+      if (line.includes('|')) {
+        const header = mdCells(line);
+        const align = header.length > 1 ? mdAlignments(header, lines[i + 1]) : null;
+        if (align) {
+          flush();
+          const table = document.createElement('table');
+          const headRow = table.createTHead().insertRow();
+          header.forEach((cell, col) => {
+            const th = document.createElement('th');
+            if (align[col]) th.style.textAlign = align[col];
+            headRow.appendChild(mdInline(cell, th));
+          });
+          const body = table.createTBody();
+          i += 2;
+          while (i < lines.length && lines[i].trim() && lines[i].includes('|')) {
+            const cells = mdCells(lines[i]);
+            const row = body.insertRow();
+            // Padded to the header's width rather than the row's: a short row is
+            // normal in hand-written markdown, and a ragged table misaligns every
+            // column after the gap.
+            for (let col = 0; col < header.length; col += 1) {
+              row.appendChild(mdInline(cells[col] ?? '', document.createElement('td')));
+              if (align[col]) row.cells[col].style.textAlign = align[col];
+            }
+            i += 1;
+          }
+          i -= 1; // the loop's own increment lands on the line that ended the table
+          const wrap = document.createElement('div');
+          wrap.className = 'cmo-md-table';
+          wrap.appendChild(table);
+          out.appendChild(wrap);
+          continue;
+        }
       }
       const heading = MD_HEADING.exec(line);
       if (heading) {
