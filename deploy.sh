@@ -541,10 +541,37 @@ if [ "$AUTH_OK" -ne 0 ]; then
   exit 1
 fi
 
+# ---------------------------------------------------------------------------
+step "Reading the sign-in password"
+# ---------------------------------------------------------------------------
+# This header earns its place by being the answer to "why does the deploy always
+# hang at the login checks". It never did. Those checks are three curls with
+# --max-time; they print and finish. What came after them was this call, with no
+# header of its own, so a stall here landed under the *previous* step's output and
+# read as that step hanging — with the summary, the last thing the script prints,
+# never arriving.
+#
+# Three things made a stall here silent and unbounded, and all three are fixed
+# below. `2>/dev/null` threw away the reason. The AWS CLI's default timeouts are
+# 60s per attempt with retries on top. And stdin was still the terminal, so a
+# profile whose credentials come from something interactive — an SSO device code,
+# an MFA prompt, a hardware key — waited forever for an answer nobody could see it
+# asking for. That is the shape of a deploy that "gets stuck at the end" on one
+# machine and not another: it is the credential helper, not the deploy.
+#
+# The password is a convenience, not the deploy. If it cannot be read, say why in
+# one line, print the command that fetches it, and still print the summary.
 PW_ARN="$(read_output PasswordCommand | sed -n 's/.*--secret-id \([^ ]*\).*/\1/p')"
-PW="$(aws secretsmanager get-secret-value --secret-id "$PW_ARN" \
+PW_ERR="$(mktemp)"
+PW_HINT=""
+if ! PW="$(aws secretsmanager get-secret-value --secret-id "$PW_ARN" \
   --query SecretString --output text \
-  "${AWS_ARGS[@]}" 2>/dev/null || echo '<see stack outputs>')"
+  --cli-connect-timeout 5 --cli-read-timeout 15 \
+  "${AWS_ARGS[@]}" 2>"$PW_ERR" </dev/null)"; then
+  PW="unread — $(tr -d '\r' < "$PW_ERR" | grep -v '^[[:space:]]*$' | tail -1 | cut -c1-120)"
+  PW_HINT="$(read_output PasswordCommand)"
+fi
+rm -f "$PW_ERR"
 
 printf '\n'
 if [ "$code" = "200" ]; then
@@ -565,3 +592,8 @@ cat <<SUMMARY
   Sign in with the password above. It gates the chat; the editor asks for the
   same one separately.
 SUMMARY
+
+if [ -n "$PW_HINT" ]; then
+  printf '\n  The password could not be read from here. Everything above is deployed;\n'
+  printf '  fetch it with:\n\n    %s\n' "$PW_HINT"
+fi
