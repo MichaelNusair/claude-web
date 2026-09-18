@@ -83,6 +83,36 @@ it" is only true if the header actually came from the load balancer — and *onl
 the ALB can reach the instance* is a security group rule, one console click from
 being false.
 
+**Authentication is not authorization, and here the difference is the whole
+thing.** An ALB `authenticate-oidc` action proves the caller holds an account with
+the provider. It does not prove they are *you*. Pointed at Google with nothing
+further, "logged in" means every Google account in existence — and this service
+hands whoever gets in a shell. So oidc mode carries a second, separate check:
+
+- `oidc.allowedEmails` (and/or `oidc.allowedDomain`) names the identities that are
+  yours. It is **mandatory**: `infra/config.js` fails the synth without it, and
+  `assertAuthConfig()` kills the process at boot without it, so there is no
+  configuration in which the provider's whole user base gets in.
+- The allowlist is matched only against claims from a JWT whose signature has
+  already been verified. Reading an identity out of an unverified token would be
+  worse than not checking at all, because then the attacker writes the claims.
+- `email_verified` must be true. With some providers `email` is whatever the user
+  typed at signup, which would make the list a formality.
+- Matching is case-insensitive and anchored at the domain label boundary, so
+  `notexample.com` cannot pass as `example.com` and `you@example.com.evil.test`
+  cannot pass as `you@example.com`.
+- `oidc.scope` must contain `email`, or there is no claim to match and every login
+  is refused. The synth rejects a scope without it rather than letting you
+  discover that at the login screen.
+
+`/api/*` and `/ws` get their own listener rule that answers an unauthenticated
+request with 401 rather than redirecting to the provider — a cross-origin 302 is
+an opaque CORS failure to `fetch()` and is un-followable by a WebSocket upgrade,
+so the client could not tell a lapsed session from a broken deployment.
+
+One trade to know about: the ALB's session cookie caps at 7 days, where password
+mode issues 30. You re-authenticate weekly.
+
 Requires an OAuth app with your provider. See [DEPLOY.md](DEPLOY.md).
 
 ## What is gated
@@ -111,6 +141,14 @@ behind it, so neither depends on the proxy being right.
 and asserts that every API route, every static asset and the WebSocket upgrade
 refuse an unauthenticated caller; that forged, tampered and expired cookies are
 rejected; and that the server dies rather than starting without credentials.
+
+In `oidc` mode it additionally asserts that the server refuses to start with no
+allowlist configured, that a forged `x-amzn-oidc-data` header is rejected
+(unsigned, symmetric-alg, and a structurally valid ES256 token carrying an
+allowlisted address but an invented signature), that a local password is not a
+second door past the provider, and — case by case, without a network — that the
+identity allowlist accepts exactly the addresses it should and refuses
+lookalikes, prefixes, subdomain tricks and unverified addresses.
 
 `deploy.sh` runs it *before* deploying and refuses to proceed if it fails, then
 curls the live URL afterwards and aborts if the deployed app answers
@@ -161,13 +199,53 @@ In rough order of value for effort:
 4. **Consider `permissionMode: "acceptEdits"`.** Claude still edits files freely
    but asks before running commands. It costs you the hands-off experience and
    buys a checkpoint in front of the dangerous half.
-5. **Use `authMode: "oidc"`** if you want real identities and MFA rather than one
-   shared password.
+5. **Use `authMode: "oidc"`** if you want a real identity and MFA rather than one
+   shared password — and set `oidc.allowedEmails` when you do. Without it the
+   load balancer authorises your provider's entire user base; with Google, the
+   internet. The deployment refuses to run in that state, but the reason to
+   configure it is that it is the check doing the work, not that a validator
+   nagged you.
 6. **Stop the instance when you are not using it.** The workspace volume is
    retained, so nothing is lost, and a stopped instance has no attack surface.
 7. **Give the GitHub token the narrowest scope that works.** It can push to
    whatever you grant it. A fine-grained token limited to specific repositories
    beats a classic `repo`-scoped one.
+
+## Knowing the blast radius
+
+Separate from reducing it, and not a substitute for it. Everything above bounds
+what a compromise *can* reach; this bounds how long you would spend guessing.
+
+By default an AWS account has no CloudTrail trail. The console shows 90 days of
+Event history, which is not durable, not integrity-validated and not exportable —
+so after an incident involving the instance role, the question *which API calls
+did those credentials make* has no answer you can rely on. That is the one gap
+that cannot be closed retroactively: you cannot decide to have been logging.
+
+```json
+{
+  "security": { "enabled": true, "cloudTrail": true, "guardDuty": false }
+}
+```
+
+```bash
+./deploy-security.sh
+```
+
+A multi-region trail with log file validation, into a private encrypted bucket
+that is `RETAIN`ed on stack deletion — `cdk destroy` must not delete the evidence
+of whatever prompted the teardown. `guardDuty` adds detection of credentials being
+used from somewhere they should not be; it defaults to off only because AWS allows
+one detector per account per region and enabling a second fails the deploy. See
+[DEPLOY.md](DEPLOY.md#optional-the-audit-stack-cloudtrail--guardduty).
+
+Two more worth enabling from the console if you are serious about this, neither of
+which this repository manages for you:
+
+- **ALB access logs**, which are the only record of requests that the application
+  never saw — including ones it rejected.
+- **An account-level S3 public access block**, which makes "a bucket was
+  accidentally made public" unreachable as a class rather than per bucket.
 
 ## Rotating credentials
 
@@ -212,10 +290,20 @@ aws ec2 stop-instances --instance-ids <InstanceId> --region us-east-1
 # 4. Read the access log before you rebuild it.
 aws ssm start-session --target <InstanceId>
 sudo journalctl -u claude-chat | grep -E 'login|failed login'
+
+# 5. Find out what the instance role did, if you have a trail (see above).
+aws cloudtrail lookup-events \
+  --lookup-attributes AttributeKey=Username,AttributeValue=<instance-id> \
+  --start-time 2026-01-01 --max-results 50 --region us-east-1
 ```
 
 Successful and failed logins are logged with their source IP, and never with the
 attempted password.
+
+Step 5 is the one that needs to have been set up in advance. Calls made with the
+instance role appear under the instance id as the username, which is what makes
+that query the answer to "what did it touch". Without a trail you get 90 days of
+Event history at best and nothing you can attest to.
 
 The workspace volume survives instance termination, so you can replace the
 instance without losing work — but if you believe code on the volume was

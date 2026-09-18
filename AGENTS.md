@@ -139,9 +139,16 @@ current design:
 - The server **refuses to start** without a strong password and session secret.
   Do not add a fallback, a default, or a development bypass that could reach
   production.
+- **Authentication is not authorization.** In `oidc` mode the ALB proves the caller
+  has an account with the provider and nothing more — with Google, that is
+  everyone. `oidc.allowedEmails` is what says which accounts are the operator's,
+  it is mandatory in both `config.js` and `assertAuthConfig()`, and it is checked
+  only against claims from a JWT whose signature has already been verified. Do not
+  add a path that reads an identity out of an unverified token, and do not make the
+  allowlist optional "for convenience" — the convenient version is a public shell.
 - [`chat-service/auth-test.js`](chat-service/auth-test.js) is the contract. It
-  boots the real server and speaks real HTTP and WebSocket to it. `deploy.sh`
-  runs it and refuses to deploy on failure.
+  boots the real server and speaks real HTTP and WebSocket to it, in both modes.
+  `deploy.sh` runs it and refuses to deploy on failure.
 
 If you are asked to "just disable auth for testing", use
 `CW_INSECURE_COOKIES=1` on `localhost` — which only drops the `Secure` cookie
@@ -151,7 +158,7 @@ itself is not something you will do on an internet-facing deployment.
 ### Before you finish any change to auth, routing, or the stack
 
 ```bash
-npm run test:auth      # must be 49/49 or better; never fewer checks than before
+npm run test:auth      # must be 95/95 or better; never fewer checks than before
 npm run test:client
 npm run test:panes     # several projects at once; what closing a tab must not do
 npm run test:overlay   # 106/106; the editor overlay: chords, drafts, clipboard, speech
@@ -272,6 +279,8 @@ infra/                   AWS CDK (JavaScript, not TypeScript).
   userdata/bootstrap.sh  Instance provisioning. Idempotent; re-run on deploy.
 
   lib/landing-stack.js   Optional marketing site: S3 + CloudFront. Separate stack.
+  lib/security-stack.js  Optional CloudTrail + GuardDuty. Account-wide, so its
+                         own stack and its own lifetime.
 
 landing/                 The public marketing page. Static, no build step.
 pwa/                     Assets copied into chat-service/public/ by deploy.sh.
@@ -281,10 +290,12 @@ mobile-extension/        Strips VS Code chrome for phone use, and owns the
                          rescue from a layout a file view has taken over.
 deploy.sh                The whole deploy. Read it before changing the pipeline.
 deploy-landing.sh        The landing site only. Independent of deploy.sh.
+deploy-security.sh       The audit stack only. Safe from the workspace: no
+                         UserData change, so nothing stops the box mid-deploy.
 migrate.sh               Brings local repos + Claude session history up.
 ```
 
-### Two stacks, deliberately
+### Three stacks, deliberately
 
 `ClaudeWebStack` is the workspace — a machine that runs shell commands.
 `ClaudeWebLandingStack` is a public static page. They share no resources, and the
@@ -296,6 +307,18 @@ Both manage a Route53 record, so **they must never be configured with the same
 hostname** — `config.js` rejects that rather than letting CloudFormation find out.
 When moving a hostname from one to the other, deploy the stack that is *giving it
 up* first.
+
+`ClaudeWebSecurityStack` is separate for a different reason: a CloudTrail trail and
+a GuardDuty detector are account-wide singletons, not app resources, and their
+lifetime must not be tied to the workspace they watch. Deleting the workspace stack
+must not delete the record of what that instance did — which is also why the trail
+bucket is `RemovalPolicy.RETAIN`. Do not fold it into `stack.js` to save a file.
+
+Both optional stacks are opt-in and default to off, because a fork must deploy
+cleanly in someone else's account. For the security stack that is load-bearing
+twice over: AWS allows one GuardDuty detector per account per region, so
+`guardDuty: true` in an account that already has one fails the deploy on that
+resource. `deploy-security.sh` checks first and explains; keep it that way.
 
 ## Common requests, and how to handle them
 

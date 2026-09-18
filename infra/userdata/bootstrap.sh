@@ -17,6 +17,13 @@ DOMAIN_NAME="__DOMAIN_NAME__"
 VPC_CIDR="__VPC_CIDR__"
 AUTH_MODE="__AUTH_MODE__"
 OIDC_CLIENT_ID="__OIDC_CLIENT_ID__"
+# Who is allowed in when AUTH_MODE is oidc. The load balancer only proves the
+# caller has an account with the provider — with Google, that is everyone — so
+# this list is the check that matters, and the chat service refuses to start in
+# oidc mode without it. Comma-separated addresses; the domain form is for a
+# provider that owns a domain.
+OIDC_ALLOWED_EMAILS="__OIDC_ALLOWED_EMAILS__"
+OIDC_ALLOWED_DOMAIN="__OIDC_ALLOWED_DOMAIN__"
 GIT_USER_NAME="__GIT_USER_NAME__"
 GIT_USER_EMAIL="__GIT_USER_EMAIL__"
 DEFAULT_MODEL="__DEFAULT_MODEL__"
@@ -266,6 +273,8 @@ AUTH_PASSWORD=$CS_PASSWORD
 SESSION_SECRET=$SESSION_SECRET
 CW_AUTH_MODE=$AUTH_MODE
 CW_OIDC_EXPECTED_CLIENT_ID=$OIDC_CLIENT_ID
+CW_OIDC_ALLOWED_EMAILS=$OIDC_ALLOWED_EMAILS
+CW_OIDC_ALLOWED_DOMAIN=$OIDC_ALLOWED_DOMAIN
 CW_REGION=$REGION
 AUTHENV
 # Readable only by the service account: anything else running on the box would
@@ -747,7 +756,7 @@ server {
         # Path-only, because nginx does not know its own address. It listens on
         # __APP_PORT__ behind the load balancer that terminates TLS, so left to build
         # an absolute Location it names the port it can see and the scheme it is spoken
-        # to in: http://cc.strikelabs.tech:8080/p/<name>/, which is unreachable from a
+        # to in: http://<your-host>:8080/p/<name>/, which is unreachable from a
         # phone. Verified in production, where that is exactly what it sent.
         absolute_redirect off;
         port_in_redirect off;

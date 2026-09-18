@@ -223,13 +223,25 @@ migrating means rewriting both — `-Users-you-Documents-code-X` →
 `-workspace-projects-X`, and every embedded `/Users/you/Documents/code/X` →
 `/workspace/projects/X`. Skip either and the history is copied but never found.
 
-## Optional: OIDC instead of a password
+## Optional: sign in with Google (or any OIDC provider)
 
 Moves authentication to the load balancer, so no unauthenticated request reaches
-the instance, and you get real identities and MFA instead of one shared secret.
+the instance, and you get a real identity with MFA instead of one shared secret.
 
-1. Create an OAuth app with your provider. Set the redirect URI to
-   `https://<domainName>/oauth2/idpresponse`.
+**Read this paragraph before you configure anything.** The load balancer's OIDC
+action *authenticates*: it proves the caller holds an account with your provider,
+and then forwards the request. It does not *authorise*. Pointed at Google with
+nothing further, "logged in" means **every Google account in existence**, and
+behind that door is a shell on your box. The setting that actually protects the
+deployment is `oidc.allowedEmails` — the addresses you personally sign in with.
+It is not optional: `./deploy.sh` refuses to synthesise without it, and the chat
+service refuses to start without it.
+
+1. Create an OAuth app with your provider. In Google Cloud Console that is
+   **APIs & Services → Credentials → Create credentials → OAuth client ID →
+   Web application**. Set the authorised redirect URI to
+   `https://<domainName>/oauth2/idpresponse` — exactly that path, on the hostname
+   in your config.
 2. Put the client secret in Secrets Manager:
 
    ```bash
@@ -248,16 +260,122 @@ the instance, and you get real identities and MFA instead of one shared secret.
        "tokenEndpoint": "https://oauth2.googleapis.com/token",
        "userInfoEndpoint": "https://openidconnect.googleapis.com/v1/userinfo",
        "clientId": "....apps.googleusercontent.com",
-       "clientSecretArn": "arn:aws:secretsmanager:us-east-1:123456789012:secret:claude-web-oidc-AbCdEf"
+       "clientSecretArn": "arn:aws:secretsmanager:us-east-1:123456789012:secret:claude-web-oidc-AbCdEf",
+       "allowedEmails": ["you@gmail.com"],
+       "scope": "openid email"
      }
    }
    ```
 
 4. `./deploy.sh`
 
-Note that the ALB authenticates *anyone* your provider will authenticate. With
-Google that is every Google account in existence unless you restrict it — use a
-Cognito user pool, or a Google Workspace-restricted client, if that matters.
+### How the two layers divide the work
+
+| Layer | Question it answers | Where |
+| --- | --- | --- |
+| ALB `authenticate-oidc` | Does this caller have an account with the provider? | `infra/lib/stack.js` |
+| `oidcIdentityAllowed` | Is that account **yours**? | `chat-service/auth.js` |
+
+The load balancer keeps unauthenticated traffic off the instance entirely. The
+app makes the decision that matters, and it makes it only against claims from a
+JWT whose ES256 signature it has verified against the ALB's published key — so
+"the load balancer checked it" is only trusted once the header is proven to have
+come from the load balancer. Anyone who can reach the instance directly (a
+security group is one console click from being wrong) cannot authenticate by
+inventing the header.
+
+Three details that are easy to get wrong:
+
+- **`scope` must contain `email`.** The allowlist matches on the email claim. Drop
+  the scope and the provider returns no email, so every login is refused — which
+  fails safe, and looks exactly like a broken deployment. `config.js` rejects a
+  scope without it rather than letting you find out at the login screen.
+- **`allowedDomain` is for providers that own a domain** — Google Workspace, or a
+  Cognito pool you control. With a public provider, a domain you do not control
+  is not a restriction. Matching is anchored at the label boundary, so
+  `notexample.com` cannot pass as `example.com`.
+- **Unverified addresses are refused.** With some providers `email` is whatever
+  the user typed at signup; only `email_verified` makes it a claim the provider
+  stands behind.
+
+### Session lifetime, and what to expect when one lapses
+
+The ALB's own session cookie caps at 7 days, shorter than the 30-day cookie
+password mode issues. Expect to re-authenticate weekly.
+
+Requests to `/api/*` and `/ws` get a listener rule of their own that answers an
+unauthenticated request with **401** instead of the default 302 to the provider.
+That is deliberate: `fetch()` would follow a cross-origin redirect to
+`accounts.google.com`, which sends no CORS headers for your origin, so the PWA
+would see an opaque network error rather than a lapsed session — and a WebSocket
+upgrade cannot follow a redirect at all. A 401 is something the client can read
+and react to by reloading, which re-runs the login flow properly.
+
+### If you lock yourself out
+
+Nothing here touches SSM. `aws ssm start-session --target <instance-id>` still
+works, so a wrong address in `allowedEmails` is recoverable: fix the config and
+redeploy, or edit `/etc/claude-auth.env` on the box and
+`systemctl restart claude-chat` for an immediate fix.
+
+## Optional: the audit stack (CloudTrail + GuardDuty)
+
+The highest-value thing you can add to this deployment that is not a lock on the
+front door. Claude runs shell commands here using the instance role's
+credentials, so whatever that role can do, a prompt can do — a documented and
+accepted property (see [SECURITY.md](SECURITY.md)). What is not acceptable is not
+being able to find out afterwards. Without a trail, the only record of what those
+credentials did is CloudTrail's 90-day Event history: not durable, not
+integrity-validated, not exportable. The first question after any incident —
+*what did it touch?* — has no answer.
+
+```json
+{
+  "security": {
+    "enabled": true,
+    "cloudTrail": true,
+    "guardDuty": false,
+    "logRetentionDays": 365
+  }
+}
+```
+
+```bash
+./deploy-security.sh
+```
+
+A third stack, and separate for a different reason than the landing site: what it
+creates is account-wide, not app infrastructure. Deleting `ClaudeWebStack` must
+not delete the record of what that instance did. The trail bucket is `RETAIN`ed
+for the same reason — `cdk destroy` leaves the logs behind rather than deleting
+the evidence of whatever prompted the teardown.
+
+Safe to run from the workspace itself, unlike `./deploy.sh`: there is no UserData
+change here, so CloudFormation never stops the box the deploy is running on.
+
+**`guardDuty` defaults to `false`, and that is not a comment on whether you want
+it.** AWS permits exactly one detector per account per region, and CDK cannot
+adopt one that already exists, so enabling this in an account that already has a
+detector fails the deploy on that resource. Check first:
+
+```bash
+aws guardduty list-detectors
+```
+
+An empty list means you can turn it on. If it returns an id, detection is already
+running — leave the toggle off, you lose nothing. `deploy-security.sh` runs this
+check for you and stops with an explanation rather than letting CloudFormation
+report it as a logical id.
+
+The same applies more softly to the trail: a second multi-region trail is legal
+and works, it just bills twice for the same events. An account inside an AWS
+Organization usually has one imposed from the management account already, in
+which case set `"cloudTrail": false`.
+
+Costs, so it is not a surprise: management events are free for the first copy in
+an account, so the trail is effectively the S3 storage only (cents per month at
+this volume). GuardDuty is usage-priced and typically a few dollars a month for a
+single small instance.
 
 ## Optional: the landing page
 

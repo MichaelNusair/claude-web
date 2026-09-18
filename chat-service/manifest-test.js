@@ -230,7 +230,7 @@ ok(
 /*
  * And that redirect has to be path-only. nginx listens on the app port behind the
  * load balancer that terminates TLS, so left to build an absolute Location it names
- * what it can see: http://cc.strikelabs.tech:8080/p/<name>/ — a scheme and a port
+ * what it can see: http://<your-host>:8080/p/<name>/ — a scheme and a port
  * that are not reachable from a phone. Found in production, on the live route, by
  * following the slashless form through the domain rather than through localhost.
  */

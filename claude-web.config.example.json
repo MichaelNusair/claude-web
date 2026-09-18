@@ -34,7 +34,24 @@
     "",
     "'oidc' moves authentication to the load balancer, so no unauthenticated",
     "request ever reaches the instance. It requires an OAuth app with your",
-    "provider and all six oidc fields below."
+    "provider and all six oidc fields below.",
+    "",
+    "READ THIS BEFORE CHOOSING oidc. The load balancer AUTHENTICATES — it proves",
+    "the caller holds an account with your provider — and then forwards the",
+    "request. It does not AUTHORIZE. With Google, 'has an account' is every",
+    "Google account in existence, and what is behind the door here is a shell.",
+    "So allowedEmails is the setting that actually protects the deployment: put",
+    "the addresses you sign in with, and nothing else. Both the deploy and the",
+    "chat service refuse to start in oidc mode without it.",
+    "",
+    "allowedDomain is for a provider that owns a domain — Google Workspace, or a",
+    "Cognito pool you control. Never use it with a public provider: a domain you",
+    "do not control is not a restriction.",
+    "",
+    "scope must contain 'email'. The allowlist matches on the email claim, so",
+    "without that scope the provider returns nothing to match against.",
+    "",
+    "Endpoints for Google, GitHub and Cognito are in docs/DEPLOY.md."
   ],
   "authMode": "password",
   "oidc": {
@@ -43,7 +60,10 @@
     "tokenEndpoint": "",
     "userInfoEndpoint": "",
     "clientId": "",
-    "clientSecretArn": ""
+    "clientSecretArn": "",
+    "allowedEmails": [],
+    "allowedDomain": "",
+    "scope": "openid email"
   },
 
   "$comment_network": [
@@ -99,6 +119,36 @@
     "domainName": "",
     "certificateArn": "",
     "stackName": "ClaudeWebLandingStack"
+  },
+
+  "$comment_security": [
+    "Optional account-level audit trail and threat detection, as its own stack.",
+    "Deploy with ./deploy-security.sh, which is independent of ./deploy.sh and",
+    "touches nothing the workspace depends on.",
+    "",
+    "cloudTrail creates a multi-region trail with log file validation, writing to",
+    "a private bucket. This is what makes the blast radius knowable: Claude runs",
+    "shell commands with the instance role's credentials, and without a trail the",
+    "only record of what those credentials did is CloudTrail's 90-day Event",
+    "history, which is not durable, not integrity-validated and not exportable.",
+    "The first question after any incident — 'what did it touch?' — has no answer.",
+    "",
+    "The bucket is RETAINed on stack deletion, deliberately: 'cdk destroy' must",
+    "not delete the evidence of whatever prompted the teardown.",
+    "",
+    "guardDuty is false by default because AWS allows exactly ONE detector per",
+    "account per region and CDK cannot adopt an existing one, so turning this on",
+    "in an account that already has one fails the deploy. Check with",
+    "'aws guardduty list-detectors' — an empty list means you can enable it.",
+    "",
+    "logRetentionDays applies to the trail logs. 0 keeps them forever."
+  ],
+  "security": {
+    "enabled": false,
+    "stackName": "ClaudeWebSecurityStack",
+    "cloudTrail": true,
+    "guardDuty": false,
+    "logRetentionDays": 365
   },
 
   "$comment_deployFrom": [

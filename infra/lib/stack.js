@@ -220,6 +220,8 @@ export class ClaudeWebStack extends Stack {
         -e 's|__VPC_CIDR__|${VPC_CIDR}|g' \\
         -e 's|__AUTH_MODE__|${config.authMode}|g' \\
         -e 's|__OIDC_CLIENT_ID__|${config.oidc.clientId}|g' \\
+        -e 's|__OIDC_ALLOWED_EMAILS__|${config.oidc.allowedEmails.join(',')}|g' \\
+        -e 's|__OIDC_ALLOWED_DOMAIN__|${config.oidc.allowedDomain}|g' \\
         -e 's|__GIT_USER_NAME__|${config.gitUserName}|g' \\
         -e 's|__GIT_USER_EMAIL__|${config.gitUserEmail}|g' \\
         -e 's|__DEFAULT_MODEL__|${config.defaultModel}|g' \\
@@ -335,6 +337,42 @@ export class ClaudeWebStack extends Stack {
           validation: acm.CertificateValidation.fromDns(zone),
         });
 
+    // --- OIDC at the load balancer -------------------------------------------
+    // Built once and reused by both rules below: `fromSecretCompleteArn` creates
+    // a construct, so calling it twice with the same id would clash.
+    //
+    // Worth being precise about what this buys, because it is easy to over-read.
+    // The ALB action AUTHENTICATES — it proves the caller holds an account with
+    // the provider. It does not AUTHORIZE: with Google, every Google account on
+    // earth satisfies it. The check that the caller is *you* happens in
+    // chat-service/auth.js, against the email claim in the JWT forwarded below.
+    // This layer's job is to keep unauthenticated traffic off the instance
+    // entirely, not to decide who gets a shell.
+    const oidcClientSecret =
+      config.authMode === 'oidc'
+        ? secretsmanager.Secret.fromSecretCompleteArn(
+            this,
+            'OidcClientSecret',
+            config.oidc.clientSecretArn,
+          )
+        : undefined;
+
+    const oidcAction = (next, onUnauthenticatedRequest) =>
+      elbv2.ListenerAction.authenticateOidc({
+        issuer: config.oidc.issuer,
+        authorizationEndpoint: config.oidc.authorizationEndpoint,
+        tokenEndpoint: config.oidc.tokenEndpoint,
+        userInfoEndpoint: config.oidc.userInfoEndpoint,
+        clientId: config.oidc.clientId,
+        clientSecret: oidcClientSecret.secretValue,
+        // Load-bearing. Without "email" in the scope the provider returns no
+        // email claim, so the app-side allowlist has nothing to match and every
+        // login is refused. config.js fails the deploy if it is missing.
+        scope: config.oidc.scope,
+        onUnauthenticatedRequest,
+        next,
+      });
+
     const httpsListener = alb.addListener('HTTPS', {
       port: 443,
       protocol: elbv2.ApplicationProtocol.HTTPS,
@@ -345,29 +383,36 @@ export class ClaudeWebStack extends Stack {
       defaultTargetGroups: config.authMode === 'oidc' ? undefined : [targetGroup],
       defaultAction:
         config.authMode === 'oidc'
-          ? elbv2.ListenerAction.authenticateOidc({
-              issuer: config.oidc.issuer,
-              authorizationEndpoint: config.oidc.authorizationEndpoint,
-              tokenEndpoint: config.oidc.tokenEndpoint,
-              userInfoEndpoint: config.oidc.userInfoEndpoint,
-              clientId: config.oidc.clientId,
-              clientSecret: secretsmanager.Secret.fromSecretCompleteArn(
-                this,
-                'OidcClientSecret',
-                config.oidc.clientSecretArn,
-              ).secretValue,
-              next: elbv2.ListenerAction.forward([targetGroup]),
-            })
+          ? oidcAction(elbv2.ListenerAction.forward([targetGroup]))
           : undefined,
     });
 
-    // The health check must stay reachable without authentication or the ALB
-    // marks its own target unhealthy and serves 503 to everyone.
     if (config.authMode === 'oidc') {
+      // The health check must stay reachable without authentication or the ALB
+      // marks its own target unhealthy and serves 503 to everyone.
       httpsListener.addAction('HealthCheckBypass', {
         priority: 1,
         conditions: [elbv2.ListenerCondition.pathPatterns(['/healthz'])],
         action: elbv2.ListenerAction.forward([targetGroup]),
+      });
+
+      // XHR and WebSocket traffic gets 401, not a redirect.
+      //
+      // The default action's behaviour for an unauthenticated request is a 302 to
+      // the provider, which is right for a browser opening a page and wrong for
+      // everything the app does afterwards. `fetch()` follows that redirect
+      // cross-origin to accounts.google.com, which has no CORS headers for us, so
+      // the PWA sees an opaque network error instead of "your session expired" —
+      // and a WebSocket upgrade cannot follow a redirect at all, so the socket
+      // just fails. DENY returns a plain 401 that the client can actually read
+      // and react to by reloading, which is what re-runs the login flow properly.
+      httpsListener.addAction('ApiDenyWhenUnauthenticated', {
+        priority: 2,
+        conditions: [elbv2.ListenerCondition.pathPatterns(['/api/*', '/ws'])],
+        action: oidcAction(
+          elbv2.ListenerAction.forward([targetGroup]),
+          elbv2.UnauthenticatedAction.DENY,
+        ),
       });
     }
 

@@ -2,6 +2,7 @@
 import { App } from 'aws-cdk-lib';
 import { ClaudeWebStack } from '../lib/stack.js';
 import { ClaudeWebLandingStack } from '../lib/landing-stack.js';
+import { ClaudeWebSecurityStack } from '../lib/security-stack.js';
 import { loadConfig } from '../config.js';
 
 // Configuration is validated before the app is constructed, so a missing domain
@@ -41,5 +42,22 @@ if (config.landing.domainName) {
     },
     description: `Landing page for claude-web at ${config.landing.domainName}`,
     crossRegionReferences: true,
+  });
+}
+
+// Audit and threat detection, also opt-in and also its own stack — but unlike the
+// landing site it is separate because of *lifetime* rather than isolation. The
+// trail outlives the workspace it watches: deleting ClaudeWebStack must not also
+// delete the record of what that instance did while it existed.
+if (config.security.enabled) {
+  new ClaudeWebSecurityStack(app, config.security.stackName, {
+    config,
+    env: {
+      account: process.env.CDK_DEFAULT_ACCOUNT,
+      // A multi-region trail and a detector are account-wide, but the resources
+      // still live somewhere; the app's own region keeps them next to it.
+      region: config.region,
+    },
+    description: 'CloudTrail and GuardDuty for the account running claude-web',
   });
 }

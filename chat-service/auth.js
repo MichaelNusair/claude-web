@@ -22,6 +22,16 @@
  * Both modes fail closed. Missing or weak configuration aborts startup rather
  * than degrading to open access, because the failure mode of the alternative is
  * remote code execution.
+ *
+ * AUTHENTICATION IS NOT AUTHORIZATION, and in oidc mode that distinction is the
+ * whole ball game. An ALB `authenticate-oidc` action proves the caller holds an
+ * account with the provider — not that they are *you*. Pointed at Google with no
+ * further check, "logged in" means every Google account in existence, which on a
+ * box running `claude --permission-mode bypassPermissions` is a world-readable
+ * shell. So oidc mode additionally requires an identity allowlist
+ * (CW_OIDC_ALLOWED_EMAILS / CW_OIDC_ALLOWED_DOMAIN) and refuses to start without
+ * one. The allowlist is checked only against claims from a JWT whose signature
+ * has already been verified — see verifyOidc.
  */
 import { createHmac, timingSafeEqual, createHash, randomUUID } from 'crypto';
 import { createVerify } from 'crypto';
@@ -73,6 +83,18 @@ export function assertAuthConfig() {
     }
     if (!process.env.AWS_REGION && !process.env.CW_REGION) {
       throw new Error('CW_AUTH_MODE=oidc requires AWS_REGION to fetch ALB signing keys.');
+    }
+    // The one that matters. Without it the provider's entire user base is
+    // authorised, which for a public provider like Google is the internet.
+    const { emails, domain } = oidcAllowList();
+    if (!emails.size && !domain) {
+      throw new Error(
+        'CW_AUTH_MODE=oidc requires CW_OIDC_ALLOWED_EMAILS (or CW_OIDC_ALLOWED_DOMAIN). ' +
+          'The load balancer only proves the caller has an account with your identity ' +
+          'provider — with Google, that is every Google account in existence. This ' +
+          'service hands out a shell, so it refuses to start without knowing which ' +
+          'identities are yours. Set oidc.allowedEmails in claude-web.config.json.',
+      );
     }
     return;
   }
@@ -226,6 +248,79 @@ export function clientIp(req) {
 
 const albKeyCache = new Map();
 
+/**
+ * Who is allowed in, read at call time rather than at import so the value is the
+ * one the process was configured with — and so a test can set it per case.
+ *
+ * Emails are compared lowercased: providers are inconsistent about case in the
+ * local part, and a mismatch here fails closed in the direction of locking the
+ * operator out of their own box.
+ */
+function oidcAllowList() {
+  const emails = new Set(
+    String(process.env.CW_OIDC_ALLOWED_EMAILS || '')
+      .split(',')
+      .map((e) => e.trim().toLowerCase())
+      .filter(Boolean),
+  );
+  const domain = String(process.env.CW_OIDC_ALLOWED_DOMAIN || '').trim().toLowerCase();
+  return { emails, domain };
+}
+
+/**
+ * Is this verified token's subject one of ours?
+ *
+ * Called only with claims from a signature-checked JWT. Calling it with an
+ * unverified payload would be worse than not calling it at all, because an
+ * attacker writes their own claims.
+ *
+ * `email_verified` is required, and required to be true, because an unverified
+ * email is a claim the provider itself does not stand behind — with some
+ * providers it is simply whatever the user typed at signup, which would make the
+ * allowlist a formality. Accepted as either a boolean or the string "true": the
+ * ALB re-serialises provider claims and does not promise to preserve the type.
+ *
+ * Exported for auth-test.js. This is the one decision in oidc mode that a
+ * network-free test can cover exhaustively — every case-, domain-suffix- and
+ * missing-claim variant — and it is the decision that separates "has a Google
+ * account" from "has a shell on this box", so it is worth covering exhaustively.
+ * Exporting it grants nothing: the only caller that matters is verifyOidc, after
+ * the signature check.
+ */
+export function oidcIdentityAllowed(claims) {
+  if (!claims || typeof claims !== 'object') return false;
+
+  const { emails, domain } = oidcAllowList();
+  // Defence in depth: assertAuthConfig already refused to start in this state.
+  if (!emails.size && !domain) return false;
+
+  const email = typeof claims.email === 'string' ? claims.email.trim().toLowerCase() : '';
+  if (!email) {
+    console.warn('oidc: token carried no email claim; check the provider scope includes "email"');
+    return false;
+  }
+
+  const verified = claims.email_verified;
+  if (verified !== true && verified !== 'true') {
+    console.warn(`oidc: rejecting ${email} — provider did not report the address as verified`);
+    return false;
+  }
+
+  if (emails.has(email)) return true;
+
+  // Domain form, for a Workspace/hosted provider. Compared against the email's
+  // own domain rather than a separate `hd` claim, so it cannot be satisfied by a
+  // provider that omits `hd` — and anchored to the final label so that
+  // "notexample.com" cannot pass as "example.com".
+  if (domain && (email.endsWith(`@${domain}`) || email.endsWith(`.${domain}`))) {
+    const claimedDomain = email.slice(email.indexOf('@') + 1);
+    if (claimedDomain === domain || claimedDomain.endsWith(`.${domain}`)) return true;
+  }
+
+  console.warn(`oidc: rejecting ${email} — not in the configured allowlist`);
+  return false;
+}
+
 async function albPublicKey(kid, region) {
   if (albKeyCache.has(kid)) return albKeyCache.get(kid);
   // Documented endpoint; returns a PEM-encoded EC public key.
@@ -263,12 +358,20 @@ export async function verifyOidc(req) {
     return false;
   }
 
+  // `JSON.parse('null')` and `JSON.parse('7')` both succeed, and reading `.alg`
+  // off either throws — from inside the request path, where an exception is a 500
+  // rather than a clean denial. Cheap to reject here instead.
+  if (!header || typeof header !== 'object' || !payload || typeof payload !== 'object') {
+    return false;
+  }
+
   if (header.alg !== 'ES256' || !header.kid) return false;
   if (payload.exp && Number(payload.exp) < Math.floor(Date.now() / 1000)) return false;
 
   const expectedClient = process.env.CW_OIDC_EXPECTED_CLIENT_ID;
   if (expectedClient && header.client !== expectedClient) return false;
 
+  let signatureValid = false;
   try {
     const region = process.env.CW_REGION || process.env.AWS_REGION;
     const pem = await albPublicKey(header.kid, region);
@@ -276,13 +379,18 @@ export async function verifyOidc(req) {
     verifier.update(`${headerB64}.${payloadB64}`);
     verifier.end();
     // ALB emits JOSE-style fixed-width r||s, which Node reads with dsaEncoding.
-    return verifier.verify(
+    signatureValid = verifier.verify(
       { key: pem, dsaEncoding: 'ieee-p1363' },
       Buffer.from(signatureB64, 'base64url'),
     );
   } catch {
     return false;
   }
+  if (!signatureValid) return false;
+
+  // Only now are the claims worth reading. The provider said who this is; this
+  // line is where we decide whether that person is allowed to have a shell.
+  return oidcIdentityAllowed(payload);
 }
 
 // --- the check every request goes through -----------------------------------

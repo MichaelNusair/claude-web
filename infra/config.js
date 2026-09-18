@@ -57,6 +57,32 @@ const DEFAULTS = {
     clientId: '',
     /** Read from Secrets Manager at deploy time; never commit the value. */
     clientSecretArn: '',
+
+    /**
+     * WHO IS ALLOWED IN. Not optional, and not the same question as which
+     * provider to use.
+     *
+     * The load balancer's OIDC action authenticates — it proves the caller has an
+     * account with the provider. It does not authorise. With Google that means
+     * every Google account on earth satisfies it, and what is behind it here is a
+     * shell running with `bypassPermissions`. So this list is what actually
+     * defends the deployment, and both `config.js` and the chat service refuse to
+     * start in oidc mode without it.
+     *
+     * Give the addresses you sign in with, e.g. ["you@gmail.com"]. Use
+     * allowedDomain instead (or as well) only for a provider that owns a domain —
+     * a Google Workspace or Cognito pool — never for a public provider, where a
+     * domain you do not control is not a restriction at all.
+     */
+    allowedEmails: [],
+    allowedDomain: '',
+
+    /**
+     * Requested scopes. "email" is load-bearing rather than cosmetic: without it
+     * the provider returns no email claim, the allowlist above has nothing to
+     * match on, and every login is refused.
+     */
+    scope: 'openid email',
   },
 
   /**
@@ -127,6 +153,35 @@ const DEFAULTS = {
    *
    * Leave `domainName` empty and no landing resources are created at all.
    */
+  /**
+   * Account-level audit and threat detection, as its own opt-in stack.
+   *
+   * Separate from the workspace stack on purpose, and for a different reason than
+   * the landing site: these are account-wide singletons, not app resources. A
+   * CloudTrail trail records every API call made in the account — including the
+   * ones made with the instance role, which is the only way to find out after the
+   * fact what a compromised workspace did. GuardDuty is what notices while it is
+   * happening.
+   *
+   * Worth understanding before enabling: `guardDuty` creates a detector, and AWS
+   * permits exactly ONE per account per region. If the account already has one —
+   * from another stack, another tool, or a click in the console — this deploy
+   * fails on that resource. Hence the default of false, which is "leave my
+   * account's detector alone" rather than "detection is optional".
+   *
+   * Leave `enabled` false and nothing here is created at all.
+   */
+  security: {
+    enabled: false,
+    stackName: 'ClaudeWebSecurityStack',
+    /** Multi-region trail with log file validation, into a private bucket. */
+    cloudTrail: true,
+    /** See the one-per-region warning above. */
+    guardDuty: false,
+    /** How long trail logs are kept. 0 keeps them forever. */
+    logRetentionDays: 365,
+  },
+
   landing: {
     /** e.g. "claude.example.com". Empty disables the whole landing stack. */
     domainName: '',
@@ -185,6 +240,7 @@ export function loadConfig() {
     oidc: { ...DEFAULTS.oidc, ...(fromFile.oidc || {}) },
     landing: { ...DEFAULTS.landing, ...(fromFile.landing || {}) },
     deployFrom: { ...DEFAULTS.deployFrom, ...(fromFile.deployFrom || {}) },
+    security: { ...DEFAULTS.security, ...(fromFile.security || {}) },
   };
 
   for (const [envVar, key] of Object.entries(ENV_MAP)) {
@@ -232,6 +288,33 @@ export function loadConfig() {
         `authMode is "oidc" but these oidc settings are missing: ${missing.join(', ')}. ` +
           'See docs/DEPLOY.md for where to find them for Google, GitHub or Cognito. ' +
           'Leave authMode as "password" if you do not want to configure a provider.',
+      );
+    }
+
+    if (!Array.isArray(config.oidc.allowedEmails)) {
+      fail('oidc.allowedEmails must be an array of addresses, e.g. ["you@gmail.com"].');
+    }
+    const emails = config.oidc.allowedEmails.map((e) => String(e).trim()).filter(Boolean);
+    if (!emails.length && !String(config.oidc.allowedDomain || '').trim()) {
+      fail(
+        'authMode is "oidc" but oidc.allowedEmails is empty. The load balancer only ' +
+          'checks that the caller has an account with your provider — with Google that ' +
+          'is every Google account in existence, and this deployment hands whoever gets ' +
+          'in a shell. Set the addresses you sign in with, e.g.\n' +
+          '      "allowedEmails": ["you@gmail.com"]\n' +
+          '  or, for a provider that owns a domain, "allowedDomain": "example.com".',
+      );
+    }
+    for (const email of emails) {
+      if (!/^[^@\s]+@[^@\s]+\.[a-z]{2,}$/i.test(email)) {
+        fail(`oidc.allowedEmails entry "${email}" is not an email address.`);
+      }
+    }
+    if (!/\bemail\b/.test(config.oidc.scope || '')) {
+      fail(
+        `oidc.scope is "${config.oidc.scope}", which does not request "email". The ` +
+          'allowlist matches on the email claim, so without that scope the provider ' +
+          'returns nothing to match and every login is refused. Use "openid email".',
       );
     }
   }
@@ -290,6 +373,24 @@ export function loadConfig() {
         '[config] landing.certificateArn is empty and region is not us-east-1, ' +
           'so a certificate will be created in us-east-1 for CloudFront. This is ' +
           'correct, just worth knowing: the landing stack is always us-east-1.',
+      );
+    }
+  }
+
+  // --- Security stack (optional) -------------------------------------------
+  if (config.security.enabled) {
+    if (!config.security.cloudTrail && !config.security.guardDuty) {
+      fail(
+        'security.enabled is true but both security.cloudTrail and security.guardDuty ' +
+          'are false, so the stack would create nothing. Enable at least one, or set ' +
+          'security.enabled to false.',
+      );
+    }
+    const days = config.security.logRetentionDays;
+    if (!Number.isInteger(days) || days < 0) {
+      fail(
+        'security.logRetentionDays must be a whole number of days, or 0 to keep trail ' +
+          `logs forever. Got ${JSON.stringify(days)}.`,
       );
     }
   }

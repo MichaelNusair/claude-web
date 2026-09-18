@@ -12,6 +12,7 @@
 import { spawn } from 'child_process';
 import { once } from 'events';
 import { WebSocket } from 'ws';
+import { oidcIdentityAllowed } from './auth.js';
 
 const PASSWORD = 'test-password-32-chars-long-enough';
 const SECRET = 'a-long-enough-session-secret-value';
@@ -358,6 +359,208 @@ console.log('\nThrottles guessing:');
 }
 
 await stop(child);
+
+// --- 3. oidc mode -----------------------------------------------------------
+// The mode with the trap in it. An ALB `authenticate-oidc` action AUTHENTICATES
+// — it proves the caller holds an account with the provider — and then forwards
+// the request. It does not AUTHORIZE. Point it at Google with no further check
+// and "logged in" means every Google account in existence, on a box that hands
+// out a shell. So the checks below are about one thing: that the deployment
+// knows which identities are its own, and refuses to run when it does not.
+
+const OIDC_ENV = {
+  CW_AUTH_MODE: 'oidc',
+  CW_OIDC_EXPECTED_CLIENT_ID: 'test-client-id.apps.googleusercontent.com',
+  CW_REGION: 'us-east-1',
+  // Deliberately still set. In oidc mode these must be *ignored*, not required:
+  // a password door alongside the provider would be a second, weaker way in.
+  AUTH_PASSWORD: PASSWORD,
+  SESSION_SECRET: SECRET,
+};
+
+console.log('\noidc mode refuses to start without knowing who is allowed in:');
+{
+  // The whole point. Nothing else in this file would catch it: the server starts
+  // fine, the ALB authenticates fine, and the box is open to the internet.
+  const { child: c, ready, stderr: err } = await startServer({
+    ...OIDC_ENV,
+    CW_OIDC_ALLOWED_EMAILS: '',
+    CW_OIDC_ALLOWED_DOMAIN: '',
+  });
+  check('oidc with no allowlist → server does not serve', !ready);
+  check(
+    'explains that the provider alone authorises nobody',
+    /CW_OIDC_ALLOWED_EMAILS/.test(err()),
+    err().slice(0, 300),
+  );
+  await stop(c);
+}
+{
+  const { child: c, ready } = await startServer({
+    ...OIDC_ENV,
+    CW_OIDC_EXPECTED_CLIENT_ID: '',
+    CW_OIDC_ALLOWED_EMAILS: 'you@example.com',
+  });
+  check('oidc with no expected client id → server does not serve', !ready);
+  await stop(c);
+}
+
+console.log('\noidc mode with an allowlist serves, and still gates every route:');
+{
+  const { child: c, ready, stderr: err } = await startServer({
+    ...OIDC_ENV,
+    CW_OIDC_ALLOWED_EMAILS: 'you@example.com',
+  });
+  check('oidc with an allowlist → server starts', ready, err().slice(0, 300));
+
+  if (ready) {
+    const mode = await fetch(`${BASE}/api/auth-mode`).then((r) => r.json());
+    check('reports mode oidc', mode.mode === 'oidc', JSON.stringify(mode));
+
+    // No ALB in front of these, so no header: exactly what a caller reaching the
+    // instance directly looks like. "Only the load balancer can reach the box" is
+    // a security group rule, i.e. one console click from being false.
+    for (const path of ['/api/models', '/api/projects', '/admin', '/']) {
+      const res = await fetch(`${BASE}${path}`, { redirect: 'manual' });
+      check(
+        `oidc: no x-amzn-oidc-data on ${path} → denied`,
+        res.status === 401 || res.status === 302,
+        `got ${res.status}`,
+      );
+    }
+
+    const ws = await wsOutcome(`ws://127.0.0.1:${PORT}/ws`);
+    check('oidc: unauthenticated /ws → rejected with 401', ws.includes('401'), `got ${ws}`);
+
+    // A local password must not be a second door past the provider.
+    const login = await fetch(`${BASE}/api/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password: PASSWORD }),
+    });
+    check('oidc: password login is refused', login.status === 400, `got ${login.status}`);
+    check('oidc: password login sets no cookie', !login.headers.get('set-cookie'));
+
+    // Forged headers. The first two are rejected on the header alone; the last is
+    // structurally a real ES256 token with an allowlisted email in it, and is
+    // refused because the signature cannot be verified against an ALB key. That
+    // is the property that matters — the claims are an attacker's to write, so
+    // nothing may be read from them before the signature is checked.
+    const b64 = (o) => Buffer.from(JSON.stringify(o)).toString('base64url');
+    const claims = { email: 'you@example.com', email_verified: true };
+    const forged = [
+      ['unsigned (alg none)', `${b64({ alg: 'none', kid: 'k' })}.${b64(claims)}.`],
+      ['symmetric alg', `${b64({ alg: 'HS256', kid: 'k' })}.${b64(claims)}.c2ln`],
+      ['not three segments', b64({ alg: 'ES256', kid: 'k' })],
+      ['null payload', `${b64({ alg: 'ES256', kid: 'k' })}.${Buffer.from('null').toString('base64url')}.c2ln`],
+      ['ES256 with an invented signature', `${b64({ alg: 'ES256', kid: 'k' })}.${b64(claims)}.${'A'.repeat(86)}`],
+    ];
+    for (const [name, token] of forged) {
+      const res = await fetch(`${BASE}/api/models`, {
+        headers: { 'x-amzn-oidc-data': token },
+      });
+      check(`oidc: forged token rejected — ${name}`, res.status === 401, `got ${res.status}`);
+    }
+  }
+  await stop(c);
+}
+
+// --- 4. The authorization decision itself -----------------------------------
+// Unit-level, because it is the one part of oidc mode a test can cover
+// exhaustively without an ALB: no network, no signing key, every variant. It is
+// also the line that separates "has a Google account" from "has a shell here".
+console.log('\nThe identity allowlist:');
+{
+  const warn = console.warn;
+  // The function logs every rejection, which is right in production and noise
+  // here — most of these cases are *meant* to be rejected.
+  console.warn = () => {};
+
+  const withEnv = (env, fn) => {
+    const before = {
+      CW_OIDC_ALLOWED_EMAILS: process.env.CW_OIDC_ALLOWED_EMAILS,
+      CW_OIDC_ALLOWED_DOMAIN: process.env.CW_OIDC_ALLOWED_DOMAIN,
+    };
+    Object.assign(process.env, {
+      CW_OIDC_ALLOWED_EMAILS: env.emails ?? '',
+      CW_OIDC_ALLOWED_DOMAIN: env.domain ?? '',
+    });
+    try {
+      return fn();
+    } finally {
+      for (const [k, v] of Object.entries(before)) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+    }
+  };
+
+  const verified = (email) => ({ email, email_verified: true });
+
+  withEnv({ emails: 'you@example.com' }, () => {
+    check('allowlisted address is allowed', oidcIdentityAllowed(verified('you@example.com')));
+    // Providers are inconsistent about case, and getting this wrong locks the
+    // operator out of their own box.
+    check('match is case-insensitive', oidcIdentityAllowed(verified('You@Example.COM')));
+    check('surrounding whitespace is ignored', oidcIdentityAllowed(verified('  you@example.com ')));
+    check('a different address is refused', !oidcIdentityAllowed(verified('someone@example.com')));
+    check('a different provider is refused', !oidcIdentityAllowed(verified('you@gmail.com')));
+    // The attack that makes the allowlist worthless if it is a substring test.
+    check(
+      'an address merely containing the allowed one is refused',
+      !oidcIdentityAllowed(verified('you@example.com.evil.test')),
+    );
+    check(
+      'an address with the allowed one as a prefix is refused',
+      !oidcIdentityAllowed(verified('you@example.como')),
+    );
+    // An unverified email is a string the user typed at signup with some
+    // providers, so honouring it would make the list a formality.
+    check(
+      'unverified email is refused',
+      !oidcIdentityAllowed({ email: 'you@example.com', email_verified: false }),
+    );
+    check(
+      'missing email_verified is refused',
+      !oidcIdentityAllowed({ email: 'you@example.com' }),
+    );
+    // The ALB re-serialises provider claims and does not promise to keep the
+    // type, so the string form has to work or a real login fails.
+    check(
+      'email_verified as the string "true" is accepted',
+      oidcIdentityAllowed({ email: 'you@example.com', email_verified: 'true' }),
+    );
+    check('no email claim at all is refused', !oidcIdentityAllowed({ email_verified: true }));
+    check('non-string email is refused', !oidcIdentityAllowed({ email: 1, email_verified: true }));
+    check('null claims are refused', !oidcIdentityAllowed(null));
+  });
+
+  withEnv({ emails: 'a@example.com, b@example.com ,,' }, () => {
+    check('multiple addresses: first', oidcIdentityAllowed(verified('a@example.com')));
+    check('multiple addresses: second', oidcIdentityAllowed(verified('b@example.com')));
+    check('multiple addresses: neither', !oidcIdentityAllowed(verified('c@example.com')));
+  });
+
+  withEnv({ domain: 'example.com' }, () => {
+    check('domain form allows the domain', oidcIdentityAllowed(verified('anyone@example.com')));
+    check('domain form allows a subdomain', oidcIdentityAllowed(verified('x@eu.example.com')));
+    check('domain form refuses another domain', !oidcIdentityAllowed(verified('x@other.com')));
+    // "notexample.com" ends with "example.com" as a string. Anchoring to the
+    // label boundary is the difference between a restriction and a suggestion.
+    check(
+      'domain form refuses a lookalike domain',
+      !oidcIdentityAllowed(verified('x@notexample.com')),
+    );
+  });
+
+  // Defence in depth: assertAuthConfig already refuses to start here, but if
+  // that check is ever moved or skipped this must still deny rather than allow.
+  withEnv({}, () => {
+    check('no allowlist configured → nobody is allowed', !oidcIdentityAllowed(verified('you@example.com')));
+  });
+
+  console.warn = warn;
+}
 
 console.log(`\n${checks - failures}/${checks} checks passed`);
 if (failures) {
