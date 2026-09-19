@@ -453,6 +453,92 @@ ok(
     'target and take the whole site down',
 );
 
+/*
+ * And guessing the password is slowed down on every spelling of the login, not
+ * just the one the limit was written next to.
+ *
+ * `limit_req` used to hang off `location = /api/login`, which meant
+ * /chat/api/login was not limited at all: the /chat/ prefix strips to the same
+ * handler through a location that had no limit, so twenty rapid guesses reached
+ * Node where /api/login stopped at six. Same shape as the editor bug above — a
+ * control attached to a location, and a second location reaching the same thing.
+ * So the key is the path now, and this checks the key covers every prefix that
+ * strips, derived from the config rather than listed.
+ */
+const conf = unescapeConf(nginx);
+const loginMap = /map \$uri \$login_attempt \{\n([\s\S]*?)\n\}/.exec(conf);
+ok(
+  loginMap,
+  'the login throttle is no longer keyed on a map over $uri, so it is back to being ' +
+    'scoped to whichever location happens to carry it',
+);
+ok(
+  /^\s*default\s+"";/m.test(loginMap?.[1] ?? ''),
+  'the login throttle map has a non-empty default, so nginx now counts ordinary chat ' +
+    'traffic against the login rate and a busy session will 429 itself',
+);
+const mapped = new Set(
+  [...(loginMap?.[1] ?? '').matchAll(/^\s*(\S+)\s+\$binary_remote_addr;/gm)].map((m) => m[1]),
+);
+ok(mapped.has('/api/login'), 'the login endpoint itself is not in the throttle map');
+
+// Applied at the server, so every location inherits it. A location that declares
+// its own limit_req replaces the inherited one rather than adding to it, which is
+// how a route silently stops being throttled.
+ok(
+  /\n    limit_req zone=login /.test(unescapeConf(heredoc ?? '')),
+  'limit_req is not applied at the server level, so a location that serves a login ' +
+    'without declaring it is unthrottled',
+);
+const ownLimit = locationBlocks.filter((l) => /limit_req\s/.test(l.body)).map((l) => l.where);
+ok(
+  ownLimit.length === 0,
+  `nginx location(s) ${ownLimit.join(', ')} declare their own limit_req, which replaces ` +
+    "the server's rather than adding to it — the login throttle stops applying there",
+);
+
+/*
+ * Any location that proxies to the chat service with a bare trailing slash strips
+ * its prefix, so the path the world asks for and the path auth.js sees differ —
+ * and the throttle is keyed on the former. Each such prefix therefore needs its
+ * own spelling of the login in the map. Today that is /chat/; the point of
+ * deriving it is the next one.
+ */
+const stripping = locationBlocks.filter((l) =>
+  /proxy_pass\s+http:\/\/127\.0\.0\.1:9997\/;/.test(l.body),
+);
+ok(
+  stripping.length > 0,
+  'no location strips a prefix to the chat service, so either the routing changed or ' +
+    'this check has stopped finding it',
+);
+for (const { where } of stripping) {
+  ok(
+    /^\/[^\s{}]*\/$/.test(where),
+    `nginx location "${where}" strips a prefix to the chat service but is not a plain ` +
+      'prefix, so the login path behind it cannot be derived — add it to the map by hand',
+  );
+  const alias = `${where}api/login`;
+  ok(
+    mapped.has(alias),
+    `${alias} reaches the login handler but is not in the throttle map, so password ` +
+      'guessing through that prefix is unlimited at the edge',
+  );
+}
+
+// The backtick check above covers the nginx heredoc; this one is written the same
+// way and is the same trap, so it gets the same check. Both are unquoted heredocs
+// run as root at boot.
+const realip = /cat > \/etc\/nginx\/conf\.d\/00-realip\.conf <<REALIP\n([\s\S]*?)\nREALIP\n/.exec(
+  nginx,
+)?.[1];
+ok(realip, 'the realip/limit config is no longer written by the heredoc this checks');
+ok(
+  !/(^|[^\\])`/.test(realip ?? '`'),
+  'an unescaped backtick in the realip heredoc: the shell will run it as root at boot ' +
+    'and paste the output into the config',
+);
+
 fs.rmSync(TMP, { recursive: true, force: true });
 console.log(`\n${pass}/${pass + fail} checks passed`);
 process.exit(fail ? 1 : 0);

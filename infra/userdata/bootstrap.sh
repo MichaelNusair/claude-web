@@ -603,9 +603,27 @@ real_ip_header X-Forwarded-For;
 real_ip_recursive on;
 
 # Slow down password guessing at the edge, before it reaches Node. auth.js also
-# locks out per IP; this is the cheap first layer, and it is scoped to the login
-# route so a burst of chat traffic is never throttled.
-limit_req_zone \$binary_remote_addr zone=login:10m rate=12r/m;
+# locks out per IP; this is the cheap first layer, and it stays scoped to the login
+# endpoint so a burst of chat traffic is never throttled.
+#
+# The key is the *path*, not the location, and that is the whole point. This limit
+# used to hang off \`location = /api/login\`, which left /chat/api/login unthrottled:
+# the /chat/ prefix strips to the same handler through a location that had no
+# limit, so 20 rapid guesses all reached Node while /api/login stopped at 6.
+# Measured, not theorised. Keying on the path means the limit follows the endpoint
+# into any location that serves it, including one added later.
+#
+# nginx does not count a request whose key is empty, so this throttles exactly the
+# paths named here and nothing else. \$uri rather than \$request_uri because \$uri is
+# decoded and normalised: /chat/api/%6Cogin, /chat//api/login and
+# /chat/../api/login all arrive here as a name written below instead of slipping
+# past it as an unrecognised string.
+map \$uri \$login_attempt {
+    default          "";
+    /api/login       \$binary_remote_addr;
+    /chat/api/login  \$binary_remote_addr;
+}
+limit_req_zone \$login_attempt zone=login:10m rate=12r/m;
 limit_req_status 429;
 
 # What gets injected into the <head> of code-server's HTML: the mobile viewport
@@ -638,6 +656,13 @@ server {
     listen $APP_PORT default_server;
     server_name _;
     client_max_body_size 100M;
+
+    # Applied here, at the server, rather than on the login location: every location
+    # inherits it, so no route can serve a login attempt without it. Which requests
+    # this actually counts is decided by \$login_attempt in 00-realip.conf, and it is
+    # empty for everything that is not a login — so this line throttles guessing and
+    # nothing else, including the 100M uploads and the long-lived streams below.
+    limit_req zone=login burst=5 nodelay;
 
     # ALB health check — must not require a password.
     location = /healthz {
@@ -728,10 +753,11 @@ server {
         proxy_set_header X-Forwarded-Proto https;
     }
 
-    # Rate-limited separately: this is the one unauthenticated endpoint that
-    # checks a secret, so it is the only one worth guessing against.
+    # The one unauthenticated endpoint that checks a secret, so the only one worth
+    # guessing against. The throttle for it is inherited from the server block above
+    # and keyed on the path, which is what also covers the /chat/api/login spelling
+    # of this same handler.
     location = /api/login {
-        limit_req zone=login burst=5 nodelay;
         proxy_pass http://127.0.0.1:9997;
         proxy_http_version 1.1;
         proxy_set_header Host \$host;

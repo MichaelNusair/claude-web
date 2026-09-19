@@ -478,6 +478,16 @@ is not arbitrary:
   in `oidc` mode and empty otherwise. Adding a fourth route to code-server without
   it is a shell on this box for any account the provider will authenticate;
   `manifest-test.js` fails the suite if you do.
+- **A security control belongs on the path, not on the location, because two
+  locations can reach one handler.** `/chat/` strips its prefix, so `/chat/api/login`
+  and `/api/login` are the same endpoint — and the `limit_req` that was attached to
+  `location = /api/login` did not apply to the other spelling. The login throttle is
+  now keyed on `$uri` through the `$login_attempt` map and applied once at the
+  server, so every location inherits it and nginx counts only the paths the map
+  names. Do not move it back into a location, and do not give a location its own
+  `limit_req` — a location-level directive *replaces* the inherited one. That is
+  the same bug as the editor gate above, twice, which is why both are derived from
+  the config in `manifest-test.js` rather than listed.
 
 ### "Make it cheaper"
 

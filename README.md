@@ -374,13 +374,23 @@ not in nginx, not in the load balancer alone. Every route and the WebSocket
 upgrade require a session; the server refuses to start without a strong password
 and cookie signing key; failed logins are throttled at two layers.
 
-This is stated precisely because an earlier version of this project got it wrong:
-the nginx config carried a comment describing an `auth_request` gate that had
-never been written, and the chat API sat open to the internet while every document
-in the repo said otherwise. So the claim is now checked by machine —
+This is stated precisely because earlier versions of this project got it wrong
+twice, in the same shape both times. First the nginx config carried a comment
+describing an `auth_request` gate that had never been written, and the chat API sat
+open to the internet while every document in the repo said otherwise. Then, after
+`oidc` mode arrived, the identity allowlist was enforced correctly in `auth.js` —
+and the editor routes did not go through `auth.js` at all, so any account the
+provider would authenticate reached a full IDE if it also had the editor's
+password. Neither was a bug in the check. Both were a route that did not reach it.
+
+So the claim is checked by machine, from both ends.
 [`chat-service/auth-test.js`](chat-service/auth-test.js) boots the real server and
-asserts it, `deploy.sh` refuses to deploy if it fails, and after deploying it
-curls the live URL and aborts if the API answers without a login.
+asserts the check is right;
+[`chat-service/manifest-test.js`](chat-service/manifest-test.js) parses the nginx
+config and asserts no route bypasses it — discovering the routes from the config
+rather than from a list, because a list is what both bugs got past. `deploy.sh`
+refuses to deploy if either fails, and after deploying it curls the live URL and
+aborts if the API answers without a login.
 
 ```bash
 npm run test:auth

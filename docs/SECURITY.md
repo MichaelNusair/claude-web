@@ -69,7 +69,18 @@ Two modes, set by `authMode` in `claude-web.config.json`.
   outstanding session. Without that, a leaked password stays useful for as long
   as the attacker's cookie lives.
 - Failed attempts are throttled per client IP with exponential backoff (up to 15
-  minutes), and nginx separately rate-limits `/api/login` to 12 requests/minute.
+  minutes), and nginx separately rate-limits the login to 12 requests/minute at
+  the edge. That limit is keyed on the **request path**, not on the nginx location
+  it was written next to, and the two are not the same thing: `/chat/` strips its
+  prefix, so `/chat/api/login` reaches the same handler, and for a while it reached
+  it through a location with no limit — 20 rapid guesses got through where
+  `/api/login` stopped at 6. Both spellings now share one counter, so alternating
+  between them does not double the budget. `$uri` is the key rather than
+  `$request_uri` because it is decoded and normalised, which is what makes
+  `/chat/api/%6Cogin`, `/chat//api/login` and `/chat/../api/login` count too.
+  `manifest-test.js` derives the set of prefixes that strip from the config and
+  fails if any of their login paths is missing from the map, so a second `/chat/`
+  added later cannot reintroduce the hole.
 - The server **refuses to start** if the password or session secret is missing or
   under 16 characters. A misconfigured deployment is a dead one, never an open
   one.
@@ -124,7 +135,7 @@ only paths served without a session:
 | --- | --- |
 | `/healthz` | ALB health check. Returns a constant; touches nothing. |
 | `/login`, `/login.html` | The login page itself. Self-contained, inline CSS. |
-| `/api/login` | Verifies the password. Rate-limited. |
+| `/api/login` | Verifies the password. Rate-limited, on every path that reaches it. |
 | `/api/auth-mode` | Says whether to show a password form. Reveals no secret. |
 
 The allowlist direction matters: a new route added to `server.js` is gated
