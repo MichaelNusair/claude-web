@@ -113,7 +113,8 @@ const DEFAULTS = {
   defaultModel: 'us.anthropic.claude-opus-5',
   /** "bypassPermissions" | "acceptEdits" | "plan". See docs/SECURITY.md. */
   permissionMode: 'bypassPermissions',
-  effortLevel: 'xhigh',
+  /** "low" | "medium" | "high" | "xhigh" | "max" — max is the highest there is. */
+  effortLevel: 'max',
 
   gitUserName: 'Claude Web',
   gitUserEmail: 'claude-web@example.invalid',

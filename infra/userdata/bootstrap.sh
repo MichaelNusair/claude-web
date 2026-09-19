@@ -545,11 +545,17 @@ if os.path.exists(target):
 perms = current.get('permissions') or {}
 perms['defaultMode'] = permission_mode
 current['permissions'] = perms
-current.setdefault('effortLevel', effort)
+# Assigned, not setdefault: this file lives on the persistent data volume, so it
+# survives every deploy. setdefault meant the value written by the *first* deploy
+# won, and effortLevel in claude-web.config.json was silently ignored from then
+# on — a box ran xhigh for three deploys that each reported shipping max. The
+# config is the authoritative answer, the same way defaultMode above is, so a
+# hand-edit here is reset by the next deploy rather than outliving it.
+current['effortLevel'] = effort
 os.makedirs(os.path.dirname(target), exist_ok=True)
 with open(target, 'w') as fh:
     json.dump(current, fh, indent=2)
-print(f'claude settings: defaultMode={permission_mode}')
+print(f'claude settings: defaultMode={permission_mode} effortLevel={effort}')
 CLAUDESETTINGS
 chown -R "$USER_NAME:$USER_NAME" "$DATA_MNT/claude"
 
