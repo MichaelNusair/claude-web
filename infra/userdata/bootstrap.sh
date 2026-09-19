@@ -575,12 +575,23 @@ chown -R "$USER_NAME:$USER_NAME" "$DATA_MNT/claude"
 # served the chat's index at /chat while its <script src="/app.js"> resolved to
 # the catch-all, so the chat shell loaded and its code did not.
 #
-# SECURITY: none of these locations authenticates anything. The chat service
-# authenticates every request itself (chat-service/auth.js) and code-server
-# checks its own password. That is deliberate — the previous config claimed an
-# `auth_request` gate here that was never written, and the chat API sat open to
-# the internet as a result. Authentication belongs in the process whose data is
-# at stake, not in a proxy comment.
+# SECURITY: no location here decides anything itself. The chat service
+# authenticates every request it serves (chat-service/auth.js), code-server checks
+# its own password, and in oidc mode the code-server routes additionally ask
+# auth.js who the caller is through auth_request — a delegation, not a decision.
+# Authentication belongs in the process whose data is at stake. An earlier config
+# claimed an `auth_request` gate here without writing one and left the chat API
+# open to the internet, so this one is written and asserted in manifest-test.js.
+#
+# Why the workbench needs that gate in oidc mode, specifically: code-server's
+# password proves someone knows a shared secret, which says nothing about *which*
+# identity is holding it. The load balancer in front admits any account the
+# provider will authenticate — with Google, every account that exists — so "any
+# Google account plus the code-server password" reached a full IDE with a
+# terminal, as an identity that was never on oidc.allowedEmails. Found 2026-09-19
+# by signing in with an unlisted address and landing in the editor. The chat was
+# never exposed: every chat request goes through auth.js, which checks the
+# allowlist. The editor simply never went through auth.js at all.
 mkdir -p /opt/claude-web
 
 # Recover the real client address. The ALB appends the caller's IP to
@@ -614,6 +625,14 @@ map \$request_uri \$cmo_head {
 }
 REALIP
 
+# Whether the code-server routes carry the identity gate. Empty in password mode,
+# where a single secret already gates both surfaces and adding a second door would
+# only lock out someone who uses the editor and never opens the chat.
+IDENTITY_GATE=""
+if [ "$AUTH_MODE" = "oidc" ]; then
+  IDENTITY_GATE="auth_request /__identity;"
+fi
+
 cat > /etc/nginx/conf.d/claude-web.conf <<NGINXCONF
 server {
     listen $APP_PORT default_server;
@@ -629,6 +648,28 @@ server {
 
     # Mobile CSS injected into the editor shell below.
     location = /mobile-overlay.js { root /opt/claude-web/pwa; add_header Cache-Control "no-cache"; }
+
+    # The auth_request target for the code-server routes further down. \`internal\`
+    # means nginx will only reach it from a subrequest, never from a client.
+    #
+    # It forwards the caller's own headers — including the load balancer's signed
+    # x-amzn-oidc-data — to /api/auth-check, which answers 204 when auth.js says
+    # the identity is allowed and 401 when it is not. That is exactly the contract
+    # auth_request wants, and it means the allowlist is read from one place for
+    # both surfaces instead of being duplicated here.
+    #
+    # The body is dropped: this asks a question about the caller, and streaming a
+    # 100M upload to the gate as well as the upstream would double every write.
+    location = /__identity {
+        internal;
+        proxy_pass http://127.0.0.1:9997/api/auth-check;
+        proxy_pass_request_body off;
+        proxy_set_header Content-Length "";
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+    }
 
     # --- Chat (primary interface) -------------------------------------------
     # The bare domain sends you to the chat, which lives at /chat/ and not here.
@@ -727,6 +768,7 @@ server {
     # Location headers point there; proxy_redirect keeps the browser inside
     # /editor/ instead of bouncing it back to the chat at /.
     location /editor/ {
+        $IDENTITY_GATE
         proxy_pass http://127.0.0.1:9999/;
         proxy_redirect / /editor/;
         proxy_set_header Accept-Encoding "";
@@ -784,6 +826,7 @@ server {
         # an absolute Location it names the port it can see and the scheme it is spoken
         # to in: http://<your-host>:8080/p/<name>/, which is unreachable from a
         # phone. Verified in production, where that is exactly what it sent.
+        $IDENTITY_GATE
         absolute_redirect off;
         port_in_redirect off;
         rewrite ^/p/([A-Za-z0-9][A-Za-z0-9._-]*)\$ /p/\$1/ redirect;
@@ -807,8 +850,11 @@ server {
         proxy_buffering off;
     }
 
-    # Catch-all: code-server's absolute asset and WebSocket URLs.
+    # Catch-all: code-server's absolute asset and WebSocket URLs. Gated too — this
+    # is the door every unmatched path goes through, so leaving it open would make
+    # the two gates above decoration.
     location / {
+        $IDENTITY_GATE
         proxy_pass http://127.0.0.1:9999/;
         # Inject mobile layout CSS and viewport meta into the workbench shell.
         # Only viewport/PWA meta plus the overlay script. Deliberately NO

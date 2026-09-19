@@ -636,7 +636,16 @@ if [ "$AUTH_OK" -ne 0 ]; then
 fi
 
 # ---------------------------------------------------------------------------
-step "Reading the sign-in password"
+# What this secret *is* depends on the auth mode, and saying the wrong one sends
+# you to the wrong login. In password mode it gates both the chat and the editor.
+# In oidc mode the chat is gated by the provider and the app-side allowlist, and
+# this password is only code-server's own — still real, still asked for, but
+# behind the Google login rather than instead of it.
+if [ "$CFG_AUTH_MODE" = "oidc" ]; then
+  step "Reading the editor's password"
+else
+  step "Reading the sign-in password"
+fi
 # ---------------------------------------------------------------------------
 # This header earns its place by being the answer to "why does the deploy always
 # hang at the login checks". It never did. Those checks are three curls with
@@ -682,10 +691,24 @@ cat <<SUMMARY
   Password  $PW
   Editor    https://$DOMAIN/editor/
   Shell     $SHELL_CMD
+SUMMARY
+
+if [ "$CFG_AUTH_MODE" = "oidc" ]; then
+  cat <<SUMMARY
+
+  Sign in with ${CFG_OIDC_ISSUER#https://}. Holding an account there only gets
+  you to the door: the addresses in oidc.allowedEmails are what
+  chat-service/auth.js actually lets through, for the editor as well as the
+  chat. The password above is code-server's own, asked for behind that check
+  rather than instead of it.
+SUMMARY
+else
+  cat <<SUMMARY
 
   Sign in with the password above. It gates the chat; the editor asks for the
   same one separately.
 SUMMARY
+fi
 
 if [ -n "$PW_HINT" ]; then
   printf '\n  The password could not be read from here. Everything above is deployed;\n'

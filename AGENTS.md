@@ -146,9 +146,24 @@ current design:
   only against claims from a JWT whose signature has already been verified. Do not
   add a path that reads an identity out of an unverified token, and do not make the
   allowlist optional "for convenience" — the convenient version is a public shell.
+- **Ask which routes reach `auth.js`, not just whether `auth.js` is right.** That
+  distinction is the second hole this repo has had. In `oidc` mode the editor
+  routes — `/editor/`, `/p/<name>/` and the catch-all `location /` — proxy to
+  code-server, so for a while they never touched `auth.js` and the allowlist never
+  applied to them. code-server's password was the only thing there, and a password
+  says nothing about *which* identity holds it: any Google account plus that one
+  password was a terminal on the box. Found 2026-09-19 by signing in with an
+  unlisted address. They now carry `auth_request /__identity`, which asks `auth.js`
+  and forwards its answer — the decision stays in the app, nginx only relays it.
+  A correct check on a route nothing goes through protects nothing.
 - [`chat-service/auth-test.js`](chat-service/auth-test.js) is the contract. It
   boots the real server and speaks real HTTP and WebSocket to it, in both modes.
-  `deploy.sh` runs it and refuses to deploy on failure.
+  `deploy.sh` runs it and refuses to deploy on failure. Route *coverage* is the
+  other half, and it lives in
+  [`chat-service/manifest-test.js`](chat-service/manifest-test.js): it discovers
+  every nginx location that proxies to code-server and requires the gate on each,
+  so adding a fourth editor route without one fails the suite. Add a route that
+  reaches code-server, and that is the test you will hear from.
 
 If you are asked to "just disable auth for testing", use
 `CW_INSECURE_COOKIES=1` on `localhost` — which only drops the `Secure` cookie
@@ -458,6 +473,11 @@ is not arbitrary:
   code-server's absolute asset URLs still fall to the catch-all. It exists so a
   project can be an installable app of its own; see "A window per project, on a
   phone" for why a path, and not just an `id`, is what that takes.
+- The three locations that reach code-server — `/editor/`, `/p/<name>/` and the
+  catch-all `/` — each carry `$IDENTITY_GATE`, which is `auth_request /__identity`
+  in `oidc` mode and empty otherwise. Adding a fourth route to code-server without
+  it is a shell on this box for any account the provider will authenticate;
+  `manifest-test.js` fails the suite if you do.
 
 ### "Make it cheaper"
 
@@ -755,9 +775,13 @@ a drift there puts an error page behind every icon on the phone.
 The route **proxies**, it does not redirect: a redirect out of scope lands the user
 in Chrome's in-app browser with a toolbar, which is the "semi-window" this feature
 was reported as. It proxies to the same code-server `/editor/` does, which is the
-security-relevant part — nothing in nginx authenticates anything, and the workbench
-is gated by code-server's own password. A `/p/` path that reached the workbench
-without one would be remote code execution.
+security-relevant part: whatever gates the workbench has to gate this too, because
+a `/p/` path that reached it ungated would be remote code execution. That means
+code-server's own password, plus — in `oidc` mode — the same `auth_request`
+identity gate `/editor/` carries. Keeping the two routes identical in what they
+check is the point. When the identity gate was added, all three code-server routes
+needed it — this one, `/editor/`, and the catch-all — and gating any two of them
+would have left the third as the way in.
 
 The accepted cost: `/login` is outside every project's scope, so the first launch
 after a lapsed session shows Chrome's toolbar until the redirect lands. A scope wide

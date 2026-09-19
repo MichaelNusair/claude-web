@@ -131,9 +131,46 @@ The allowlist direction matters: a new route added to `server.js` is gated
 unless someone deliberately opens it. The reverse — a denylist — is how the
 original bug happened.
 
-The editor at `/editor/` is gated separately by code-server's own password,
-which is the same value. Two independent doors, each enforced by the process
-behind it, so neither depends on the proxy being right.
+The editor at `/editor/` is gated by code-server's own password, enforced by
+code-server itself, so it does not depend on the proxy being right. In `oidc`
+mode that is not sufficient on its own and the editor carries a second gate —
+see below.
+
+### The editor is a second surface, and it needs the allowlist too
+
+A password proves someone knows a shared secret. It does not say **which
+identity** knows it. That distinction does not matter in `password` mode, where
+one secret is the whole authentication story for both surfaces. In `oidc` mode it
+is the entire point: the load balancer admits any account the provider will
+authenticate, and the thing that narrows "any Google account" down to yours is
+`oidc.allowedEmails`, checked in `auth.js`. So any route that never reaches
+`auth.js` never gets that check.
+
+**This was a live hole, found on 2026-09-19 by signing in with an address that
+was not on the allowlist and landing in the editor.** `/editor/`, `/p/<name>/`
+and the catch-all `location /` proxied straight to code-server. The ALB let any
+Google account through the front door; code-server asked for its password; and
+that was the whole of it. Any Google account plus that one password was a full
+IDE with a terminal on this box, held by an identity the allowlist had never
+heard of. The chat was never exposed — every chat request goes through
+`auth.js`. The editor simply never went through `auth.js` at all.
+
+The fix does not move the decision into nginx. In `oidc` mode those three
+locations carry `auth_request /__identity`, an `internal` location that proxies
+to the chat service's `/api/auth-check`; `auth.js` verifies the signed
+`x-amzn-oidc-data` header and matches the allowlist exactly as it does for the
+chat, and answers 204 or 401. nginx forwards the answer, it does not form one.
+code-server's password still applies behind it, so this adds a door rather than
+replacing one. The gate is empty in `password` mode, where a second door would
+only lock out someone who uses the editor and never opens the chat.
+
+The lesson is narrower than "check the editor": **the question is never whether
+`auth.js` is correct, it is which routes reach `auth.js`.** The correctness of
+the allowlist had been verified. Its coverage had not. So the check in
+[`chat-service/manifest-test.js`](../chat-service/manifest-test.js) is written
+over *every* nginx location that proxies to code-server, discovered from the
+config rather than listed, and fails for a route added later — because the bug
+was a route nobody thought to add to a list.
 
 ### Verified, not asserted
 
@@ -149,6 +186,14 @@ allowlisted address but an invented signature), that a local password is not a
 second door past the provider, and — case by case, without a network — that the
 identity allowlist accepts exactly the addresses it should and refuses
 lookalikes, prefixes, subdomain tricks and unverified addresses.
+
+[`chat-service/manifest-test.js`](../chat-service/manifest-test.js) covers the
+other half, the one that was missing: it parses the nginx config out of
+`bootstrap.sh` and asserts that every location reaching code-server carries the
+identity gate, that the gate is `internal` and asks `auth.js`, that it is
+conditional on `oidc` mode, and that `/healthz` stays outside it — a gated health
+check would fail the ALB's own target and take the site down for everyone,
+including you.
 
 `deploy.sh` runs it *before* deploying and refuses to proceed if it fails, then
 curls the live URL afterwards and aborts if the deployed app answers

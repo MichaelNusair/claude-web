@@ -29,6 +29,10 @@ const exported = {
   CFG_PROFILE: config.awsProfile,
   CFG_STACK: config.stackName,
   CFG_AUTH_MODE: config.authMode,
+  // Empty in password mode. Exported so the deploy summary can name the provider
+  // it just put in front of the app, rather than telling you to sign in with a
+  // password that no longer gates the chat.
+  CFG_OIDC_ISSUER: config.oidc?.issuer ?? '',
   CFG_PERMISSION_MODE: config.permissionMode,
   CFG_ADMIN: config.instanceAdminAccess,
   CFG_INSTANCE_TYPE: config.instanceType,

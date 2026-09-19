@@ -243,11 +243,15 @@ section('The path a manifest hands out is a real route, gated like the editor it
  * an error page is not something a test suite should be able to miss.
  *
  * The upstream is compared against /editor/'s rather than named, because that is the
- * property that matters and it is not about routing: nothing in nginx authenticates
- * anything here (see the SECURITY note in bootstrap.sh) — the workbench is gated by
- * code-server's own password check. A project path that reached anything else, or
- * reached code-server by some other door, would be a shell on this box for whoever
- * found it.
+ * property that matters: a project path that reached anything else, or reached
+ * code-server by some other door, would be a shell on this box for whoever found it.
+ *
+ * What gates that door depends on the mode. In password mode it is code-server's own
+ * password check and nothing in nginx. In oidc mode nginx additionally asks auth.js
+ * who the caller is, through `auth_request` — still a delegation, never a decision
+ * taken in the proxy. The check for that is at the bottom of this file, and it is
+ * written over every route that reaches code-server rather than over a list, because
+ * the bug it exists for was a route nobody remembered to add to a list.
  */
 const nginx = fs.readFileSync(path.join(root, 'infra', 'userdata', 'bootstrap.sh'), 'utf8');
 const blockFor = (pattern) =>
@@ -312,8 +316,8 @@ ok(strip('/p/demo/') === '/' && strip('/p/demo') === '/', 'a project window does
 const upstreamOf = (block) => /proxy_pass\s+http:\/\/([^;/\s]+)/.exec(block)?.[1] ?? '';
 ok(
   upstreamOf(body) !== '' && upstreamOf(body) === upstreamOf(blockFor('/editor/')?.[2] ?? ''),
-  'a project path does not reach the same code-server /editor/ does, and code-server’s ' +
-    'own password is the only thing gating the workbench',
+  'a project path does not reach the same code-server /editor/ does, so it is gated by ' +
+    'whatever that other upstream happens to check, which is not the same question',
 );
 ok(
   /cmo_head/.test(body),
@@ -378,6 +382,75 @@ ok(
   !/(^|[^\\])`/.test(heredoc ?? '`'),
   'an unescaped backtick in the nginx heredoc: the shell will run it as root at boot ' +
     'and paste the output into the config',
+);
+
+/*
+ * And every door into the workbench asks who is knocking.
+ *
+ * This is the check that was missing on 2026-09-19, when the deployment moved to
+ * oidc and the editor did not move with it. code-server's password proves someone
+ * knows a shared secret; it says nothing about which identity holds it. The load
+ * balancer in front authenticates any account the provider will vouch for — with
+ * Google, every account that exists — so "any Google account plus the code-server
+ * password" was a full IDE with a terminal, held by an identity that was never on
+ * oidc.allowedEmails. The chat was never exposed, because every chat request goes
+ * through auth.js. The editor simply never went through auth.js at all.
+ *
+ * So the invariant is about *coverage*, not about any one route: anything that can
+ * reach code-server has to carry the gate. Written this way on purpose — it fails
+ * for a location added later, which is the case a list of three known paths would
+ * quietly miss.
+ */
+const locationBlocks = [
+  ...(heredoc ?? '').matchAll(/\n    location\s+([^\n{]+?)\s*\{\n([\s\S]*?)\n    \}/g),
+].map(([, where, body]) => ({ where: where.trim(), body }));
+ok(locationBlocks.length > 0, 'no nginx location blocks parsed, so the checks below prove nothing');
+
+const workbenchRoutes = locationBlocks.filter((l) => /127\.0\.0\.1:9999/.test(l.body));
+ok(
+  workbenchRoutes.length > 0,
+  'no route reaches code-server, so either the editor is unreachable or this check has ' +
+    'stopped looking at the right thing',
+);
+for (const { where, body } of workbenchRoutes) {
+  ok(
+    body.includes('$IDENTITY_GATE'),
+    `nginx location "${where}" reaches code-server without $IDENTITY_GATE — in oidc mode ` +
+      'that is a shell on this box for any identity the provider will authenticate',
+  );
+}
+
+// And the gate has to be the delegation it claims to be: a 2xx/401 answer from
+// auth.js, not a second opinion formed in the proxy.
+ok(
+  /IDENTITY_GATE="auth_request \/__identity;"/.test(nginx),
+  'the identity gate is no longer auth_request /__identity, so the locations above carry ' +
+    'a directive that does nothing',
+);
+ok(
+  /if \[ "\$AUTH_MODE" = "oidc" \]/.test(nginx),
+  'the gate is no longer conditional on oidc mode: in password mode this locks out anyone ' +
+    'who uses the editor and never opens the chat',
+);
+const identity = blockFor('= /__identity');
+ok(identity, 'no /__identity location, so auth_request has nothing to ask and every gated route 500s');
+ok(
+  /\binternal;/.test(identity?.[2] ?? ''),
+  '/__identity is not internal, so a client can call the gate directly',
+);
+ok(
+  /proxy_pass http:\/\/127\.0\.0\.1:9997\/api\/auth-check;/.test(identity?.[2] ?? ''),
+  'the gate does not ask chat-service/auth.js, which is the only thing here that knows who ' +
+    'is allowed',
+);
+
+// The health check must stay outside the gate, or the ALB marks its own target
+// unhealthy and serves 503 to everyone — including the allowlisted caller.
+const health = blockFor('= /healthz');
+ok(
+  health && !health[2].includes('$IDENTITY_GATE'),
+  'the health check is behind the identity gate, so the load balancer will fail its own ' +
+    'target and take the whole site down',
 );
 
 fs.rmSync(TMP, { recursive: true, force: true });
