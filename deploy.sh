@@ -552,8 +552,23 @@ cmds = [
   # the built-in-chat removal. It is written to be idempotent.
   "if [ -x /opt/bootstrap.sh ]; then bash /opt/bootstrap.sh > /var/log/reprovision.log 2>&1 || "
   "{ echo 'reprovision failed:'; tail -20 /var/log/reprovision.log; exit 1; }; fi",
+  # A reload that nginx refuses is silent from out here. `nginx -t` loads the
+  # config from scratch, so it never sees a conflict with the shared memory the
+  # running master already holds; `systemctl reload` only sends SIGHUP and exits 0
+  # whatever comes of it. When the master then rejects the new config it logs
+  # [emerg], keeps serving the *old* one, and stays up — so every signal this
+  # deploy had said success while nothing had changed. That happened on 2026-09-19
+  # with a limit_req zone whose key changed under an unchanged name, and it cost an
+  # hour of looking for the bug in a config file that was correct and simply was
+  # not running. So read the error log across the reload and fail on [emerg].
+  "ERRLOG=/var/log/nginx/error.log",
+  "if [ ! -f \"$ERRLOG\" ]; then echo \"cannot verify the nginx reload: $ERRLOG does not exist\"; exit 1; fi",
+  "BEFORE=$(stat -c %s \"$ERRLOG\")",
   "nginx -t && systemctl reload nginx",
   "sleep 3",
+  "NEW=$(tail -c +$((BEFORE + 1)) \"$ERRLOG\" | grep '\\[emerg\\]' || true)",
+  "if [ -n \"$NEW\" ]; then echo 'nginx refused the new config and is still serving the old one:';"
+  " printf '%s\\n' \"$NEW\"; exit 1; fi",
   # `is-active` exits non-zero if any unit is down, which fails the SSM command
   # — so a half-broken deploy can no longer report success.
   # claude-broker included so a broker that dies after install.sh checked it —

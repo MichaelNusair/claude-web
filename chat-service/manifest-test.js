@@ -482,13 +482,23 @@ const mapped = new Set(
 );
 ok(mapped.has('/api/login'), 'the login endpoint itself is not in the throttle map');
 
-// Applied at the server, so every location inherits it. A location that declares
-// its own limit_req replaces the inherited one rather than adding to it, which is
-// how a route silently stops being throttled.
+/*
+ * Applied at the server, so every location inherits it. A location that declares
+ * its own limit_req replaces the inherited one rather than adding to it, which is
+ * how a route silently stops being throttled.
+ *
+ * The zone name is read from the declaration rather than written here twice. It has
+ * to change whenever the key changes — nginx refuses a reload that redefines a
+ * shared memory zone's key under the same name, keeps serving the old config and
+ * reports success (see the gotcha in AGENTS.md) — so the rename is a step someone
+ * will do in one place and forget in the other.
+ */
+const zoneName = /limit_req_zone \$login_attempt zone=([A-Za-z0-9_]+):/.exec(conf)?.[1];
+ok(zoneName, 'the login throttle zone is not declared against the $login_attempt key');
 ok(
-  /\n    limit_req zone=login /.test(unescapeConf(heredoc ?? '')),
-  'limit_req is not applied at the server level, so a location that serves a login ' +
-    'without declaring it is unthrottled',
+  new RegExp(`\\n    limit_req zone=${zoneName ?? '$.^'} `).test(unescapeConf(heredoc ?? '')),
+  `limit_req zone=${zoneName} is not applied at the server level, so either nothing ` +
+    'inherits the throttle or it names a zone that is not the one keyed on the path',
 );
 const ownLimit = locationBlocks.filter((l) => /limit_req\s/.test(l.body)).map((l) => l.where);
 ok(

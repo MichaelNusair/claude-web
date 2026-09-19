@@ -1340,6 +1340,24 @@ Things that have burned people, in this codebase specifically:
   exists and why `cc` is installed from there too. A full deploy from another machine
   is still what re-aligns the stack's UserData, so that if the instance is ever
   genuinely replaced it boots the same script.
+- **nginx can refuse a reload and keep running the old config, and nothing in the
+  deploy used to notice.** `nginx -t` loads the config from scratch, so it cannot
+  see a conflict with shared memory the running master already holds, and
+  `systemctl reload` only sends SIGHUP — it exits 0 whatever the master decides.
+  When the master rejects the new config it logs `[emerg]`, keeps serving the
+  previous one, and stays up, so `nginx -t` passed, `systemctl is-active` said
+  active, the config file on disk was visibly new and correct, and the running
+  server was two deploys old. Hit 2026-09-19: `limit_req_zone`'s key changed from
+  `$binary_remote_addr` to `$login_attempt` while the zone kept the name `login`,
+  which nginx refuses outright — *"limit_req "login" uses the "$login_attempt" key
+  while previously it used the "$binary_remote_addr" key"*. **Rename a shared memory
+  zone whenever you change its key**; a new name is a new zone with nothing to
+  conflict with. `deploy.sh` now reads `/var/log/nginx/error.log` across the reload
+  and fails on a new `[emerg]`, so this class of failure is loud rather than
+  invisible. The tell, if you are ever debugging a config that is provably correct
+  and provably not working: compare the nginx worker start times against the config
+  file's mtime (`ps -eo lstart,args | grep nginx:` versus `ls -l`). Workers older
+  than the config mean the config is not running.
 
 ## Things not to do
 

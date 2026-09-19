@@ -618,12 +618,25 @@ real_ip_recursive on;
 # decoded and normalised: /chat/api/%6Cogin, /chat//api/login and
 # /chat/../api/login all arrive here as a name written below instead of slipping
 # past it as an unrecognised string.
+# The zone is named for its key, and renaming it is mandatory whenever that key
+# changes. nginx keeps a shared memory zone across a reload and refuses one whose
+# key has changed underneath it:
+#
+#   [emerg] limit_req "login" uses the "\$login_attempt" key while previously it
+#           used the "\$binary_remote_addr" key
+#
+# That refusal aborts the whole reconfigure, so the master keeps serving the *old*
+# config — and neither \`nginx -t\` nor \`systemctl reload\` reports it, because -t
+# tests a fresh load with no existing zone and reload only sends a signal. A deploy
+# that changed this key while keeping the name looked entirely successful and
+# changed nothing; deploy.sh now reads the error log after reloading for exactly
+# this. A new name is a new zone, so there is nothing to conflict with.
 map \$uri \$login_attempt {
     default          "";
     /api/login       \$binary_remote_addr;
     /chat/api/login  \$binary_remote_addr;
 }
-limit_req_zone \$login_attempt zone=login:10m rate=12r/m;
+limit_req_zone \$login_attempt zone=login_by_path:10m rate=12r/m;
 limit_req_status 429;
 
 # What gets injected into the <head> of code-server's HTML: the mobile viewport
@@ -662,7 +675,7 @@ server {
     # this actually counts is decided by \$login_attempt in 00-realip.conf, and it is
     # empty for everything that is not a login — so this line throttles guessing and
     # nothing else, including the 100M uploads and the long-lived streams below.
-    limit_req zone=login burst=5 nodelay;
+    limit_req zone=login_by_path burst=5 nodelay;
 
     # ALB health check — must not require a password.
     location = /healthz {
