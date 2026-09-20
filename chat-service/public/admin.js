@@ -235,6 +235,10 @@ function renderBroker(sessions) {
   for (const s of sorted) {
     const badges = [];
     if (s.probe) badges.push(badge('idle probe', 'warn'));
+    // Only the broker can say either of these, and only about a process it still
+    // holds. Both are absent rather than false when it could not be asked.
+    if (s.working) badges.push(badge('working', 'hot'));
+    if (s.clients) badges.push(badge(`${s.clients} attached`));
     el.appendChild(
       row({
         title: s.project || s.cwd || `pid ${s.pid}`,

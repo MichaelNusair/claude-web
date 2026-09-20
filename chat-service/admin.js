@@ -14,16 +14,25 @@
  * "why does this box feel wrong", which are the two questions that have actually
  * come up.
  *
- * THE BROKER IS INSPECTED FROM THE OUTSIDE, ON PURPOSE. Adding a list/kill op to
+ * THE BROKER GETS NO NEW OP, ON PURPOSE. Adding a list/kill op to
  * `claude-broker/broker.js` would be the obvious way to enumerate its sessions,
  * and it would be the wrong one: the conversations are children of that process,
  * so a change to it only takes effect at a restart, and a restart ends every live
  * conversation — the exact failure the broker exists to prevent. Its children are
- * ordinary processes owned by the same user as this service, and their argv
- * already carries `--resume <session id>`, so `ps` answers the question for free
- * and today's broker needs no change at all. A SIGTERM to one of those children is
- * handled by the broker's own exit handler, which tells the attached pages and
- * unregisters the session. Keep it this way.
+ * ordinary processes owned by the same user as this service, so `ps` and `/proc`
+ * answer most of this for free, and a SIGTERM to one of them is handled by the
+ * broker's own exit handler, which tells the attached pages and unregisters the
+ * session.
+ *
+ * What `ps` cannot answer is which conversation a process IS. Argv names one only
+ * when the editor resumed it; a conversation started fresh is named by the CLI at
+ * runtime, in an init event that only the broker sees — five of nine live
+ * processes on the box, unnameable from outside. So the id comes from the READ-ONLY
+ * `op: 'status'` the broker already answers, which is why this still needs no
+ * change to `broker.js` and no restart: `chat-service/claude-status.js` has spoken
+ * that op since it shipped. It is asked for a name, never for authority — every
+ * stop still goes through a freshly-read process table and a parent we expected —
+ * and an unanswered ask degrades to what argv says, never to a blank page.
  *
  * Security: this adds no authority. Every route in front of it sits behind the
  * same gate as `/ws`, which already hands the caller a shell with
@@ -35,6 +44,7 @@ import { readFile, readlink } from 'fs/promises';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import os from 'os';
+import { brokerSessions as liveBrokerSessions } from './claude-status.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -72,6 +82,9 @@ const defaultDeps = {
   readProcFile: (path) => readFile(path, 'utf8'),
   readProcLink: (path) => readlink(path),
   sendSignal: (pid, signal) => process.kill(pid, signal),
+  // Null for every kind of "cannot say", and this page must stay useful when it
+  // is: the broker being down is one of the things you come here to find out.
+  liveSessions: () => liveBrokerSessions(),
   memory: () => ({ total: os.totalmem(), free: os.freemem() }),
   load: () => os.loadavg(),
   uptime: () => os.uptime(),
@@ -193,26 +206,48 @@ const projectOf = (cwd) =>
   cwd && cwd.startsWith(`${DATA_MOUNT}/`) ? cwd.slice(DATA_MOUNT.length + 1) : cwd || null;
 
 /**
- * The editor panel's conversations: children of the broker, one per conversation,
- * named by the `--resume` id in their own argv.
+ * The editor panel's conversations: children of the broker, one per conversation.
+ *
+ * Named from two places, because neither is enough on its own. Argv names a
+ * conversation the editor RESUMED. A conversation started fresh in the panel was
+ * launched with no id to carry — the CLI invents one and announces it in an init
+ * event — so argv cannot name it however carefully it is read, and five of the nine
+ * processes on the box were that kind. The broker heard those events, so it is
+ * asked; when it cannot answer, argv is still the answer it always was.
+ *
+ * Asked once for the whole page rather than per process: it is one socket
+ * round-trip, and `op: 'status'` deliberately does not count the asker as a client,
+ * so opening this page cannot keep a conversation alive.
  */
 async function brokerSessions(deps, table, brokerPid) {
   if (!brokerPid) return [];
+  const live = (await deps.liveSessions()) || [];
+  const livePid = new Map(live.filter((s) => s && s.pid).map((s) => [s.pid, s]));
   const out = [];
   for (const proc of table) {
     if (proc.ppid !== brokerPid) continue;
     const parsed = parseClaudeArgs(proc.args);
     if (!parsed.isClaude) continue;
     const cwd = await cwdOf(deps, proc.pid);
+    const known = livePid.get(proc.pid);
     out.push({
       kind: 'broker',
       pid: proc.pid,
-      sessionId: parsed.resume,
+      // Argv first: it is what the editor asked for, and it is true even when the
+      // broker has been replaced under these processes.
+      sessionId: parsed.resume || known?.sessionId || null,
       cwd,
       project: projectOf(cwd),
       model: parsed.model,
       permissionMode: parsed.permissionMode,
       probe: parsed.probe,
+      // Null rather than false when the broker did not say, because "not working"
+      // and "nobody could tell me" are different answers and only one of them is
+      // safe to act on. Not used to decide anything here — the stop path asks the
+      // manager, never this — but shown, because it is the question the page is
+      // most often opened to answer.
+      working: known ? known.working : null,
+      clients: known ? known.clients : null,
       rssKb: proc.rssKb,
       ageSeconds: proc.ageSeconds,
     });

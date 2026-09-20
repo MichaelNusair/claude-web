@@ -80,6 +80,11 @@ function makeState() {
       { pid: 902, ppid: BROKER_PID, rssKb: 205_000, ageSeconds: 880, args: `${CLAUDE} --permission-mode default`, cwd: `${ROOT}/demo` },
       { pid: 903, ppid: BROKER_PID, rssKb: 204_000, ageSeconds: 500, args: `${CLAUDE} --permission-mode default`, cwd: `${ROOT}/demo` },
       { pid: 904, ppid: BROKER_PID, rssKb: 203_000, ageSeconds: 60, args: `${CLAUDE} --permission-mode default`, cwd: `${ROOT}/other` },
+      // A conversation started FRESH in the panel: nothing resumed, so there is no
+      // id anywhere in its argv to read, however carefully. Five of the nine live
+      // processes on the box were this kind, and all five read "no session" until
+      // the broker was asked. It is not a probe — someone is talking to it.
+      { pid: 905, ppid: BROKER_PID, rssKb: 207_000, ageSeconds: 300, args: `${CLAUDE} --permission-mode bypassPermissions --model us.anthropic.claude-opus-5`, cwd: `${ROOT}/demo` },
       { pid: TMUX_PID, ppid: 1, rssKb: 9_000, ageSeconds: 80_000, args: 'tmux -L claude new-session -d' },
       { pid: 960, ppid: TMUX_PID, rssKb: 4_000, ageSeconds: 70_000, args: '-bash' },
       { pid: 961, ppid: 960, rssKb: 206_000, ageSeconds: 69_000, args: `${CLAUDE.replace(' --print --input-format stream-json --output-format stream-json', '')}`, cwd: `${ROOT}/demo` },
@@ -101,6 +106,13 @@ function makeState() {
     cgroup: '0::/system.slice/code-server.service\n',
     disk: { totalKb: 100_000_000, usedKb: 40_000_000 },
     mem: { total: 8 * GB, free: 0.8 * GB },
+    // What the broker answers `op: 'status'` with. The only place a fresh
+    // conversation's id exists: the CLI announced it in an init event that no
+    // process table records.
+    live: [
+      { pid: 901, cwd: `${ROOT}/demo`, sessionId: 'dup-session', working: false, clients: 1 },
+      { pid: 905, cwd: `${ROOT}/demo`, sessionId: 'fresh-session', working: true, clients: 2 },
+    ],
     signals: [],
     killedSessions: [],
     commands: [],
@@ -165,6 +177,10 @@ function makeDeps(state) {
       return proc.cwd;
     },
     sendSignal: (pid, signal) => state.signals.push({ pid, signal }),
+    // `null` is what claude-status.js returns for every kind of "cannot say", and
+    // the page has to survive it: a socket that is not there, a broker mid-restart,
+    // a timeout.
+    liveSessions: async () => state.live,
     memory: () => state.mem,
     load: () => [0.42, 0.31, 0.25],
     uptime: () => 30 * 3600,
@@ -266,7 +282,7 @@ const overview = await admin.overview();
     state.commands.filter((c) => c.startsWith('ps ')).join(' | '));
 
   const { chat, broker, tmux } = overview.surfaces;
-  check('finds the broker conversations', broker.length === 4, String(broker.length));
+  check('finds the broker conversations', broker.length === 5, String(broker.length));
   check('three of them are probes', broker.filter((s) => s.probe).length === 3);
   // Parentage, not argv: the identical claude under code-server is not the
   // broker's and must not appear on the broker's list.
@@ -274,6 +290,15 @@ const overview = await admin.overview();
     !broker.some((s) => s.pid === STRAY_CLAUDE_PID));
   check('names the project from /proc/<pid>/cwd', broker[0].project === 'demo', String(broker[0].project));
   check('reports the conversation\'s memory', broker[0].rssKb === 208_000);
+
+  // The half argv cannot answer, and the reason this asks the broker at all.
+  const fresh = broker.find((s) => s.pid === 905);
+  check('a fresh conversation is named by the broker', fresh.sessionId === 'fresh-session', String(fresh.sessionId));
+  check('and is not mistaken for a probe', !fresh.probe);
+  check('the broker also says whether it is working', fresh.working === true && fresh.clients === 2,
+    JSON.stringify({ working: fresh.working, clients: fresh.clients }));
+  check('a resumed one keeps the id argv gave it', broker[0].sessionId === 'dup-session', String(broker[0].sessionId));
+  check('and is asked for one client, not two', broker[0].clients === 1 && broker[0].working === false);
 
   check('lists the chat\'s own conversations', chat.length === 2);
   check('costs the live one from the process table', chat[0].rssKb === 210_000 && chat[0].alive);
@@ -333,6 +358,29 @@ console.log('\nSays what is down, and what that silently costs:');
   check('says the panel falls back to a fork per page', detail('claude-broker').includes('per page load'));
   check('says a deploy will kill the next cc\'s sessions', detail('claude-tmux').includes('deploy'));
   check('with the broker down there are no broker sessions', view.surfaces.broker.length === 0);
+}
+
+console.log('\nStill draws the page when the broker will not say who is who:');
+{
+  // The broker is asked for a name, never for authority, so an unanswered ask has
+  // to cost exactly the names it would have supplied — not a row, not a button,
+  // not the page. `null` here is every kind of "cannot say" claude-status.js
+  // collapses into one: no socket, a restart in progress, a timeout.
+  const mute = makeState();
+  const deps = { ...makeDeps(mute), liveSessions: async () => null };
+  const view = await createAdmin({ manager: makeManager([conversation()]), deps }).overview();
+  const broker = view.surfaces.broker;
+
+  check('every conversation is still listed', broker.length === 5, String(broker.length));
+  check('argv still names the ones it can', broker[0].sessionId === 'dup-session', String(broker[0].sessionId));
+  const fresh = broker.find((s) => s.pid === 905);
+  check('a fresh one goes back to unnamed, which is honest', fresh.sessionId === null, String(fresh.sessionId));
+  // Not `false`: "not working" and "nobody could tell me" are different answers
+  // and only one of them is safe to act on.
+  check('and says nothing about working rather than saying no', fresh.working === null && fresh.clients === null,
+    JSON.stringify({ working: fresh.working, clients: fresh.clients }));
+  check('the probes are still probes, so reaping still works', broker.filter((s) => s.probe).length === 3);
+  check('and the fork is still named from argv', view.findings.some((f) => f.text.includes('resuming session')));
 }
 
 // --- 3. The refusals --------------------------------------------------------
@@ -489,7 +537,7 @@ await new Promise((resolve) => setTimeout(resolve, 50));
 const $ = (sel) => w.document.querySelector(sel);
 {
   check('the header stops saying loading', !$('#admin-sub').textContent.includes('loading'), $('#admin-sub').textContent);
-  check('it counts the sessions', $('#admin-sub').textContent.startsWith('8 sessions'), $('#admin-sub').textContent);
+  check('it counts the sessions', $('#admin-sub').textContent.startsWith('9 sessions'), $('#admin-sub').textContent);
 
   const findings = $('#findings');
   check('every finding is shown', findings.querySelectorAll('.finding').length === overview.findings.length);
@@ -508,10 +556,17 @@ const $ = (sel) => w.document.querySelector(sel);
   check('a dead process says so', $('#surface-chat').innerHTML.includes('process gone'));
 
   const brokerRows = [...$('#surface-broker').querySelectorAll('.row')];
-  check('the panel conversations are listed', brokerRows.length === 4);
+  check('the panel conversations are listed', brokerRows.length === 5);
   // The one you came to look at is the one you can see without scrolling.
   check('the live conversation sorts above the probes', !brokerRows[0].innerHTML.includes('idle probe'));
   check('probes are labelled', $('#surface-broker').querySelectorAll('.pill.warn').length === 3);
+  // The fresh conversation, which used to read "no session" on a box where it was
+  // the majority of what was running.
+  const freshRow = brokerRows.find((r) => r.textContent.includes('fresh-se'));
+  check('a fresh conversation shows its id, not "no session"', Boolean(freshRow),
+    $('#surface-broker').textContent);
+  check('and what the broker said about it', freshRow?.textContent.includes('working')
+    && freshRow?.textContent.includes('2 attached'), freshRow?.textContent);
 
   check('the tmux sessions are listed', $('#surface-tmux').querySelectorAll('.row').length === 2);
   // No button is better than a button whose only outcome is a refusal.
