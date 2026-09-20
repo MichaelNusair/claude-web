@@ -63,12 +63,20 @@ function makeState() {
       { pid: CODE_SERVER_PID, ppid: 1, rssKb: 180_000, ageSeconds: 90_000, args: 'node /usr/lib/code-server/out/node/entry.js' },
       // A claude that is not the broker's child. Nothing about its argv says so,
       // which is exactly why parentage is what the kill path checks.
-      { pid: STRAY_CLAUDE_PID, ppid: CODE_SERVER_PID, rssKb: 205_000, ageSeconds: 400, args: `${CLAUDE} --resume other-session --permission-mode bypassPermissions`, cwd: `${ROOT}/demo` },
+      // Launched by the editor extension, so `--resume=<id>` is JOINED. The two
+      // spellings on this box are not a style choice and the fixture must carry
+      // both: the extension writes `--resume=<id>` (2.1.278), chat-service writes
+      // `--resume <id>` (session-manager.js). A fixture that used only the spaced
+      // form is why the parser shipped reading only the spaced form, which made
+      // every conversation on the box read "no session" and quietly disabled the
+      // fork finding this file is mostly about.
+      { pid: STRAY_CLAUDE_PID, ppid: CODE_SERVER_PID, rssKb: 205_000, ageSeconds: 400, args: `${CLAUDE} --resume=other-session --permission-mode bypassPermissions`, cwd: `${ROOT}/demo` },
       { pid: CHAT_PID, ppid: 100, rssKb: 210_000, ageSeconds: 1200, args: `${CLAUDE} --resume dup-session --permission-mode bypassPermissions`, cwd: `${ROOT}/demo` },
       { pid: BROKER_PID, ppid: 1, rssKb: 40_000, ageSeconds: 90_000, args: 'node /opt/claude-broker/broker.js' },
       // The broker's own children: one live conversation resuming the same id the
-      // chat is resuming, and three probes nobody has ever spoken to.
-      { pid: 901, ppid: BROKER_PID, rssKb: 208_000, ageSeconds: 900, args: `${CLAUDE} --resume dup-session --permission-mode bypassPermissions --model us.anthropic.claude-opus-5`, cwd: `${ROOT}/demo` },
+      // chat is resuming — in the other spelling, which is how the fork really
+      // looks — and three probes nobody has ever spoken to.
+      { pid: 901, ppid: BROKER_PID, rssKb: 208_000, ageSeconds: 900, args: `${CLAUDE} --resume=dup-session --permission-mode bypassPermissions --model us.anthropic.claude-opus-5`, cwd: `${ROOT}/demo` },
       { pid: 902, ppid: BROKER_PID, rssKb: 205_000, ageSeconds: 880, args: `${CLAUDE} --permission-mode default`, cwd: `${ROOT}/demo` },
       { pid: 903, ppid: BROKER_PID, rssKb: 204_000, ageSeconds: 500, args: `${CLAUDE} --permission-mode default`, cwd: `${ROOT}/demo` },
       { pid: 904, ppid: BROKER_PID, rssKb: 203_000, ageSeconds: 60, args: `${CLAUDE} --permission-mode default`, cwd: `${ROOT}/other` },
@@ -208,6 +216,31 @@ console.log('\nTells a probe from a conversation:');
   // permission mode. It has a transcript, so it must never be reapable.
   const resumedDefault = parseClaudeArgs(`${CLAUDE} --resume abc --permission-mode default`);
   check('a resumed conversation in default mode is not a probe', !resumedDefault.probe);
+
+  /*
+   * The spelling the editor actually uses, which this could not read at all.
+   *
+   * Real argv from the box, extension 2.1.278: `--resume=<id>` joined, and
+   * `--permission-mode <mode>` spaced, in one command line. `indexOf('--resume')`
+   * therefore found nothing, so every one of nine live conversations was reported
+   * as "no session" — and the fork finding, which groups by this id and skips a
+   * null, silently matched nothing on the page whose job is catching a fork.
+   */
+  const joined = parseClaudeArgs(
+    `${CLAUDE} --permission-prompt-tool stdio --resume=3b86a39a-71de-42e1-b7fe-c2ebcb863a5d`
+      + ' --setting-sources=user,project,local --permission-mode bypassPermissions --enable-auth-status',
+  );
+  check('reads a joined --resume=<id>', joined.resume === '3b86a39a-71de-42e1-b7fe-c2ebcb863a5d', joined.resume);
+  check('and the spaced flags beside it', joined.permissionMode === 'bypassPermissions', joined.permissionMode);
+  check('a conversation the editor resumed is not a probe', !joined.probe);
+
+  // `--resume` with nothing after it means "pick one interactively" — the wrapper
+  // has always read it that way. Taking the next token regardless made the session
+  // id `--permission-mode`, which would then group two unrelated processes into a
+  // fork that does not exist.
+  const interactive = parseClaudeArgs(`${CLAUDE} --resume --permission-mode default`);
+  check('a valueless --resume names no session', interactive.resume === null, interactive.resume);
+  check('and is still a probe, as the panel’s own is', interactive.probe);
 
   check('the node server is not a claude', !parseClaudeArgs('node /opt/chat-service/server.js').isClaude);
   // Near-miss names are how the wrapper trap bit once already; matching is on the

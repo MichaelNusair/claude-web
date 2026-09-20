@@ -118,9 +118,29 @@ async function processTable(deps) {
  */
 export function parseClaudeArgs(args) {
   const tokens = String(args || '').split(/\s+/);
+  /*
+   * Both spellings of every flag, because the choice is not ours to make and it
+   * is not even consistent within one command line: extension 2.1.278 launches
+   * `--resume=<id>` joined and `--permission-mode <mode>` spaced, in the same
+   * argv. Reading only the spaced form meant `resume` was ALWAYS null, so every
+   * conversation on the box read "no session" — and, far worse, the fork finding
+   * below groups by this id and therefore silently matched nothing, on the one
+   * page that exists to catch a fork. Measured before this fix: 9 live broker
+   * children, 8 of them nameable from argv, 0 named.
+   *
+   * `claude-broker/wrapper` has read both spellings since it shipped; this is
+   * the same rule, and the two must not disagree about what is being resumed.
+   */
   const valueOf = (flag) => {
+    const joined = tokens.find((t) => t.startsWith(`${flag}=`));
+    if (joined !== undefined) return joined.slice(flag.length + 1) || null;
     const i = tokens.indexOf(flag);
-    return i >= 0 && i + 1 < tokens.length ? tokens[i + 1] : null;
+    if (i < 0) return null;
+    const next = tokens[i + 1];
+    // A flag with no value: `--resume` alone means "pick one interactively",
+    // which names no session. Taking the next token regardless turned that into
+    // a session id of `--permission-mode`.
+    return next !== undefined && !next.startsWith('-') ? next : null;
   };
   const isClaude = tokens.some((t) => t === 'claude' || t.endsWith('/claude'));
   const resume = valueOf('--resume');
