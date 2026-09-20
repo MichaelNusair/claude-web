@@ -85,6 +85,12 @@ function isSyntheticUserText(text) {
   return SYNTHETIC_USER_PATTERNS.some((re) => re.test(trimmed));
 }
 
+/** One line, short enough for a row title on a phone. */
+function truncate(text, max = 70) {
+  const clean = text.replace(/\s+/g, ' ').trim();
+  return clean.length > max ? `${clean.slice(0, max)}…` : clean;
+}
+
 /**
  * Validate a project name and turn it into a path under PROJECTS_ROOT.
  *
@@ -523,7 +529,7 @@ export class SessionManager {
         sessions.push({
           sessionId,
           mtime: info.mtimeMs,
-          title: await this.#firstUserMessage(full),
+          title: await this.#titleOf(full),
           // Surfaced so the list can show a chat that is still working, and so
           // any device can tell it will be joining rather than restarting.
           live: Boolean(live),
@@ -537,11 +543,39 @@ export class SessionManager {
     return sessions.slice(0, 50);
   }
 
-  /** Use the opening user message as the conversation title, like a chat app. */
-  async #firstUserMessage(file) {
+  /**
+   * What to call a conversation in the list.
+   *
+   * The CLI names its own sessions: it writes `{"type":"ai-title","aiTitle":…}`
+   * into the transcript, rewriting it as the conversation changes subject, and
+   * that name is what the editor and the terminal show. So it is what this shows
+   * too — a list where one row reads "Empty and lingering sessions" and the next
+   * "PostHog tracking on the landing page" is scannable in a way that a row
+   * reading "Now wire it into server.js:" is not.
+   *
+   * Last one wins: the name is regenerated as the conversation moves on, and the
+   * current subject is the useful one. A transcript from before the CLI wrote
+   * these, or one too young to have been named yet, falls back to its opening
+   * message, which is what this always used.
+   */
+  async #titleOf(file) {
     try {
       const raw = await readFile(file, 'utf8');
-      for (const line of raw.split('\n')) {
+      const lines = raw.split('\n');
+      // Backwards, and only parsing the lines that can possibly be one. These
+      // transcripts reach tens of MB and this runs once per conversation in the
+      // list, so the whole-file JSON.parse this would otherwise be is the
+      // difference between a list that opens and one that hangs.
+      for (let i = lines.length - 1; i >= 0; i -= 1) {
+        if (!lines[i].includes('"ai-title"')) continue;
+        try {
+          const title = JSON.parse(lines[i]).aiTitle;
+          if (typeof title === 'string' && title.trim()) return truncate(title);
+        } catch {
+          /* torn line at the tail of a transcript being written */
+        }
+      }
+      for (const line of lines) {
         if (!line.trim()) continue;
         let entry;
         try {
@@ -555,10 +589,7 @@ export class SessionManager {
           ? content
           : (content || []).find((b) => b.type === 'text')?.text;
         // A skill loader or resume preamble makes a useless title.
-        if (text?.trim() && !isSyntheticUserText(text)) {
-          const clean = text.replace(/\s+/g, ' ').trim();
-          return clean.length > 70 ? `${clean.slice(0, 70)}…` : clean;
-        }
+        if (text?.trim() && !isSyntheticUserText(text)) return truncate(text);
       }
     } catch {
       /* unreadable transcript */

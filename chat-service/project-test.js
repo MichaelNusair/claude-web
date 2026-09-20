@@ -14,7 +14,7 @@
  * Run: node chat-service/project-test.js
  */
 import { execFile } from 'child_process';
-import { mkdtemp, mkdir, writeFile, stat, rm } from 'fs/promises';
+import { mkdtemp, mkdir, writeFile, stat, rm, realpath } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { promisify } from 'util';
@@ -172,6 +172,48 @@ console.log('\nReports what a project still holds:');
   check('names a missing project rather than inventing one', await manager
     .projectStatus('does-not-exist')
     .then(() => false, (err) => /no project named/.test(err.message)));
+}
+
+console.log('\nCalls a conversation what the CLI calls it:');
+{
+  // Real transcript lines, in the CLI's own spelling. The list used to be titled
+  // by the opening user message, which on a resumed or long conversation is
+  // whatever happened to be said first — "Now wire it into server.js:" — while
+  // the CLI has been writing a name for the conversation all along and showing
+  // it in the editor and the terminal.
+  const path = await makeProject('named', { repo: false });
+  const dir = join(process.env.CLAUDE_HOME, 'projects', (await realpath(path)).replace(/[/.]/g, '-'));
+  await mkdir(dir, { recursive: true });
+
+  const user = (text) => JSON.stringify({ type: 'user', message: { role: 'user', content: text } });
+  const aiTitle = (aiTitle) => JSON.stringify({ type: 'ai-title', aiTitle, sessionId: 'x' });
+  const write = (id, ...lines) => writeFile(join(dir, `${id}.jsonl`), `${lines.join('\n')}\n`);
+
+  await write('11111111-1111-1111-1111-111111111111',
+    user('Now wire it into server.js:'),
+    aiTitle('Empty and lingering sessions'),
+    user('Done. Committed, pushed, deployed'),
+    // Regenerated as the conversation moves on; the current subject is the useful
+    // one, so the last one wins.
+    aiTitle('Naming conversations in the list'));
+  await write('22222222-2222-2222-2222-222222222222',
+    user('<command-name>/loop</command-name>'),
+    user('the first thing actually typed'));
+  await write('33333333-3333-3333-3333-333333333333',
+    user('a conversation too young to have been named'));
+  await write('44444444-4444-4444-4444-444444444444', '{"type":"ai-title"', user('a torn tail'));
+  await write('55555555-5555-5555-5555-555555555555', '');
+
+  const byId = new Map((await manager.listSessions(path)).map((s) => [s.sessionId.slice(0, 1), s.title]));
+  check('uses the name the CLI gave the conversation',
+    byId.get('1') === 'Naming conversations in the list', byId.get('1'));
+  check('an unnamed conversation still falls back to its opening message',
+    byId.get('2') === 'the first thing actually typed', byId.get('2'));
+  check('and a skill loader is not that message', byId.get('3') === 'a conversation too young to have been named', byId.get('3'));
+  // Transcripts are appended to while this reads them, so a half-written last
+  // line has to cost the name, not the row.
+  check('a torn line is skipped, not fatal', byId.get('4') === 'a torn tail', byId.get('4'));
+  check('an empty transcript is still listed', byId.get('5') === 'Untitled conversation', byId.get('5'));
 }
 
 console.log('\nRefuses to delete work that exists nowhere else:');
