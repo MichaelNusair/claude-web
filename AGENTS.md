@@ -60,6 +60,15 @@ a comment:
   it is the right tool when the change is only app payload: `chat-service`, `pwa`,
   either extension, or `infra/userdata/bootstrap.sh`. It changes no AWS resources.
   Anything under `infra/lib` needs the deploy box.
+- **Check whether this account runs more than one deployment before you ship.** A
+  deployment is a config file, and a second one is a second config file selected with
+  `CLAUDE_WEB_CONFIG=…` — `ls claude-web.*.config.json` is how you find out, since
+  they are all gitignored. Everything here is shared by all of them: one repository,
+  one `origin/main`, one deploy box, one suite. So a change to `chat-service`, `pwa`
+  or `infra/lib` is a change to every deployment, and finishing means each of them is
+  deployed, not just the one whose config happens to be `claude-web.config.json`.
+  Say which ones you shipped. ["More than one deployment"](docs/DEPLOY.md#more-than-one-deployment)
+  has the mechanics, including why the deploy box needs a checkout per deployment.
 
 The box is named in `claude-web.config.json` under `deployFrom` (gitignored, so it
 is per-deployment and never committed). Anyone running the open-source repo should

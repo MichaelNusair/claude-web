@@ -106,7 +106,11 @@ export class ClaudeWebStack extends Stack {
       encrypted: true,
       removalPolicy: RemovalPolicy.RETAIN,
     });
-    Tags.of(dataVolume).add('Name', 'claude-workspace-data');
+    // Named after the stack rather than the product, because a second deployment
+    // in the same account is a second 100 GiB volume holding someone's only copy
+    // of their work, and two volumes called "claude-workspace-data" are an
+    // invitation to detach or delete the wrong one from the console.
+    Tags.of(dataVolume).add('Name', `${this.stackName}-workspace-data`);
 
     // --- Security groups -----------------------------------------------------
     const albSg = new ec2.SecurityGroup(this, 'AlbSG', { vpc, allowAllOutbound: true });

@@ -11,20 +11,30 @@
 # ./deploy.sh somewhere a poller can find it, because the poller cannot see the
 # process — that is the point of detaching it.
 #
-#   $1  the repository checkout to deploy from
-#   $2… passed through to ./deploy.sh
+#   $1  where to write the exit code, when there is one
+#   $2  where to write this process's pid
+#   $3  the repository checkout to deploy from
+#   $4… passed through to ./deploy.sh
+#
+# The two paths are arguments rather than constants because one deploy box can
+# serve several deployments, and two runs sharing one status file would report each
+# other's exit code. deploy-remote.sh derives them from the stack name and creates
+# them before starting this, so the names on both ends always agree.
 #
 # Deliberately no `set -e`: the exit code of the deploy is the product of this
 # script, so a failing deploy must reach the two lines that record it.
 
-LOG_DIR=/var/log
-PID_FILE="$LOG_DIR/claude-web-deploy.pid"
-STATUS_FILE="$LOG_DIR/claude-web-deploy.status"
+STATUS_FILE="$1"
+PID_FILE="$2"
+repo="$3"
+shift 3
+
+if [ -z "$STATUS_FILE" ] || [ -z "$PID_FILE" ] || [ -z "$repo" ]; then
+  echo "remote-deploy-runner: usage: $0 <status-file> <pid-file> <repo> [deploy args…]" >&2
+  exit 2
+fi
 
 echo $$ > "$PID_FILE"
-
-repo="$1"
-shift
 
 if ! cd "$repo"; then
   echo "remote-deploy-runner: cannot enter $repo" >&2

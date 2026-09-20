@@ -40,11 +40,22 @@ step() { printf '\n\033[1;36m==> %s\033[0m\n' "$1"; }
 
 REMOTE_ARGS=("$@")
 
-LOG_FILE=/var/log/claude-web-deploy.log
-STATUS_FILE=/var/log/claude-web-deploy.status
-PID_FILE=/var/log/claude-web-deploy.pid
-
 eval "$(node infra/print-config.js)"
+
+# Run state is per deployment, keyed by stack name.
+#
+# One deploy box can serve several deployments — a second one is a second config
+# file and a second checkout there (docs/DEPLOY.md), which is how this account runs
+# two. With one fixed set of paths they shared a log, a pid file and an exit status:
+# starting a deploy would delete the other one's log, the "a deploy is already
+# running" check would match a completely different deployment and refuse, and the
+# status file the poller reads would be whichever run wrote it last. So the name of
+# the stack being deployed is in the path.
+RUN_TAG="$(printf '%s' "$CFG_STACK" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9._-')"
+[ -n "$RUN_TAG" ] || RUN_TAG=stack
+LOG_FILE="/var/log/claude-web-deploy.$RUN_TAG.log"
+STATUS_FILE="/var/log/claude-web-deploy.$RUN_TAG.status"
+PID_FILE="/var/log/claude-web-deploy.$RUN_TAG.pid"
 
 AWS_ARGS=(--region "$CFG_REGION")
 [ -n "$CFG_PROFILE" ] && AWS_ARGS+=(--profile "$CFG_PROFILE")
@@ -230,7 +241,8 @@ runuser -u {q(user)} -- git -C {q(path)} log -1 --format="HEAD %h %s"
 install -o {q(user)} -g {q(user)} -m 0644 /dev/null {q(log)}
 install -o {q(user)} -g {q(user)} -m 0644 /dev/null {q(status)}
 install -o {q(user)} -g {q(user)} -m 0644 /dev/null {q(pid)}
-setsid runuser -u {q(user)} -- bash {q(path + "/scripts/remote-deploy-runner.sh")} {q(path)} {args} \\
+setsid runuser -u {q(user)} -- bash {q(path + "/scripts/remote-deploy-runner.sh")} \\
+  {q(status)} {q(pid)} {q(path)} {args} \\
   </dev/null >>{q(log)} 2>&1 &
 disown || true
 for _ in 1 2 3 4 5 6 7 8 9 10; do

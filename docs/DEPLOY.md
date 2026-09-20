@@ -134,6 +134,53 @@ If you skip all of this, nothing breaks — you simply cannot change infrastruct
 from inside the workspace, and `deploy.sh` will tell you so instead of half-applying
 a stack.
 
+## More than one deployment
+
+Two workspaces that share nothing — a personal one and a work one, or one per
+client — are two stacks in the same account, and the only setting that makes them
+distinct is `stackName`. Nothing in `infra/lib/stack.js` names a resource
+explicitly, so every VPC, instance, volume, load balancer, certificate and secret
+gets a CloudFormation-generated name of its own. Give the second one its own
+hostname, its own `stackName`, and leave `landing.domainName` empty and
+`security.enabled` false: a landing hostname and a GuardDuty detector are both
+singletons, owned by whichever deployment created them.
+
+A deployment is a config file, so a second deployment is a second config file:
+
+```bash
+cp claude-web.config.json claude-web.work.config.json
+$EDITOR claude-web.work.config.json      # domainName, stackName, deployFrom.repoPath
+
+CLAUDE_WEB_CONFIG=$PWD/claude-web.work.config.json ./deploy-remote.sh
+CLAUDE_WEB_CONFIG=$PWD/claude-web.work.config.json ./deploy.sh --app-only
+```
+
+`claude-web.*.config.json` is gitignored like `claude-web.config.json` itself, and
+`CLAUDE_WEB_CONFIG` is read by `infra/config.js`, which every script and the CDK app
+load their settings through.
+
+Three things to know, each of which is a mistake someone would otherwise make once:
+
+- **The deploy box needs a second checkout, not a second flag.** `deploy.sh` reads
+  `claude-web.config.json` from the tree it runs in, and `deploy-remote.sh` resets
+  that tree to `origin/main` every time. So clone the repository again at a second
+  path, drop the second config in it as `claude-web.config.json`, and point
+  `deployFrom.repoPath` there. One machine can drive both; run state on it
+  (`/var/log/claude-web-deploy.<stack>.log` and its `.pid`/`.status` siblings) is
+  keyed by stack name, so a deploy of one never overwrites the log or the exit code
+  of the other.
+- **In `oidc` mode each hostname is a redirect URI the provider has to know.** The
+  ALB's callback is `https://<domainName>/oauth2/idpresponse`. One OAuth client can
+  serve several deployments, but every one of their hostnames has to be listed on it
+  — otherwise the deploy succeeds and the provider refuses the login with
+  `redirect_uri_mismatch`, which is a failure that happens at Google rather than on
+  your box and so appears nowhere in its logs.
+- **Separate stacks are not separate blast radii.** With
+  `instanceAdminAccess: true` on either deployment, that box's role is
+  AdministratorAccess over the whole account — the other deployment included. If the
+  point of the second workspace is containment rather than tidiness, set it to
+  `false` there, or use a separate AWS account.
+
 ## Configuration
 
 Only `domainName` and `hostedZoneName` are required. Everything else has a
