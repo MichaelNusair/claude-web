@@ -378,6 +378,24 @@ ok(
     'may contain a space',
 );
 /*
+ * The last link, which is an ordering rather than a value: the unit above is written
+ * by the reprovision, and bootstrap.sh never restarts anything (`enable --now` leaves
+ * a running unit alone, on purpose — restarting it kills live sessions). So the
+ * deploy's own restart has to come after the reprovision, or the process keeps the
+ * environment of the previous unit while the file on disk says otherwise. That is
+ * what happened on 2026-09-20: restart 12:49:44, unit rewritten 12:50:11, deploy
+ * green, every title still "Claude".
+ */
+const deploySrc = fs.readFileSync(path.join(root, 'deploy.sh'), 'utf8');
+const reprovisionAt = deploySrc.indexOf('bash /opt/bootstrap.sh > /var/log/reprovision.log');
+const chatRestartAt = deploySrc.indexOf('"systemctl restart claude-chat"');
+ok(reprovisionAt > 0 && chatRestartAt > 0, 'deploy.sh no longer reprovisions and restarts the way this checks');
+ok(
+  chatRestartAt > reprovisionAt,
+  'deploy.sh restarts claude-chat before the reprovision that writes its unit, so anything ' +
+    'the deploy adds to that unit reaches the running process one deploy late',
+);
+/*
  * The editor half. code-server writes document.title from `window.title` and rewrites
  * it on every editor change, so this is a setting rather than something the overlay
  * could do — and it is assigned rather than defaulted because that settings file lives

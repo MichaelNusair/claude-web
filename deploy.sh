@@ -519,8 +519,6 @@ cmds = [
   " --extensions-dir /workspace/code-server-ext"
   " --install-extension /opt/claude-web/claude-mobile.vsix --force",
   "systemctl enable --now claude-chat",
-  "systemctl restart claude-chat",
-  "systemctl restart code-server",
   # Install the provisioning script from the payload, the way a boot installs it.
   #
   # Nothing else does. UserData is what writes /opt/bootstrap.sh, and it runs once
@@ -566,6 +564,21 @@ cmds = [
   # the built-in-chat removal. It is written to be idempotent.
   "if [ -x /opt/bootstrap.sh ]; then bash /opt/bootstrap.sh > /var/log/reprovision.log 2>&1 || "
   "{ echo 'reprovision failed:'; tail -20 /var/log/reprovision.log; exit 1; }; fi",
+  # The restarts, and they belong *after* that reprovision.
+  #
+  # The reprovision is what writes the systemd units and the editor settings, and
+  # bootstrap.sh deliberately never restarts anything — `enable --now` leaves a unit
+  # that is already running exactly as it is, because restarting it is what kills
+  # live sessions. So a deploy that restarts first and reprovisions second leaves the
+  # service running with the *previous* unit: the file on disk is new, the process
+  # environment is not, and `systemctl show` reads the file, so it all looks applied.
+  #
+  # That shipped on 2026-09-20 with `PWA_NAME`. Payload 12:49:35, restart 12:49:44,
+  # unit rewritten 12:50:11 — the deploy reported success and every title still said
+  # "Claude", and the variable would have arrived one deploy late, looking like it had
+  # worked all along. Anything a deploy adds to a unit has this shape.
+  "systemctl restart claude-chat",
+  "systemctl restart code-server",
   # A reload that nginx refuses is silent from out here. `nginx -t` loads the
   # config from scratch, so it never sees a conflict with the shared memory the
   # running master already holds; `systemctl reload` only sends SIGHUP and exits 0
