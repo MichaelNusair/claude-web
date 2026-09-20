@@ -305,7 +305,22 @@ export class ClaudeWebStack extends Stack {
       idleTimeout: Duration.seconds(4000),
     });
 
-    const targetGroup = new elbv2.ApplicationTargetGroup(this, 'TG', {
+    /*
+     * The construct id here is load-bearing, and not for the usual CDK reason.
+     *
+     * A target group can be attached to exactly one load balancer, so
+     * CloudFormation cannot replace the ALB while this stays put: the new ALB's
+     * listener asks for a target group the old ALB is still holding, the API
+     * refuses, and the whole update rolls back. Renaming this construct is what
+     * replaces the two together.
+     *
+     * It was `TG` until 2026-09-20, when the ALB had to be replaced to drop a
+     * `loadBalancerName` that had been set by hand to recover the stack after the
+     * load balancer was deleted out of band. So: if you ever have to replace the
+     * ALB again, rename this too, and expect the site to 503 for as long as the
+     * health check below takes to pass on the new group.
+     */
+    const targetGroup = new elbv2.ApplicationTargetGroup(this, 'AppTG', {
       vpc,
       port: APP_PORT,
       protocol: elbv2.ApplicationProtocol.HTTP,
@@ -316,6 +331,11 @@ export class ClaudeWebStack extends Stack {
         interval: Duration.seconds(30),
         // First boot installs code-server, Node and the extension.
         unhealthyThresholdCount: 5,
+        // Two in a row rather than the AWS default of five. A target group is
+        // only ever created here with the instance already up, and five 30s
+        // checks is two and a half minutes of 503s before the load balancer will
+        // send it anything — paid in full every time this group is replaced.
+        healthyThresholdCount: 2,
       },
       deregistrationDelay: Duration.seconds(10),
     });
