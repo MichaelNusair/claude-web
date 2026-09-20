@@ -104,6 +104,23 @@ class Session {
     this.truncated = false;
     this.sessionId = null;
     this.lastActivity = Date.now();
+    /*
+     * When a PERSON last had anything to do with this conversation: it was
+     * created, a page attached or detached, or something was written to it.
+     * Deliberately not bumped by the CLI's own output, which is what separates
+     * this from `lastActivity`.
+     *
+     * IDLE_MS is measured against this, and has to be, or a parked conversation
+     * never dies. `lastActivity` moves on every byte the CLI writes, and these
+     * processes are launched by the panel with `--debug --debug-to-stderr`, so
+     * they chatter while nobody is watching. Measured on the box before this
+     * fix: five parked conversations, last spoken to between 1.6h and 22.8h
+     * earlier, every one of them reporting an idle time of 194 seconds and all
+     * five advancing in lockstep — one shared event resetting all five clocks,
+     * over and over. The 12-hour reaper had therefore never fired for any of
+     * them, and nine processes held ~2.0GB until someone found the Stop button.
+     */
+    this.attendedAt = Date.now();
     this.exited = false;
     // Whether anyone has ever sent this process a MESSAGE — not merely bytes. A
     // session that has not been spoken to holds no conversation: nothing was
@@ -302,6 +319,7 @@ class Session {
   attach(client) {
     this.clients.add(client);
     this.lastActivity = Date.now();
+    this.attendedAt = Date.now();
     // Everything written so far, so the page can rebuild its view. One frame per
     // recorded chunk keeps the byte stream identical to what a sole client saw.
     for (const chunk of this.chunks) {
@@ -313,6 +331,10 @@ class Session {
   detach(client) {
     this.clients.delete(client);
     this.lastActivity = Date.now();
+    // The reaper's clock starts here for a conversation being left behind, which
+    // is what keeps "read an old conversation, close the tab, come back" from
+    // finding a dead process: leaving is attention too.
+    this.attendedAt = Date.now();
     log(`session ${this.key} detached; clients=${this.clients.size}`);
 
     // Keeping a watched-by-nobody conversation is the entire point of this
@@ -349,6 +371,7 @@ class Session {
 
   write(data) {
     this.lastActivity = Date.now();
+    this.attendedAt = Date.now();
     // Only a message starts a turn; the panel's control traffic does not. The
     // remaining way to be wrong is a missed `result`, which leaves a stale
     // "working" — still the right direction to be wrong in, because "working"
@@ -451,6 +474,11 @@ function statusSnapshot() {
       working: session.turnInFlight,
       clients: session.clients.size,
       idleMs: now - session.lastActivity,
+      // How long since anyone attached, left, or wrote — the clock the reaper
+      // actually runs on, so that "why is this still here" has an answer that
+      // matches the decision. `idleMs` is since the CLI last wrote a byte, which
+      // is a different question and answers nothing about lifetime.
+      attendedMs: now - session.attendedAt,
       // How long since anyone said anything to this conversation, as opposed to
       // since the CLI last wrote a byte. Null if nobody ever has. This is what
       // tells "the conversation being used" from "a conversation being read
@@ -526,8 +554,14 @@ function open(hello, client) {
 function reapIdle() {
   const now = Date.now();
   for (const session of [...sessions.values()]) {
-    if (session.clients.size === 0 && now - session.lastActivity > IDLE_MS) {
-      log(`session ${session.key} idle; stopping`);
+    if (session.clients.size > 0) continue;
+    // A turn still running is work, whatever the clocks say. `lastActivity` used
+    // to stand in for this — a working conversation is a writing one — and that
+    // is exactly the conflation that broke the timeout, so the guard is now its
+    // own line and says what it means.
+    if (session.turnInFlight) continue;
+    if (now - session.attendedAt > IDLE_MS) {
+      log(`session ${session.key} unattended for ${Math.round((now - session.attendedAt) / 60000)}m; stopping`);
       session.stop();
     }
   }
@@ -553,7 +587,11 @@ function main() {
     log(`listening on ${SOCKET}`);
   });
 
-  setInterval(reapIdle, 60 * 1000).unref();
+  // Once a minute against a twelve-hour timeout, and never coarser than the
+  // timeout itself — a fixed minute would enforce a one-second IDLE_MS a minute
+  // late, which is the difference between a test that proves the reaper works and
+  // one that waits for it.
+  setInterval(reapIdle, Math.max(50, Math.min(60 * 1000, Math.floor(IDLE_MS / 4)))).unref();
 
   // Leave the sessions running on SIGTERM only if we are being replaced; a
   // deploy restarts this unit, and killing every conversation on restart is the

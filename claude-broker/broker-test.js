@@ -67,6 +67,14 @@ process.stdin.on('data', (c) => {
     } catch {
       /* not JSON: a raw line from a byte-transparency check */
     }
+    // The panel launches the CLI with \`--debug --debug-to-stderr\`, so a parked
+    // conversation writes while nobody is reading. On the box that output was
+    // resetting the reaper's clock, and five conversations last spoken to between
+    // 1.6h and 22.8h earlier all reported an idle time of 194 seconds.
+    if (text === 'chatter') {
+      setInterval(() => process.stderr.write('[DEBUG] still here\\n'), 60);
+      continue;
+    }
     if (text === 'end-turn') {
       process.stdout.write(JSON.stringify({ type: 'result', subtype: 'success' }) + '\\n');
       continue;
@@ -111,8 +119,8 @@ const alive = (pid) => {
 const SESSION_ARGS = ['--input-format', 'stream-json', '--output-format', 'stream-json'];
 
 /** A wrapper-shaped client: speaks the framing, collects decoded stdout. */
-function connect({ resume, cwd = TMP }) {
-  const sock = net.connect(SOCKET);
+function connect({ resume, cwd = TMP, socket = SOCKET }) {
+  const sock = net.connect(socket);
   const client = { sock, hello: null, out: '', frames: [] };
   let buffered = '';
   sock.on('data', (chunk) => {
@@ -296,6 +304,91 @@ function checkLaunchContract() {
       'deploy.sh puts it in the payload, so the box gets this file and not a stale one',
     );
   }
+}
+
+/**
+ * The twelve-hour timeout, which had never once fired.
+ *
+ * Its own broker, because the only way to test a timeout in a second is to set it
+ * to a second, and IDLE_MS is fixed at startup. Its own cwd per case, because the
+ * fake CLI always announces `S1` and a second session in the same directory
+ * re-keys onto the first one's key, displacing it — the displaced process then
+ * leaves the map and no assertion about reaping means anything.
+ *
+ * What this pins down is which clock decides. `lastActivity` moves on every byte
+ * the CLI writes, so on the box a parked conversation was kept alive by its own
+ * debug output for as long as the box stayed up: nine processes, ~2.0GB, the
+ * oldest last spoken to 22.8 hours earlier.
+ */
+async function checkUnattendedReaping() {
+  section('A parked conversation is reaped on the attention clock, not the CLI’s chatter:');
+  const socket = path.join(TMP, 'idle.sock');
+  const IDLE = 1500;
+  const broker = spawn(process.execPath, [path.join(HERE, 'broker.js')], {
+    env: { ...process.env, CLAUDE_BROKER_SOCKET: socket, CLAUDE_BROKER_IDLE_MS: String(IDLE) },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let log = '';
+  broker.stdout.on('data', (d) => (log += d.toString()));
+  broker.stderr.on('data', (d) => (log += d.toString()));
+  for (let i = 0; i < 50 && !fs.existsSync(socket); i += 1) await sleep(100);
+
+  const dirs = [];
+  const freshCwd = () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'broker-test-idle-'));
+    dirs.push(dir);
+    return dir;
+  };
+
+  // A real conversation, left behind: spoken to, so detaching parks it rather
+  // than stopping it, and its turn is finished, so nothing is in flight. Then it
+  // chatters, which is the whole of the bug.
+  const parked = await connect({ resume: null, cwd: freshCwd(), socket });
+  await sleep(400);
+  const parkedPid = lastPid();
+  say(parked, 'a-real-first-message');
+  await sleep(200);
+  // Asked for before the turn is ended, because asking IS a message: a `chatter`
+  // sent last would leave a turn in flight and the guard below would keep the
+  // process alive for the right reason, proving nothing about the clock.
+  say(parked, 'chatter');
+  await sleep(200);
+  say(parked, 'end-turn');
+  await sleep(200);
+  ok(alive(parkedPid), 'it is running while its page is open');
+  parked.sock.destroy();
+
+  // A turn still running is work. The old code protected it only by accident —
+  // a working conversation is a writing one — and writing is exactly what this
+  // stopped trusting, so the guard is now explicit and is worth a check.
+  const working = await connect({ resume: null, cwd: freshCwd(), socket });
+  await sleep(400);
+  const workingPid = lastPid();
+  say(working, 'a-question-with-no-end-turn');
+  await sleep(200);
+  working.sock.destroy();
+
+  // And attention keeps a conversation: a page that is still attached holds one
+  // open however long the CLI has nothing to say.
+  const held = await connect({ resume: null, cwd: freshCwd(), socket });
+  await sleep(400);
+  const heldPid = lastPid();
+  say(held, 'a-real-first-message');
+  await sleep(200);
+  say(held, 'end-turn');
+
+  await sleep(IDLE + 1500);
+  ok(!alive(parkedPid), 'a parked conversation is stopped once nobody has attended it');
+  ok(log.includes('unattended'), 'and the log says so in the terms of the decision');
+  ok(alive(workingPid), 'a turn in flight is never reaped, whatever the clocks say');
+  ok(alive(heldPid), 'and an attached page holds its conversation open indefinitely');
+
+  held.sock.destroy();
+  broker.kill('SIGTERM');
+  await sleep(400);
+  broker.kill('SIGKILL');
+  for (const dir of dirs) fs.rmSync(dir, { recursive: true, force: true });
+  return log;
 }
 
 async function main() {
@@ -510,6 +603,8 @@ async function main() {
   );
   fs.rmSync(ALT, { recursive: true, force: true });
 
+  const idleLog = await checkUnattendedReaping();
+
   broker.kill('SIGTERM');
   await sleep(500);
   broker.kill('SIGKILL');
@@ -517,6 +612,7 @@ async function main() {
   console.log(`\n${pass}/${pass + fail} checks passed`);
   if (fail) {
     console.log('\nbroker log:\n' + brokerLog);
+    console.log('\nreaper broker log:\n' + idleLog);
     process.exit(1);
   }
   fs.rmSync(TMP, { recursive: true, force: true });
