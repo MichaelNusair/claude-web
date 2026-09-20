@@ -44,37 +44,84 @@ CDK_ARGS=()
 printf '\n\033[1mDeploying landing site\033[0m %s\n' "https://$DOMAIN"
 
 # ---------------------------------------------------------------------------
-step "Checking the page is well-formed"
+step "Checking the page against the stack"
 # ---------------------------------------------------------------------------
-# Cheap guards against the two mistakes that actually happen: a referenced asset
-# that was never created, and a copy button whose visible text disagrees with
-# what it copies (the clipboard fallback selects the visible node, so a mismatch
-# hands the visitor a command that does not work).
-node - <<'CHECK'
-import { readFileSync, existsSync } from 'fs';
+# Analytics needs the page, the CloudFront behaviours and the CSP to agree, and
+# disagreement is invisible: the page still looks perfect and records nothing.
+node landing/landing-test.js || { echo "landing tests failed — not deploying." >&2; exit 1; }
 
-const html = readFileSync('landing/index.html', 'utf8');
+# ---------------------------------------------------------------------------
+step "Staging the site"
+# ---------------------------------------------------------------------------
+# The upload comes from a staging copy rather than from landing/ directly,
+# because one file is per-deployment: analytics.js is committed holding
+# placeholders and is stamped here with this deployment's PostHog token. The
+# working tree is never modified, so nothing account-specific can be committed by
+# accident.
+STAGE="$ROOT/dist/landing-site"
+rm -rf "$STAGE"
+mkdir -p "$STAGE"
+cp -R landing/. "$STAGE/"
+rm -f "$STAGE/landing-test.js"
+node infra/landing-analytics.js "$STAGE/analytics.js" ||
+  { echo "Could not write the analytics settings into the page." >&2; exit 1; }
+
+# ---------------------------------------------------------------------------
+step "Checking what is about to be uploaded"
+# ---------------------------------------------------------------------------
+# Cheap guards against the mistakes that actually happen: a referenced asset that
+# was never created, a copy button whose visible text disagrees with what it
+# copies (the clipboard fallback selects the visible node, so a mismatch hands the
+# visitor a command that does not work), and a page that forgot to load the
+# tracker — a page nobody can see the visits to looks exactly like a page nobody
+# visited.
+SITE="$STAGE" PH_KEY="$CFG_LANDING_PH_KEY" node - <<'CHECK'
+import { readFileSync, existsSync, readdirSync } from 'fs';
+
+const site = process.env.SITE;
+const key = process.env.PH_KEY;
 let failed = 0;
 const fail = (msg) => { console.error(`  FAIL ${msg}`); failed = 1; };
 
-for (const match of html.matchAll(/(?:href|src)="(\/[^"]*)"/g)) {
-  const asset = match[1].split('?')[0];
-  if (!existsSync(`landing${asset}`)) fail(`references ${asset}, which does not exist in landing/`);
-}
+const pages = readdirSync(site).filter((name) => name.endsWith('.html'));
+if (!pages.includes('index.html')) fail('no index.html to serve');
 
-for (const match of html.matchAll(/data-copy="([^"]*)"[\s\S]*?<code>([\s\S]*?)<\/code>/g)) {
-  const [, copied, shown] = match;
-  if (copied.trim() !== shown.trim()) {
-    fail(`copy button shows "${shown.trim()}" but copies "${copied.trim()}"`);
+for (const page of pages) {
+  const html = readFileSync(`${site}/${page}`, 'utf8');
+
+  for (const match of html.matchAll(/(?:href|src)="(\/[^"]*)"/g)) {
+    const asset = match[1].split('?')[0];
+    if (!existsSync(`${site}${asset}`)) fail(`${page} references ${asset}, which is not in the site`);
   }
+
+  for (const match of html.matchAll(/data-copy="([^"]*)"[\s\S]*?<code>([\s\S]*?)<\/code>/g)) {
+    const [, copied, shown] = match;
+    if (copied.trim() !== shown.trim()) {
+      fail(`${page}: copy button shows "${shown.trim()}" but copies "${copied.trim()}"`);
+    }
+  }
+
+  if (!html.includes('src="/analytics.js"')) fail(`${page} does not load /analytics.js, so visits to it are invisible`);
+  if (!/<title>.+<\/title>/.test(html)) fail(`${page} has no <title>`);
 }
 
-if (!/<title>.+<\/title>/.test(html)) fail('no <title>');
-if (!/name="description"/.test(html)) fail('no meta description');
+if (!/name="description"/.test(readFileSync(`${site}/index.html`, 'utf8'))) {
+  fail('index.html has no meta description');
+}
+
+// The substitution is the step with no symptom of its own: an unstamped script
+// loads, returns immediately, and reports nothing for as long as nobody checks.
+const script = readFileSync(`${site}/analytics.js`, 'utf8');
+if (key) {
+  if (!script.includes(key)) fail('analytics.js does not carry the configured PostHog key');
+  if (/__POSTHOG_[A-Z_]+__/.test(script)) fail('analytics.js still holds an unsubstituted placeholder');
+} else if (!script.includes('__POSTHOG_PROJECT_TOKEN__')) {
+  fail('no PostHog key is configured, yet analytics.js has been stamped with something');
+}
 
 process.exit(failed);
 CHECK
-echo "  page OK"
+echo "  site OK"
 
 # ---------------------------------------------------------------------------
 step "Deploying infrastructure"
@@ -106,7 +153,7 @@ step "Uploading content"
 # HTML is revalidated on every request so a copy fix goes live at once; the
 # fingerprint-free CSS/JS get a short TTL for the same reason. This site is tiny
 # and traffic-light, so correctness beats cache efficiency here.
-aws s3 sync landing/ "s3://$BUCKET/" \
+aws s3 sync "$STAGE/" "s3://$BUCKET/" \
   --delete \
   --exclude '.DS_Store' \
   --cache-control 'public, max-age=300, must-revalidate' \
@@ -138,7 +185,27 @@ done
 
 printf '\n'
 if [ "$code" = "200" ]; then
-  printf '\033[1;32m✓ Live at https://%s\033[0m\n\n' "$DOMAIN"
+  printf '\033[1;32m✓ Live at https://%s\033[0m\n' "$DOMAIN"
+
+  # The analytics proxy is the one part of the page with no visible symptom: if
+  # these behaviours are missing or misrouted the page loads perfectly and
+  # records nothing. So fetch the tracker the way a visitor's browser will, from
+  # the path CloudFront was configured with (print-config exports the same
+  # constant the stack and the page were built from).
+  if [ -n "$CFG_LANDING_PH_KEY" ]; then
+    PH_URL="https://$DOMAIN$CFG_LANDING_PH_PATH/static/array.js"
+    ph_code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "$PH_URL" || true)"
+    if [ "$ph_code" = "200" ]; then
+      printf '\033[1;32m✓ Analytics reaching PostHog through %s\033[0m\n\n' "$CFG_LANDING_PH_PATH"
+    else
+      printf '\033[1;33m! The page is live but %s returned %s, so it is\n' "$PH_URL" "$ph_code"
+      printf '  loading no tracker and recording nothing. A new behaviour takes a\n'
+      printf '  few minutes to reach every edge; if it persists, check the\n'
+      printf '  additionalBehaviors in infra/lib/landing-stack.js.\033[0m\n\n'
+    fi
+  else
+    printf '\n'
+  fi
 else
   printf '\033[1;33m! Returned %s. A new distribution takes ~15 minutes to\n' "$code"
   printf '  deploy, and a first-time certificate waits on DNS validation.\033[0m\n\n'

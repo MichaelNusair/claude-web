@@ -456,7 +456,11 @@ route to the private thing, and deploying either cannot disturb the other.
 {
   "landing": {
     "domainName": "claude.example.com",
-    "certificateArn": ""
+    "certificateArn": "",
+    "analytics": {
+      "posthogKey": "",
+      "region": "us"
+    }
   }
 }
 ```
@@ -476,6 +480,66 @@ Three things worth knowing:
 - **A new CloudFront distribution takes ~15 minutes** to reach every edge, and a
   first-time certificate waits on DNS validation before that. The script polls,
   then tells you if it is still settling rather than failing.
+
+### Analytics for the landing page
+
+Off by default, and off entirely — with no key configured the page loads a script
+that returns on its first line, and the distribution has one origin and the
+strictest CSP it can have. To turn it on, put a PostHog **project** key in the
+config (`Project settings → Project API key`, the public `phc_…` one that is meant
+to ship in page JavaScript — not a personal `phx_…` key):
+
+```json
+"landing": {
+  "analytics": {
+    "posthogKey": "phc_...",
+    "region": "us"
+  }
+}
+```
+
+```bash
+./deploy-landing.sh
+```
+
+**It is configured to record as much as PostHog will record.** Session replay,
+autocapture of every click and input, heatmaps, dead clicks, rage clicks, web
+vitals, console logs, uncaught exceptions, and person profiles for anonymous
+visitors so that "unique visitors" and "returning" mean something without anyone
+logging in. On top of that, five events the page defines itself:
+`command_copied` (which command, and whether the clipboard or the fallback took
+it), `outbound_click`, `scroll_depth`, `section_viewed` (a band of the page that
+held half the viewport for a second — scrolling past something is not reading it)
+and `page_exit` (visible seconds, furthest scroll, which sections were read,
+whether the command was copied). No masking: there is no login, no form and no
+user-supplied content on that page. If one ever appears, `session_recording` in
+`landing/analytics.js` is the thing to change before shipping it.
+
+Four things worth knowing:
+
+- **Session replay also has to be enabled in the PostHog project.** It is a
+  server-side toggle (`Project settings → Session replay`) and no client setting
+  can turn it on. Everything else here works without it; replays simply will not
+  appear.
+- **PostHog is proxied through your own domain**, under a short path on the same
+  CloudFront distribution — the SDK, the events, the replay snapshots and the
+  remote config all come from and go to your hostname. That is not decoration:
+  requests to `posthog.com` are on every blocker list, and a blocked request is
+  not a degraded visit, it is an invisible one. It also means the page's CSP names
+  no third party at all. The path, the CloudFront behaviours and the policy are
+  defined once in `infra/landing-analytics.js`, because three things that must
+  agree and fail silently when they don't is exactly what that file is for.
+- **The key is per-deployment, not committed.** It is public by design, but it
+  names *your* PostHog project, and a fork that inherited it would report its
+  visitors into your account. So `landing/analytics.js` ships with placeholders
+  and `deploy-landing.sh` stamps a staged copy — your working tree is never
+  modified, and the deploy refuses to upload a page whose token never got
+  written.
+- **There is no cookie banner, and this records EU visitors.** A personal project
+  page with no login is about as low-stakes as tracking gets, but "we record full
+  sessions of everyone" is the honest description of what is switched on, and a
+  consent gate is not something this page has. Turning it off is removing the key
+  and redeploying.
 
 ### If you are moving a hostname between the two
 

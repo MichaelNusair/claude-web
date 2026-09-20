@@ -459,6 +459,14 @@ entirely if you're self-hosting for yourself.
 ./deploy-landing.sh    # independent of ./deploy.sh
 ```
 
+Visitor analytics is optional and off until you give it a key. Set
+`landing.analytics.posthogKey` to a PostHog project key (`phc_…`) and the page
+records sessions in full — replay, autocapture, heatmaps, scroll depth, which
+sections were read, whether the install command was copied. PostHog is proxied
+through the site's own domain, so nothing is lost to a blocker and no third-party
+origin appears in the page's CSP. Leave the key empty and no analytics code runs
+at all. See [docs/DEPLOY.md](docs/DEPLOY.md#analytics-for-the-landing-page).
+
 ## Working on it
 
 `AGENTS.md` (and `CLAUDE.md`) orient both people and AI agents: repo map, the
@@ -468,6 +476,7 @@ rules that matter, and the gotchas that have burned people. Contributions welcom
 ```bash
 npm test                              # auth + client + project tabs + overlay + dictation
                                       # + projects + operations surface + broker
+                                      # + the landing page's analytics wiring
 cd infra && npx cdk synth --quiet     # stack compiles
 ```
 

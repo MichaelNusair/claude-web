@@ -139,12 +139,25 @@
     "certificates from. Leave it empty to have one created there for you; a",
     "wildcard covering your zone can be reused if it is already in us-east-1.",
     "",
-    "Deploy with ./deploy-landing.sh, which is independent of ./deploy.sh."
+    "Deploy with ./deploy-landing.sh, which is independent of ./deploy.sh.",
+    "",
+    "analytics.posthogKey turns on visitor analytics for that page: the public",
+    "phc_... project key from PostHog, which is meant to live in page JavaScript.",
+    "Empty means no analytics at all, and the strictest possible CSP. With a key",
+    "set, the distribution also proxies PostHog under a path of its own so no",
+    "request leaves your domain (blockers stop the ones that do), and the CSP is",
+    "widened exactly far enough to allow it. region is us or eu, whichever cloud",
+    "your project lives in. Session replay also has to be enabled in the PostHog",
+    "project itself — no client setting can turn it on."
   ],
   "landing": {
     "domainName": "",
     "certificateArn": "",
-    "stackName": "ClaudeWebLandingStack"
+    "stackName": "ClaudeWebLandingStack",
+    "analytics": {
+      "posthogKey": "",
+      "region": "us"
+    }
   },
 
   "$comment_security": [

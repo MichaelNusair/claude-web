@@ -234,6 +234,26 @@ const DEFAULTS = {
      */
     certificateArn: '',
     stackName: 'ClaudeWebLandingStack',
+
+    /**
+     * Visitor analytics for the landing page. Off unless a key is set.
+     *
+     * `posthogKey` is a PostHog *project* key — the `phc_…` one that is meant to
+     * be public and sits in the page's JavaScript. It is still per-deployment
+     * rather than committed, because it names someone's PostHog project: a fork
+     * that inherited it would report its visitors into a stranger's account.
+     *
+     * With a key set, the landing distribution also proxies PostHog under a path
+     * of its own so that no request leaves this origin (see
+     * infra/landing-analytics.js), and the page's CSP is widened exactly far
+     * enough to allow it. Session replay additionally has to be switched on in
+     * the PostHog project itself; the client cannot turn it on from here.
+     */
+    analytics: {
+      posthogKey: '',
+      /** "us" or "eu" — which PostHog cloud the project lives in. */
+      region: 'us',
+    },
   },
 };
 
@@ -315,7 +335,11 @@ export function loadConfig() {
     ...DEFAULTS,
     ...fromFile,
     oidc: { ...DEFAULTS.oidc, ...(fromFile.oidc || {}) },
-    landing: { ...DEFAULTS.landing, ...(fromFile.landing || {}) },
+    landing: {
+      ...DEFAULTS.landing,
+      ...(fromFile.landing || {}),
+      analytics: { ...DEFAULTS.landing.analytics, ...(fromFile.landing?.analytics || {}) },
+    },
     pwa: { ...DEFAULTS.pwa, ...(fromFile.pwa || {}) },
     deployFrom: { ...DEFAULTS.deployFrom, ...(fromFile.deployFrom || {}) },
     security: { ...DEFAULTS.security, ...(fromFile.security || {}) },
@@ -486,6 +510,24 @@ export function loadConfig() {
         `landing.domainName and domainName are both "${config.domainName}". They ` +
           'cannot share a hostname — one DNS record cannot point at both ' +
           'CloudFront and the load balancer. Give the workspace its own subdomain.',
+      );
+    }
+    // Analytics, if it is switched on. Checked here rather than discovered in the
+    // browser: a mistyped key is a page that loads, looks right, and records
+    // nothing anywhere, which is the one failure nobody notices.
+    const analytics = config.landing.analytics;
+    if (analytics.posthogKey && !/^phc_[A-Za-z0-9]{20,}$/.test(analytics.posthogKey)) {
+      fail(
+        `landing.analytics.posthogKey "${analytics.posthogKey}" is not a PostHog project ` +
+          'key. Expected the public "phc_…" key from Project settings → Project API key ' +
+          '— not a personal API key (phx_…), and not the project id.',
+      );
+    }
+    if (!['us', 'eu'].includes(analytics.region)) {
+      fail(
+        `landing.analytics.region "${analytics.region}" is not a PostHog cloud. Use "us" ` +
+          'or "eu" — whichever your project lives in. The wrong one accepts the events ' +
+          'and shows them in no project you can see.',
       );
     }
     // The workspace certificate is only reusable when it happens to live in

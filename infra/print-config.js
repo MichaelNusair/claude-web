@@ -11,6 +11,7 @@
  * non-zero, so `eval "$(node infra/print-config.js)"` fails loudly.
  */
 import { loadConfig, requiredPwaIcons } from './config.js';
+import { PROXY_PATH } from './landing-analytics.js';
 
 /** Single-quote for the shell, escaping embedded single quotes safely. */
 const shellQuote = (value) => `'${String(value).replace(/'/g, `'\\''`)}'`;
@@ -38,6 +39,13 @@ const exported = {
   CFG_INSTANCE_TYPE: config.instanceType,
   CFG_LANDING_DOMAIN: config.landing.domainName,
   CFG_LANDING_STACK: config.landing.stackName,
+  // The landing page's PostHog project key, which is public by design — it ships
+  // in the page's JavaScript. Exported so deploy-landing.sh can check that the
+  // copy it is about to upload actually carries it, rather than the placeholder.
+  CFG_LANDING_PH_KEY: config.landing.analytics.posthogKey,
+  // And the path the distribution proxies PostHog under, so the shell verifies
+  // the same path CloudFront was configured with rather than a second copy of it.
+  CFG_LANDING_PH_PATH: PROXY_PATH,
   CFG_SECURITY_ENABLED: config.security.enabled,
   CFG_SECURITY_STACK: config.security.stackName,
   CFG_SECURITY_CLOUDTRAIL: config.security.cloudTrail,

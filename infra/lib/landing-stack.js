@@ -20,6 +20,12 @@ import * as origins from 'aws-cdk-lib/aws-cloudfront-origins';
 import * as acm from 'aws-cdk-lib/aws-certificatemanager';
 import * as route53 from 'aws-cdk-lib/aws-route53';
 import * as route53_targets from 'aws-cdk-lib/aws-route53-targets';
+import {
+  PROXY_PATH,
+  analyticsEnabled,
+  landingCsp,
+  posthogOrigins,
+} from '../landing-analytics.js';
 
 export class ClaudeWebLandingStack extends Stack {
   constructor(scope, id, props) {
@@ -27,6 +33,13 @@ export class ClaudeWebLandingStack extends Stack {
 
     const config = props.config;
     const domainName = config.landing.domainName;
+
+    // Analytics is opt-in per deployment. With no key configured this stack is
+    // exactly what it was before: one origin, one behaviour, and a CSP that
+    // permits nothing external.
+    const analytics = analyticsEnabled(config.landing)
+      ? posthogOrigins(config.landing.analytics.region)
+      : null;
 
     // --- Bucket --------------------------------------------------------------
     // Private, with no public access and no website hosting. CloudFront reaches
@@ -61,21 +74,14 @@ export class ClaudeWebLandingStack extends Stack {
 
     // --- Security headers ----------------------------------------------------
     // A static page with no login and no user data, so these are cheap
-    // hardening rather than load-bearing. The CSP is strict because the page
-    // genuinely needs nothing external: no analytics, no fonts, no CDN scripts.
+    // hardening rather than load-bearing. The policy itself is built in
+    // infra/landing-analytics.js, which is also where the page's analytics path
+    // is defined — the two cannot be allowed to disagree, and a CSP that forbids
+    // what the page does shows up as a perfect-looking page recording nothing.
     const headers = new cloudfront.ResponseHeadersPolicy(this, 'SecurityHeaders', {
       securityHeadersBehavior: {
         contentSecurityPolicy: {
-          contentSecurityPolicy: [
-            "default-src 'none'",
-            "img-src 'self' data:",
-            "style-src 'self'",
-            "script-src 'self'",
-            "font-src 'self'",
-            "base-uri 'none'",
-            "form-action 'none'",
-            "frame-ancestors 'none'",
-          ].join('; '),
+          contentSecurityPolicy: landingCsp({ analytics: Boolean(analytics) }),
           override: true,
         },
         strictTransportSecurity: {
@@ -84,13 +90,100 @@ export class ClaudeWebLandingStack extends Stack {
           override: true,
         },
         contentTypeOptions: { override: true },
-        frameOptions: { frameOption: cloudfront.HeadersFrameOption.DENY, override: true },
+        // X-Frame-Options has only DENY and SAMEORIGIN, no allowlist, so it is
+        // dropped when analytics is on: it would otherwise override the CSP's
+        // narrower permission for PostHog's heatmap view to frame the page.
+        ...(analytics
+          ? {}
+          : {
+              frameOptions: { frameOption: cloudfront.HeadersFrameOption.DENY, override: true },
+            }),
         referrerPolicy: {
           referrerPolicy: cloudfront.HeadersReferrerPolicy.STRICT_ORIGIN_WHEN_CROSS_ORIGIN,
           override: true,
         },
       },
     });
+
+    // --- Analytics proxy -----------------------------------------------------
+    // PostHog, forwarded from PROXY_PATH on this distribution so that everything
+    // the page does is first-party: the SDK, the events, the replay snapshots.
+    // Requests to posthog.com are on every blocker list, and a blocked request is
+    // an invisible visit rather than a degraded one.
+    const proxyBehaviors = {};
+    if (analytics) {
+      // PostHog knows nothing about PROXY_PATH, so it comes off at the edge.
+      // A viewer-request function runs *after* the path pattern has selected the
+      // behaviour, which is what lets the behaviours below match on the prefix and
+      // the origin still see the path it expects.
+      const stripPrefix = new cloudfront.Function(this, 'StripAnalyticsPrefix', {
+        runtime: cloudfront.FunctionRuntime.JS_2_0,
+        comment: `Remove ${PROXY_PATH} before forwarding to PostHog`,
+        code: cloudfront.FunctionCode.fromInline(
+          [
+            'function handler(event) {',
+            '  var request = event.request;',
+            `  request.uri = request.uri.substring(${PROXY_PATH.length}) || '/';`,
+            '  return request;',
+            '}',
+          ].join('\n'),
+        ),
+      });
+
+      const proxyCommon = {
+        viewerProtocolPolicy: cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
+        // Everything the viewer sent except Host, which has to stay PostHog's own
+        // or their router cannot tell what the request is for. The managed
+        // CORS policies forward no query string, and PostHog puts the batch
+        // compression and the API version in the query string.
+        originRequestPolicy: cloudfront.OriginRequestPolicy.ALL_VIEWER_EXCEPT_HOST_HEADER,
+        functionAssociations: [
+          { function: stripPrefix, eventType: cloudfront.FunctionEventType.VIEWER_REQUEST },
+        ],
+        compress: true,
+      };
+
+      const assetBehavior = {
+        ...proxyCommon,
+        origin: new origins.HttpOrigin(analytics.assets, {
+          protocolPolicy: cloudfront.OriginProtocolPolicy.HTTPS_ONLY,
+        }),
+        allowedMethods: cloudfront.AllowedMethods.ALLOW_GET_HEAD_OPTIONS,
+        // Honours whatever PostHog says: zero default TTL, so a response with no
+        // cache-control is re-fetched, and one with it is kept for as long as it
+        // asks up to a day. This is the whole reason /array/* is not pointed at
+        // the ingestion origin — that one strips the cache headers, and stale
+        // remote config silently freezes the recorder's settings.
+        cachePolicy: new cloudfront.CachePolicy(this, 'AnalyticsAssetCache', {
+          comment: 'PostHog assets: cache as the origin instructs',
+          queryStringBehavior: cloudfront.CacheQueryStringBehavior.all(),
+          headerBehavior: cloudfront.CacheHeaderBehavior.allowList('Origin'),
+          cookieBehavior: cloudfront.CacheCookieBehavior.none(),
+          enableAcceptEncodingGzip: true,
+          enableAcceptEncodingBrotli: true,
+          minTtl: Duration.seconds(0),
+          defaultTtl: Duration.seconds(0),
+          maxTtl: Duration.days(1),
+        }),
+      };
+
+      // Order is load-bearing: CloudFront tries path patterns in the order they
+      // are declared, so the two asset paths have to come before the catch-all or
+      // it would swallow them and serve the SDK from the ingestion host.
+      proxyBehaviors[`${PROXY_PATH}/static/*`] = assetBehavior;
+      proxyBehaviors[`${PROXY_PATH}/array/*`] = assetBehavior;
+      proxyBehaviors[`${PROXY_PATH}/*`] = {
+        ...proxyCommon,
+        origin: new origins.HttpOrigin(analytics.api, {
+          protocolPolicy: cloudfront.OriginProtocolPolicy.HTTPS_ONLY,
+        }),
+        // POST is not optional here: every event, and every session replay
+        // snapshot, is a POST body.
+        allowedMethods: cloudfront.AllowedMethods.ALLOW_ALL,
+        // Ingestion must never be cached, and neither must a feature flag call.
+        cachePolicy: cloudfront.CachePolicy.CACHING_DISABLED,
+      };
+    }
 
     // --- Distribution --------------------------------------------------------
     const distribution = new cloudfront.Distribution(this, 'Distribution', {
@@ -102,6 +195,11 @@ export class ClaudeWebLandingStack extends Stack {
         compress: true,
         responseHeadersPolicy: headers,
       },
+      // The analytics proxy, or nothing at all when no key is configured. These
+      // carry no response headers policy of their own: PostHog answers with its
+      // own CORS headers and its own cache directives, and the site's policy has
+      // nothing useful to say about a JSON API response.
+      additionalBehaviors: proxyBehaviors,
       domainNames: [domainName],
       certificate,
       defaultRootObject: 'index.html',
@@ -113,6 +211,12 @@ export class ClaudeWebLandingStack extends Stack {
       errorResponses: [
         // A single-page site: anything missing shows the page rather than an
         // XML S3 error, and 404 is preserved so it is honest to crawlers.
+        //
+        // Distribution-wide, which CloudFront gives no way to scope to one
+        // behaviour, so an error *from PostHog* also comes back as this page.
+        // Harmless in practice — ingestion answers 200, and the SDK treats a
+        // non-2xx as a failed batch either way — but it is why a debugging
+        // session against the proxy sees HTML where it expected JSON.
         { httpStatus: 403, responseHttpStatus: 404, responsePagePath: '/404.html', ttl: Duration.minutes(5) },
         { httpStatus: 404, responseHttpStatus: 404, responsePagePath: '/404.html', ttl: Duration.minutes(5) },
       ],

@@ -196,6 +196,7 @@ npm run test:projects  # 53/53; real git repos, real pushes
 npm run test:admin     # the operations surface, and every refusal it makes
 npm run test:status    # 42/42; which conversation a device is told about, and from where
 npm run test:broker    # 51/51; one process per conversation, and what counts as a turn
+npm run test:landing   # 53/53; the marketing page's analytics, which fails silently
 cd infra && npx cdk synth --quiet
 ```
 
@@ -307,10 +308,16 @@ infra/                   AWS CDK (JavaScript, not TypeScript).
   userdata/bootstrap.sh  Instance provisioning. Idempotent; re-run on deploy.
 
   lib/landing-stack.js   Optional marketing site: S3 + CloudFront. Separate stack.
+  landing-analytics.js   The landing page's analytics contract: the proxy path,
+                         PostHog's hosts, the page's CSP. Imported by the stack,
+                         the deploy script and the test, so they cannot disagree.
   lib/security-stack.js  Optional CloudTrail + GuardDuty. Account-wide, so its
                          own stack and its own lifetime.
 
 landing/                 The public marketing page. Static, no build step.
+  analytics.js           PostHog, proxied through the site's own origin. Ships
+                         holding placeholders; stamped at deploy time.
+  landing-test.js        Runs analytics.js in a stub browser. `npm run test:landing`.
 pwa/                     Assets copied into chat-service/public/ by deploy.sh.
                          THIS IS THE SOURCE OF TRUTH for manifest + sw.js.
 voice-extension/         VS Code dictation extension (for the editor surface).
@@ -1053,6 +1060,16 @@ Things that have burned people, in this codebase specifically:
   clipboard API is unavailable the script selects the visible `<code>` node
   instead, so an abbreviated label hands the visitor a broken command.
   `deploy-landing.sh` checks this and refuses to deploy on a mismatch.
+- **Broken analytics on the landing page has no symptom.** The page still loads,
+  still reads correctly, and records nothing — and the evidence is a dashboard
+  that looks like a page nobody visited. Four separate things have to agree for a
+  visit to arrive: the page loads `analytics.js`, the CSP permits what it does,
+  CloudFront proxies the path it posts to, and the deploy stamps the token into
+  it. So they are defined once in `infra/landing-analytics.js`, and
+  `landing/landing-test.js` runs the real script in a stub browser to check the
+  page still agrees. If you change any of the four, run `npm run test:landing`
+  and then look at PostHog's *Activity* view after deploying — a live event is
+  the only proof that matters.
 - **Headless Chrome with `--window-size` alone does not apply the viewport meta**,
   so it lays a responsive page out at desktop width and crops it. That looks
   exactly like a mobile overflow bug and isn't one. Use
