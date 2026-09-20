@@ -78,6 +78,12 @@ AWS_ARGS=(--region "$REGION")
 printf '\n\033[1mDeploying\033[0m %s\n' "https://$DOMAIN"
 printf '  region %s   auth %s   permissions %s   admin-role %s\n' \
   "$REGION" "$CFG_AUTH_MODE" "$CFG_PERMISSION_MODE" "$CFG_ADMIN"
+# Which deployment this is, in its own words. Two of them in one account means two
+# configs and one repository, and "which one am I about to change" is worth stating
+# rather than inferring from a hostname.
+if [ -n "$CFG_PWA_NAME" ]; then
+  printf '  name %s   (windows are titled "%s: <project>")\n' "$CFG_PWA_NAME" "$CFG_PWA_NAME"
+fi
 
 # Credentials are checked before anything is built, because when they are wrong
 # the failure otherwise lands minutes in, after the tests and the vsix packaging,

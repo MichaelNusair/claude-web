@@ -231,6 +231,7 @@ export class ClaudeWebStack extends Stack {
         -e 's|__DEFAULT_MODEL__|${config.defaultModel}|g' \\
         -e 's|__PERMISSION_MODE__|${config.permissionMode}|g' \\
         -e 's|__EFFORT_LEVEL__|${config.effortLevel}|g' \\
+        -e 's|__PWA_NAME__|${config.pwa.name}|g' \\
         /tmp/bootstrap.sh`,
       // Keep a persistent copy (with placeholders already substituted) so
       // deploy.sh can re-run provisioning on the live instance without a

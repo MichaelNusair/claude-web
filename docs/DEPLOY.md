@@ -159,7 +159,7 @@ CLAUDE_WEB_CONFIG=$PWD/claude-web.work.config.json ./deploy.sh --app-only
 `CLAUDE_WEB_CONFIG` is read by `infra/config.js`, which every script and the CDK app
 load their settings through.
 
-Four things to know, each of which is a mistake someone would otherwise make once:
+Five things to know, each of which is a mistake someone would otherwise make once:
 
 - **The deploy box needs a second checkout, not a second flag.** `deploy.sh` reads
   `claude-web.config.json` from the tree it runs in, and `deploy-remote.sh` resets
@@ -183,6 +183,16 @@ Four things to know, each of which is a mistake someone would otherwise make onc
   the config that selects it is gitignored, but a full deploy ships what the deploy
   box checked out from `origin/main`, so an untracked directory there means the
   default icons and a deploy that reports success anyway.
+- **And give it a name, which is the half of that the icons cannot do.** `pwa.name`
+  — say `"work"` — is what the deployment calls itself, and every title it shows
+  then reads `<name>: <project>`: the label under each project's installed icon, the
+  browser tab, the editor window. Empty, the default, leaves all of them exactly as
+  a single deployment has always had them. Two rules follow from where the value
+  travels: it reaches the box in UserData, so changing it needs a full deploy rather
+  than `--app-only`, and renaming a deployment never moves a manifest's `id` or
+  `scope`, so icons already on a home screen keep working and are not installed
+  twice. The name is limited to 24 characters of letters, digits, spaces, dots,
+  dashes and underscores, and Android truncates a home-screen label at about 12.
 - **Separate stacks are not separate blast radii.** With
   `instanceAdminAccess: true` on either deployment, that box's role is
   AdministratorAccess over the whole account — the other deployment included. If the

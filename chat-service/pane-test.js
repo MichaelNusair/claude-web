@@ -31,11 +31,29 @@ import { readFileSync } from 'fs';
 import { dirname, join as joinPath } from 'path';
 import { fileURLToPath } from 'url';
 import { JSDOM } from 'jsdom';
+import { applyDeploymentName } from './manifest.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const publicDir = joinPath(here, 'public');
 const html = readFileSync(joinPath(publicDir, 'index.html'), 'utf8');
 const js = readFileSync(joinPath(publicDir, 'app.js'), 'utf8');
+
+/**
+ * The shell as a named deployment serves it — through the real rewrite, not a
+ * hand-written copy of what it is assumed to produce. The client reads the name out
+ * of the document, so the two halves only agree if they are tested joined up.
+ */
+function namedShell(name) {
+  const had = Object.hasOwn(process.env, 'PWA_NAME');
+  const before = process.env.PWA_NAME;
+  process.env.PWA_NAME = name;
+  try {
+    return applyDeploymentName(html);
+  } finally {
+    if (had) process.env.PWA_NAME = before;
+    else delete process.env.PWA_NAME;
+  }
+}
 
 const failures = [];
 function check(name, ok, detail = '') {
@@ -105,9 +123,12 @@ function projectsPayload() {
  * `saved` is written to localStorage *before* the script runs, because that is the
  * only way to test the case that matters most for a phone's memory: a cold PWA
  * launch with several tabs already open.
+ *
+ * `shell` is the HTML the server sent, which is not always the file on disk: a named
+ * deployment has its titles rewritten on the way out (see namedShell below).
  */
-function bootClient({ saved = null, live = [] } = {}) {
-  const dom = new JSDOM(html, { runScripts: 'outside-only', url: 'https://claude.example.com/' });
+function bootClient({ saved = null, live = [], shell = html } = {}) {
+  const dom = new JSDOM(shell, { runScripts: 'outside-only', url: 'https://claude.example.com/' });
   const w = dom.window;
   if (saved) w.localStorage.setItem('claude-chat-panes', JSON.stringify(saved));
 
@@ -811,6 +832,75 @@ console.log('\nRejoins every live conversation when the phone comes back:');
   await finish(h);
 }
 
+// --- 10. Which window is this ------------------------------------------------
+/**
+ * With two deployments of this app open in one browser, the tab strip is the only
+ * place that says which is which — and a tab shows a title, not a hostname. So the
+ * title has to name both the deployment and the project, and it has to be right at
+ * the moment you glance at it, which is why it is set from the document rather than
+ * from a request.
+ */
+console.log('\nSays which deployment and which project a tab is:');
+{
+  const h = bootClient();
+  await settle();
+  check('an unnamed deployment keeps the title it shipped with', h.w.document.title === 'Claude', h.w.document.title);
+
+  h.hooks.openConversation({ cwd: DEMO, project: 'demo', sessionId: 'aaa', title: 'the one still running' });
+  joinConversation(h.sockets[0], { sessionId: 'aaa' });
+  check(
+    'the tab of a single deployment is named after the project alone',
+    h.w.document.title === 'demo',
+    h.w.document.title,
+  );
+
+  h.$('#screen-chat [data-back]').click();
+  await settle();
+  check('going back to the list restores the app’s own title', h.w.document.title === 'Claude', h.w.document.title);
+  check('nothing threw', h.thrown.length === 0, h.thrown.join('; '));
+  await finish(h);
+}
+
+{
+  const h = bootClient({ shell: namedShell('work') });
+  await settle();
+  check(
+    'a named deployment says so before any project is open',
+    h.w.document.title === 'work',
+    h.w.document.title,
+  );
+
+  const a = h.hooks.openConversation({ cwd: DEMO, project: 'demo', sessionId: 'aaa', title: 'the one still running' });
+  joinConversation(h.sockets[0], { sessionId: 'aaa' });
+  check(
+    'the tab reads "<deployment>: <project>"',
+    h.w.document.title === 'work: demo',
+    h.w.document.title,
+  );
+
+  const b = h.hooks.openConversation({ cwd: API, project: 'api', sessionId: 'ccc', title: 'an api chat' });
+  joinConversation(h.sockets[1], { sessionId: 'ccc', cwd: API });
+  check('the title follows the tab you switch to', h.w.document.title === 'work: api', h.w.document.title);
+  // Switching conversations inside a project must not touch it: the tab is the
+  // project, and a chat's own name is already on screen under the tabs.
+  h.hooks.showConversation(b, { sessionId: 'eee', title: 'a fifth chat' });
+  await settle();
+  check('and not the conversation inside it', h.w.document.title === 'work: api', h.w.document.title);
+
+  h.hooks.activatePane(a);
+  check('going back to the other tab retitles again', h.w.document.title === 'work: demo', h.w.document.title);
+
+  h.$('#screen-chat [data-back]').click();
+  await settle();
+  check(
+    'with no project on screen the title names the deployment, not Claude',
+    h.w.document.title === 'work',
+    h.w.document.title,
+  );
+  check('nothing threw', h.thrown.length === 0, h.thrown.join('; '));
+  await finish(h);
+}
+
 // --- results ----------------------------------------------------------------
 if (failures.length) {
   console.error(`\nFAIL: ${failures.length} check(s) failed`);
@@ -824,6 +914,7 @@ console.log(
   + 'its own thread and announces itself when it lands; the composer follows the '
   + 'conversation on screen and sends nowhere else; the live cap cools an idle '
   + 'project and never a working one; closing a tab stops nothing, and neither does '
-  + 'switching which conversation a tab shows; and a new chat keeps its draft '
-  + 'through being named.',
+  + 'switching which conversation a tab shows; a new chat keeps its draft '
+  + 'through being named; and the browser tab says which deployment and which '
+  + 'project you are looking at.',
 );

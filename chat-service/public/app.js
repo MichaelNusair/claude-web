@@ -182,6 +182,36 @@ function saveSettings() {
   localStorage.setItem('claude-chat', JSON.stringify(state.settings));
 }
 
+// --- what the tab says ------------------------------------------------------
+
+/**
+ * This deployment's own name, and the title the shell arrived with.
+ *
+ * One account can run this app twice, and then a browser with both open is two
+ * tabs called the same thing. The server writes the name into the shell — the meta
+ * tag and the title itself — so both are read from the document rather than
+ * fetched: a tab has to be right before the first request finishes, and an unnamed
+ * deployment must look exactly as it always did.
+ */
+const DEPLOYMENT = $('meta[name="deployment"]')?.content.trim() || '';
+const BASE_TITLE = document.title;
+
+/**
+ * Title the tab after the project on screen, or after the deployment when none is.
+ *
+ * "<name>: <project>" is the same label the project's own installed icon carries
+ * (short_name in chat-service/manifest.js), so the tab and the home screen agree
+ * about what a window is. Without a deployment name the project stands alone, which
+ * is what one deployment wants: it has nothing to be told apart from.
+ */
+function setTabTitle(project) {
+  if (!project) {
+    document.title = BASE_TITLE;
+    return;
+  }
+  document.title = DEPLOYMENT ? `${DEPLOYMENT}: ${project}` : project;
+}
+
 // --- navigation -------------------------------------------------------------
 const screens = ['list', 'new', 'chat'];
 const navStack = ['list'];
@@ -206,6 +236,8 @@ function back() {
     // left working still announces itself — but none of them is on screen now.
     saveDraft({ now: true });
     state.activeKey = null;
+    // No project on screen, so the tab goes back to naming the deployment.
+    setTabTitle(null);
     renderConvBar(null);
     saveOpenPanes();
     refreshList();
@@ -898,6 +930,8 @@ function activatePane(pane) {
   // Which conversation you are in goes on its own line below the tabs, where it is
   // also the control for changing it.
   $('#chat-title').textContent = pane.project;
+  // The tab says the same thing as the header, plus which deployment it belongs to.
+  setTabTitle(pane.project);
   renderConvBar(pane);
   setSub(pane, pane.sub);
   setBusy(pane, pane.busy);

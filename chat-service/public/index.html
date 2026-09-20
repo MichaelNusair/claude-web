@@ -7,6 +7,11 @@
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="Claude">
+<!-- What this deployment calls itself, filled in by the server when it has a name
+     of its own (pwa.name in the deployment config) and left empty when it does
+     not. app.js reads it to title the tab "<name>: <project>"; the title below is
+     rewritten by the same pass. See applyDeploymentName in chat-service/manifest.js. -->
+<meta name="deployment" content="">
 <title>Claude</title>
 <!-- use-credentials is required: a manifest is fetched with credentials omitted
      by default, which now means a 401 and no install prompt. -->

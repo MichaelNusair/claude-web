@@ -99,17 +99,26 @@
   "effortLevel": "max",
 
   "$comment_pwa": [
-    "Which set of home screen icons the installable app ships with. Directory in",
+    "name is what this deployment calls itself, in front of every title the app",
+    "shows: a project window becomes 'work: my-project' on its icon, its browser",
+    "tab and its editor title bar, and the chat app's own icon becomes 'work'.",
+    "Letters, digits, spaces, dots, dashes and underscores, up to 24 characters —",
+    "and short is better, because a phone truncates a label under an icon at",
+    "about twelve. Empty is the default: one deployment has nothing to tell",
+    "apart, so windows are titled with the project alone.",
+    "",
+    "iconDir is which set of home screen icons the installable app ships with. Directory in",
     "this repository, relative to its root: 'pwa-icons' is the default set, and a",
     "subdirectory of it is a set of your own, e.g. 'pwa-icons/ribbon'. It must",
     "contain every file pwa/manifest.webmanifest names — a deploy refuses",
     "otherwise, because an icon that 404s is an app that cannot be installed.",
     "",
-    "Only worth changing if you run more than one deployment of this repository:",
-    "they are two apps on one phone, and the icon is how you tell them apart.",
-    "See pwa-icons/README.md."
+    "Both are only worth setting if you run more than one deployment of this",
+    "repository: they are two apps on one phone, and the icon and the name are",
+    "how you tell them apart. See pwa-icons/README.md."
   ],
   "pwa": {
+    "name": "",
     "iconDir": "pwa-icons"
   },
 

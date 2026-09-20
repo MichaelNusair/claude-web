@@ -40,8 +40,17 @@ fs.mkdirSync(path.join(PROJECTS, 'other'), { recursive: true });
 // Read at import time by session-manager.js, which manifest.js validates through.
 process.env.PROJECTS_ROOT = PROJECTS;
 
-const { projectManifest, projectStartUrl, projectWindowPath, manifestForProject } =
-  await import('./manifest.js');
+const {
+  projectManifest,
+  projectStartUrl,
+  projectWindowPath,
+  manifestForProject,
+  deploymentName,
+  appTitle,
+  chatManifest,
+  applyDeploymentName,
+} = await import('./manifest.js');
+const { PWA_NAME_PATTERN } = await import('../infra/config.js');
 
 let pass = 0;
 let fail = 0;
@@ -198,6 +207,193 @@ for (const set of iconSets) {
     );
   }
 }
+
+section('A named deployment says so in every title, and changes nothing else:');
+/*
+ * The words half of telling two deployments apart. `pwa.iconDir` above is how they
+ * look different on a home screen; `pwa.name` is how they read — "<name>: <project>"
+ * under a project's icon, in its browser tab and in its editor title bar, and the
+ * name on its own for the chat app.
+ *
+ * What these checks are really defending is the *unnamed* deployment, which is
+ * everyone who deploys this repository once: with no name set, every title has to be
+ * exactly what it was before this existed. And on the named side, identity: `id` and
+ * `scope` are how a phone recognises an app it already installed, so renaming a
+ * deployment must not orphan an icon.
+ */
+const shells = Object.fromEntries(
+  ['index.html', 'login.html', 'admin.html'].map((f) => [
+    f,
+    fs.readFileSync(path.join(here, 'public', f), 'utf8'),
+  ]),
+);
+
+delete process.env.PWA_NAME;
+ok(deploymentName() === '', 'a deployment with no name reports one anyway');
+ok(appTitle('demo') === 'demo', 'an unnamed deployment prefixes titles with something');
+const plain = await manifestForProject('demo');
+ok(plain.short_name === 'demo', 'the home-screen label changed for a deployment with no name');
+ok(plain.name === 'demo — Claude Code', 'the installer label changed for a deployment with no name');
+ok(chatManifest(base) === base, 'the chat manifest is rebuilt when there is no name to put in it');
+ok(
+  Object.values(shells).every((html) => applyDeploymentName(html) === html),
+  'an unnamed deployment still has its HTML shells rewritten, so a single deployment ' +
+    'pays for a feature it is not using',
+);
+
+process.env.PWA_NAME = 'work';
+const named = await manifestForProject('demo');
+ok(deploymentName() === 'work', 'the deployment name is not read from the environment');
+ok(appTitle('demo') === 'work: demo', 'a project title is not "<name>: <project>"');
+ok(named.short_name === 'work: demo', 'the label under the icon does not say which deployment it opens');
+ok(
+  named.name === 'work: demo — Claude Code',
+  'the installer label does not name the deployment, so two deployments offer the same install',
+);
+ok(
+  named.id === plain.id && named.scope === plain.scope && named.start_url === plain.start_url,
+  'naming a deployment changed a project app’s identity or scope — every icon already ' +
+    'installed from it is orphaned, and the next install is a second copy',
+);
+ok(
+  JSON.stringify(named.icons) === JSON.stringify(plain.icons),
+  'the name changed which icons a project installs with',
+);
+
+const chat = chatManifest(base);
+ok(chat.name === 'work' && chat.short_name === 'work', 'the chat app is not named after its deployment');
+ok(
+  chat.id === base.id && chat.scope === base.scope && chat.start_url === base.start_url,
+  'renaming the chat app moved its identity or scope, which orphans the installed icon',
+);
+ok(
+  JSON.stringify(chat.icons) === JSON.stringify(base.icons) && chat.display === base.display,
+  'the chat manifest lost fields on the way through the rename',
+);
+
+/*
+ * Each shell writes "Claude" where it means "this deployment's app", so the word is
+ * what gets replaced and each page keeps its own phrasing. The meta tag is the one
+ * addition: it is how app.js learns the name, so a tab can read "<name>: <project>"
+ * once a project is on screen (setTabTitle in public/app.js).
+ */
+const titleOf = (html) => /<title>([^<]*)<\/title>/.exec(html)?.[1];
+const metaOf = (html, name) =>
+  new RegExp(`<meta name="${name}" content="([^"]*)"`).exec(html)?.[1];
+const renamed = Object.fromEntries(
+  Object.entries(shells).map(([f, html]) => [f, applyDeploymentName(html)]),
+);
+ok(titleOf(renamed['index.html']) === 'work', 'the chat app’s tab does not say which deployment it is');
+ok(
+  titleOf(renamed['login.html']) === 'Sign in — work',
+  'the login page does not say which deployment you are signing in to — with two of them ' +
+    'that is the one page where it matters most',
+);
+ok(
+  titleOf(renamed['admin.html']) === 'work · box',
+  'the box page lost its own phrasing, or was not renamed at all',
+);
+ok(
+  metaOf(renamed['index.html'], 'deployment') === 'work',
+  'the shell does not carry the deployment name, so the client cannot title a tab with it',
+);
+ok(
+  metaOf(renamed['index.html'], 'apple-mobile-web-app-title') === 'work',
+  'the iOS home-screen label still says Claude on a named deployment',
+);
+ok(
+  metaOf(shells['index.html'], 'deployment') === '',
+  'public/index.html no longer ships an empty deployment meta tag for the server to fill, ' +
+    'so the client reads whatever was committed',
+);
+ok(
+  renamed['index.html'].includes('<script src="/chat/app.js"></script>'),
+  'the rewrite disturbed something other than the titles',
+);
+
+/*
+ * A name this cannot use is treated as no name at all, and that is a security
+ * property rather than tidiness: these values are interpolated into an HTML <title>
+ * and serialised into a manifest, and what arrives here is an environment variable,
+ * so a box whose unit file was hand-edited must not be able to put markup in a page.
+ * Mangling it into something legal would be worse than ignoring it — a name nobody
+ * chose, under every icon.
+ */
+process.env.PWA_NAME = '<script>alert(1)</script>';
+ok(deploymentName() === '', 'a name that is not a name is used anyway');
+ok(appTitle('demo') === 'demo', 'a rejected name still reached a title');
+ok(
+  applyDeploymentName(shells['index.html']) === shells['index.html'],
+  'a rejected name still rewrote the shell — which is script injection into the chat app',
+);
+process.env.PWA_NAME = 'x'.repeat(25);
+ok(deploymentName() === '', 'a name past the length limit is used anyway');
+delete process.env.PWA_NAME;
+
+/*
+ * Two copies of one pattern, in two files that cannot import each other: the service
+ * is deployed without `infra/`, so manifest.js carries its own. A drift here is a
+ * name the config accepts and the app silently drops, or the reverse.
+ */
+const manifestSrc = fs.readFileSync(path.join(here, 'manifest.js'), 'utf8');
+const declared = /const NAME_PATTERN = (\/.*\/);/.exec(manifestSrc)?.[1];
+ok(declared, 'manifest.js no longer declares NAME_PATTERN, so this drift check is blind');
+ok(
+  declared === String(PWA_NAME_PATTERN),
+  `the deployment name pattern drifted: infra/config.js has ${PWA_NAME_PATTERN}, ` +
+    `chat-service/manifest.js has ${declared} — one of them accepts a name the other refuses`,
+);
+
+section('And the name actually reaches the box, which is three files away:');
+/*
+ * The name is the only thing in this feature that cannot be shipped by
+ * `deploy.sh --app-only`: it travels config → UserData (a sed in stack.js) → a shell
+ * variable in bootstrap.sh → the chat service's unit → PWA_NAME in the process. Every
+ * link is in a different language, and a broken one is silent — a deployment that
+ * deploys green and is still called Claude.
+ *
+ * So the placeholders are checked as a set rather than one by one: anything of the
+ * form __NAME__ in bootstrap.sh needs a substitution rule in stack.js, or the deploy
+ * ships a script with a literal placeholder in it (deploy.sh refuses at that point,
+ * which is the good failure — this check is the earlier one).
+ */
+const bootstrapSrc = fs.readFileSync(path.join(root, 'infra', 'userdata', 'bootstrap.sh'), 'utf8');
+const stackSrc = fs.readFileSync(path.join(root, 'infra', 'lib', 'stack.js'), 'utf8');
+const placeholders = new Set(bootstrapSrc.match(/__[A-Z0-9_]+__/g) || []);
+ok(placeholders.has('__PWA_NAME__'), 'bootstrap.sh does not take a deployment name at all');
+for (const placeholder of placeholders) {
+  ok(
+    stackSrc.includes(`-e 's|${placeholder}|`),
+    `bootstrap.sh uses ${placeholder} but stack.js has no sed rule for it, so the boot ` +
+      'script reaches the instance with a literal placeholder where a value belongs',
+  );
+}
+const chatUnit = /cat > \/etc\/systemd\/system\/claude-chat\.service <<SVC\n([\s\S]*?)\nSVC\n/
+  .exec(bootstrapSrc)?.[1];
+ok(chatUnit, 'the chat service’s unit is no longer written by the heredoc this checks');
+ok(
+  /^Environment="PWA_NAME=\$PWA_NAME"$/m.test(chatUnit ?? ''),
+  'the chat service’s unit does not pass PWA_NAME, so the service cannot know what this ' +
+    'deployment is called and every title falls back to Claude — quoted, because a name ' +
+    'may contain a space',
+);
+/*
+ * The editor half. code-server writes document.title from `window.title` and rewrites
+ * it on every editor change, so this is a setting rather than something the overlay
+ * could do — and it is assigned rather than defaulted because that settings file lives
+ * on the persistent volume and outlives every deploy (the same trap effortLevel fell
+ * into: see "Let the config decide the effort level, every deploy").
+ */
+ok(
+  /WINDOW_TITLE="\$PWA_NAME"': \$\{rootName\}/.test(bootstrapSrc),
+  'the editor window title no longer leads with the deployment name and the open folder',
+);
+ok(
+  /merged\['window\.title'\] = window_title/.test(bootstrapSrc) &&
+    /merged\.pop\('window\.title', None\)/.test(bootstrapSrc),
+  'window.title is not assigned-or-removed from the config, so a name the config no longer ' +
+    'asks for is permanent on a box whose settings file survived the deploy',
+);
 
 section('And the chat app leaves the projects alone, which is the other half of it:');
 /*

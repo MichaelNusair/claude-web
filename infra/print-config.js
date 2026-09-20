@@ -42,6 +42,12 @@ const exported = {
   CFG_SECURITY_STACK: config.security.stackName,
   CFG_SECURITY_CLOUDTRAIL: config.security.cloudTrail,
   CFG_SECURITY_GUARDDUTY: config.security.guardDuty,
+  // What this deployment calls itself, in front of every title the app shows.
+  // Exported so the deploy says which deployment it is shipping — with two of them
+  // in one account, the hostname is the only other thing that distinguishes the
+  // output. It reaches the box through UserData (see stack.js), not the payload, so
+  // --app-only cannot change it.
+  CFG_PWA_NAME: config.pwa.name,
   // Which icon set this deployment installs on a home screen, and the files it
   // owes — both exported so deploy.sh copies a named list rather than a glob, and
   // the list lives only in pwa/manifest.webmanifest. loadConfig has already

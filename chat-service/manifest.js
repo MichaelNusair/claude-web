@@ -50,6 +50,120 @@ const ICONS = [
 
 const THEME_COLOR = '#141413';
 
+/*
+ * ---------------------------------------------------------------------------
+ * What this deployment calls itself
+ * ---------------------------------------------------------------------------
+ *
+ * One account can run this repository twice — two stacks, two hostnames, two
+ * phones' worth of icons that are the same code and not the same workspace. The
+ * icons differ (pwa.iconDir, see pwa-icons/README.md); this is the other half, the
+ * words. With `pwa.name` set, every title the app puts its own name in becomes
+ * "<name>: <project>": the label under a project's home screen icon, the browser
+ * tab, the editor's title bar. The chat app, which is not in a project, becomes the
+ * name on its own.
+ *
+ * Empty is the default and means today's behaviour exactly — a project is titled
+ * with the project, the chat app is "Claude". A single deployment has nothing to
+ * tell apart, and a prefix would only spend the twelve characters a phone gives a
+ * label under an icon.
+ */
+
+/**
+ * What a name may be, duplicated from PWA_NAME_PATTERN in infra/config.js.
+ *
+ * Duplicated rather than imported because this process is deployed without
+ * `infra/` — and re-checked rather than trusted because what arrives here is an
+ * environment variable, not that file. The values below are interpolated into an
+ * HTML <title> and serialised into a manifest, so a name from a hand-edited
+ * /etc/systemd unit must not be able to carry markup or a quote into either.
+ * manifest-test.js compares the two patterns and fails if they drift.
+ */
+const NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9 ._-]{0,23}$/;
+
+/** Said once rather than per request: this is a misconfiguration, not an event. */
+let warnedAboutName = false;
+
+/**
+ * This deployment's name, or '' for a deployment that has not been given one.
+ *
+ * Read per call rather than at import so the service picks up its environment as
+ * the unit sets it, and so a test can name a deployment and un-name it again.
+ *
+ * A value that does not match NAME_PATTERN is treated as no name at all. Mangling
+ * it into something legal would put a name nobody chose under every icon on a
+ * phone, which is worse than the default of the app being called what it has always
+ * been called.
+ */
+export function deploymentName() {
+  const raw = String(process.env.PWA_NAME || '').trim();
+  if (!raw) return '';
+  if (NAME_PATTERN.test(raw)) return raw;
+  if (!warnedAboutName) {
+    warnedAboutName = true;
+    console.warn(
+      `[manifest] ignoring PWA_NAME ${JSON.stringify(raw)} — a deployment name must be ` +
+        'at most 24 characters of letters, digits, spaces, dots, dashes or underscores. ' +
+        'Titles will name the project alone. Fix pwa.name in the deployment config.',
+    );
+  }
+  return '';
+}
+
+/** A project's title: "<deployment>: <project>", or the project alone when unnamed. */
+export function appTitle(project) {
+  const name = deploymentName();
+  return name ? `${name}: ${project}` : project;
+}
+
+/**
+ * The chat app's own manifest: pwa/manifest.webmanifest, wearing this deployment's
+ * name.
+ *
+ * Taken as an argument rather than read here because that file is not in this
+ * directory at runtime — server.js serves it out of public/ and hands it over on
+ * the way past. The `id` is deliberately untouched: it is app identity, and renaming
+ * an app must not orphan the icon already installed from it.
+ *
+ * Unnamed deployments get the object back exactly as it came, so the file is served
+ * byte for byte as shipped.
+ */
+export function chatManifest(base) {
+  const name = deploymentName();
+  if (!name) return base;
+  return { ...base, name, short_name: name };
+}
+
+/**
+ * The same name, in an HTML shell's title.
+ *
+ * Three shells reach a browser tab — the chat app, the login page, the box page —
+ * and each of them writes "Claude" where it means "this deployment's app". So the
+ * word is what gets replaced, which leaves each shell's own phrasing intact:
+ * "Sign in — Claude" becomes "Sign in — <name>" without the server having to know
+ * that page's sentence.
+ *
+ * `<meta name="deployment">` is the one addition rather than a replacement: it is
+ * how app.js learns the name, so a tab can read "<name>: <project>" once a project
+ * is on screen. It stays empty for an unnamed deployment, which is what the client
+ * reads as "prefix nothing".
+ */
+export function applyDeploymentName(html) {
+  const name = deploymentName();
+  if (!name) return html;
+  const rename = (text) => text.replace(/Claude/g, name);
+  return html
+    .replace(/<title>([^<]*)<\/title>/i, (_, title) => `<title>${rename(title)}</title>`)
+    .replace(
+      /(<meta name="apple-mobile-web-app-title" content=")([^"]*)(")/i,
+      (_, before, title, after) => `${before}${rename(title)}${after}`,
+    )
+    .replace(
+      /(<meta name="deployment" content=")([^"]*)(")/i,
+      (_, before, _content, after) => `${before}${name}${after}`,
+    );
+}
+
 /**
  * The path a project's window lives under, which is the whole reason it can be its
  * own app.
@@ -88,9 +202,11 @@ export function projectStartUrl(project, path) {
 /**
  * The manifest for one project.
  *
- * `short_name` is what Android writes under the icon, so it is the bare project
- * name; `name` is the longer label used in the installer and app info, and says
- * what the thing is.
+ * `short_name` is what Android writes under the icon, so it is the project and
+ * nothing else it can do without — on a deployment with a name of its own that is
+ * "<name>: <project>", because two deployments' icons for the same project are
+ * otherwise the same word twice. `name` is the longer label used in the installer
+ * and app info, and says what the thing is.
  *
  * Two deliberate omissions:
  *   - `orientation`. The chat app asks for portrait; a workbench is used in both,
@@ -102,12 +218,14 @@ export function projectStartUrl(project, path) {
  */
 export function projectManifest({ project, path }) {
   const home = projectWindowPath(project);
+  const title = appTitle(project);
   return {
     // The path, not the start_url: an id is app identity, and identity should not
-    // change if the folder a project lives in ever moves.
+    // change if the folder a project lives in ever moves. Nor when the deployment
+    // is renamed, which is why the name below is not in here.
     id: home,
-    name: `${project} — Claude Code`,
-    short_name: project,
+    name: `${title} — Claude Code`,
+    short_name: title,
     description: `Claude Code in ${project}, in a window of its own`,
     start_url: projectStartUrl(project, path),
     /*

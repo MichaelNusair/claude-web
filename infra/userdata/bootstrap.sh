@@ -32,6 +32,14 @@ DEFAULT_MODEL="__DEFAULT_MODEL__"
 # shell. Configurable so a deployment can choose `acceptEdits` or `plan`.
 PERMISSION_MODE="__PERMISSION_MODE__"
 EFFORT_LEVEL="__EFFORT_LEVEL__"
+# What this deployment calls itself, in front of every title the app shows: the
+# label under a project's home screen icon, the browser tab, the editor window.
+# Empty means one deployment with nothing to tell apart, and titles name the
+# project alone. It reaches the chat service as PWA_NAME (see the unit below) and
+# the editor as window.title. infra/config.js restricts it to a short plain label
+# of letters, digits, spaces, dots, dashes and underscores, which is what makes it
+# safe to put in a systemd Environment line and a JSON settings file from here.
+PWA_NAME="__PWA_NAME__"
 
 USER_NAME="coder"
 DATA_MNT="/workspace"
@@ -511,9 +519,21 @@ cat > /tmp/mobile-defaults.json <<'SETTINGS'
 SETTINGS
 
 SETTINGS_FILE="$DATA_MNT/code-server-data/User/settings.json"
-python3 - "$SETTINGS_FILE" /tmp/mobile-defaults.json <<'MERGE'
+
+# What the editor window calls itself, which is a setting rather than something the
+# overlay can do: code-server writes document.title from `window.title` and rewrites
+# it on every editor change, so anything set from JavaScript is overwritten within
+# seconds. ${rootName} is the open folder — the project — and ${activeEditorShort}
+# the file, so a tab reads "name: project - file.js". Those are code-server's own
+# variables, hence the single quotes: this shell must not expand them.
+WINDOW_TITLE=""
+if [ -n "$PWA_NAME" ]; then
+  WINDOW_TITLE="$PWA_NAME"': ${rootName}${separator}${activeEditorShort}'
+fi
+
+python3 - "$SETTINGS_FILE" /tmp/mobile-defaults.json "$WINDOW_TITLE" <<'MERGE'
 import json, sys, os
-target, defaults_path = sys.argv[1], sys.argv[2]
+target, defaults_path, window_title = sys.argv[1], sys.argv[2], sys.argv[3]
 defaults = json.load(open(defaults_path))
 current = {}
 if os.path.exists(target):
@@ -523,6 +543,15 @@ if os.path.exists(target):
         current = {}  # corrupt file: fall back to defaults rather than fail
 # Existing values win, so anything changed in the editor is preserved.
 merged = {**defaults, **current}
+# The window title is the exception: assigned when the deployment has a name and
+# removed when it does not, rather than merely defaulted. This file lives on the
+# persistent data volume and outlives every deploy, so a value the config no longer
+# asks for would otherwise be permanent — the same reason the CLI settings below are
+# assigned rather than setdefault'd.
+if window_title:
+    merged['window.title'] = window_title
+else:
+    merged.pop('window.title', None)
 with open(target, 'w') as fh:
     json.dump(merged, fh, indent=2)
 print(f"settings merged: {len(defaults)} defaults, {len(current)} existing")
@@ -994,6 +1023,11 @@ Environment=CODER_HOME=/home/$USER_NAME
 Environment=PORT=9997
 Environment=PROJECTS_ROOT=$DATA_MNT/projects
 Environment=CLAUDE_HOME=$DATA_MNT/claude
+# What the app calls itself. The chat service puts it in front of every title it
+# serves — the manifests, so a home screen icon says which deployment it opens, and
+# the HTML shells, so a browser tab does too. Quoted because a name may contain a
+# space, and empty is the single-deployment default rather than a missing value.
+Environment="PWA_NAME=$PWA_NAME"
 Environment=CLAUDE_CODE_USE_BEDROCK=1
 Environment=AWS_REGION=$REGION
 Environment=ANTHROPIC_MODEL=$DEFAULT_MODEL

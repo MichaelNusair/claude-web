@@ -27,7 +27,12 @@ import {
   SILENT_WAV,
 } from './speak.js';
 import { claudeStatus } from './claude-status.js';
-import { manifestForProject } from './manifest.js';
+import {
+  manifestForProject,
+  chatManifest,
+  applyDeploymentName,
+  deploymentName,
+} from './manifest.js';
 import { vapidPublicKey, addSubscription, removeSubscription, listSubscriptions, notifyAll, topicFor } from './push.js';
 import { startTurnWatcher } from './turn-watcher.js';
 import { createAdmin } from './admin.js';
@@ -157,10 +162,31 @@ async function serveStatic(req, res, pathname) {
     if (file.endsWith('.html')) {
       const v = await getAssetVersion();
       data = Buffer.from(
-        data
-          .toString()
-          .replace(/(src|href)="(\/chat\/[A-Za-z0-9._-]+\.(?:js|css))"/g, `$1="$2?v=${v}"`),
+        applyDeploymentName(
+          data
+            .toString()
+            .replace(/(src|href)="(\/chat\/[A-Za-z0-9._-]+\.(?:js|css))"/g, `$1="$2?v=${v}"`),
+        ),
       );
+    }
+
+    /*
+     * The chat app's own manifest, wearing this deployment's name — the icon on a
+     * home screen says which deployment it opens, the way a project's does.
+     *
+     * Rewritten here rather than at deploy time, and rather than through a route of
+     * its own, so it stays one file: pwa/manifest.webmanifest is what ships, and the
+     * name is the only thing this process knows that the file cannot. Guarded on the
+     * name so an unnamed deployment serves those bytes untouched rather than a
+     * re-serialised copy of them.
+     */
+    if (file.endsWith('.webmanifest') && deploymentName()) {
+      try {
+        data = Buffer.from(`${JSON.stringify(chatManifest(JSON.parse(data.toString())), null, 2)}\n`);
+      } catch {
+        // Not JSON, so not something to rename. Serve it as it is: a manifest that
+        // installs under the wrong name beats no manifest at all.
+      }
     }
 
     // Revalidate app code and the shell on every load. A stale app.js paired
@@ -178,7 +204,9 @@ async function serveStatic(req, res, pathname) {
     try {
       const shell = await readFile(join(PUBLIC_DIR, 'index.html'));
       res.writeHead(200, { 'Content-Type': MIME['.html'], 'Cache-Control': 'no-cache' });
-      res.end(shell);
+      // Named here too: a tab that opened on an unknown path is still this
+      // deployment's app, and the client reads its own name out of this shell.
+      res.end(applyDeploymentName(shell.toString()));
     } catch {
       json(res, 404, { error: 'not found' });
     }

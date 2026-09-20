@@ -118,6 +118,30 @@ const DEFAULTS = {
 
   pwa: {
     /**
+     * What this deployment calls itself, in front of every title the app shows.
+     *
+     * The icon below is how two deployments look different on a home screen; this
+     * is how they read differently. Every title the app puts its name in becomes
+     * "<name>: <project>" — the label under a project's icon, the browser tab, the
+     * editor window — and the chat app's own icon becomes the name on its own. Set
+     * it to what you call the deployment, e.g. "work".
+     *
+     * Empty is the default and means today's behaviour: a project's window is
+     * titled with the project, and the chat app is "Claude". A single deployment
+     * has nothing to tell apart, and prefixing every title there would only cost
+     * room on a phone.
+     *
+     * Deliberately narrow: letters, digits, spaces, dot, dash, underscore, up to 24
+     * characters. This value is substituted into UserData by sed, written into a
+     * systemd Environment line, serialised into a web app manifest and interpolated
+     * into an HTML <title>, and a label short enough to fit under an icon needs
+     * none of those four to have an escaping rule of its own. Android truncates a
+     * home-screen label at around 12 characters anyway, so shorter is better than
+     * merely legal.
+     */
+    name: '',
+
+    /**
      * Which set of installable-app icons ships with the chat UI.
      *
      * A second deployment is a second icon on the same phone's home screen — same
@@ -229,6 +253,17 @@ const ENV_MAP = {
   CLAUDE_WEB_GIT_USER_NAME: 'gitUserName',
   CLAUDE_WEB_GIT_USER_EMAIL: 'gitUserEmail',
 };
+
+/**
+ * What a deployment may call itself, as one pattern both ends share.
+ *
+ * Exported because the chat service enforces the same thing again at runtime and
+ * cannot import this file — it is deployed without `infra/` — so the two copies are
+ * kept honest by a test instead (see chat-service/manifest-test.js). The shape:
+ * starts with a letter or digit, then letters, digits, spaces, dots, dashes or
+ * underscores, 24 characters at most.
+ */
+export const PWA_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9 ._-]{0,23}$/;
 
 const VALID_AUTH_MODES = ['password', 'oidc'];
 const VALID_PERMISSION_MODES = ['bypassPermissions', 'acceptEdits', 'plan', 'default'];
@@ -386,6 +421,26 @@ export function loadConfig() {
       fail(`${key} must be a whole number of GiB, at least 8. Got ${JSON.stringify(value)}.`);
     }
   }
+
+  // --- What this deployment is called --------------------------------------
+  // The pattern is the whole safety story for this value. It travels through a sed
+  // replacement in UserData, a systemd Environment line, a JSON manifest and an
+  // HTML <title>, and rejecting anything that is not a plain short label here means
+  // no link in that chain needs an escaping rule — see PWA_NAME_PATTERN and
+  // deploymentName() in chat-service/manifest.js, which sanitises again rather than
+  // trusting a box whose env file was edited by hand.
+  const pwaName = String(config.pwa.name || '').trim();
+  if (pwaName && !PWA_NAME_PATTERN.test(pwaName)) {
+    fail(
+      `pwa.name ${JSON.stringify(config.pwa.name)} is not a name this can use. Give a ` +
+        'short label of letters, digits, spaces, dots, dashes or underscores — at most ' +
+        '24 characters, starting with a letter or digit, e.g. "work". It is prefixed to ' +
+        'every title the app shows ("work: my-project"), so it has to survive being put ' +
+        'in a manifest, an HTML title and a systemd unit. Leave it empty for a single ' +
+        'deployment, which titles windows with the project alone.',
+    );
+  }
+  config.pwa.name = pwaName;
 
   // --- PWA icons -----------------------------------------------------------
   // Checked here rather than at the copy in deploy.sh because this is the error
