@@ -431,7 +431,15 @@ cp dist/claude-voice.vsix dist/claude-mobile.vsix dist/stage/vsix/
 # The chat UI serves its own PWA assets, so bundle them into its public dir.
 cp pwa/manifest.webmanifest pwa/sw.js pwa/reset.html dist/stage/chat-service/public/
 mkdir -p dist/stage/chat-service/public/pwa-icons
-cp pwa-icons/*.png dist/stage/chat-service/public/pwa-icons/
+# Which icon set, from the config: two deployments of this repository are two apps
+# on the same phone, and an icon is how you tell them apart. Named files rather
+# than a glob so the set can keep its source artwork next to it, and so a missing
+# one is an error here instead of an icon that silently does not exist on a home
+# screen — config.js has already checked all of them are present.
+for icon in $CFG_PWA_ICON_FILES; do
+  cp "$CFG_PWA_ICON_DIR/$icon" dist/stage/chat-service/public/pwa-icons/
+done
+echo "  icons: $CFG_PWA_ICON_DIR"
 # COPYFILE_DISABLE stops macOS tar from emitting AppleDouble `._*` companions for
 # every file carrying an extended attribute (macOS adds com.apple.provenance to
 # downloaded and newly written files). Those stubs land on the instance, show up

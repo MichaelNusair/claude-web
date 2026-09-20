@@ -159,6 +159,46 @@ ok(
 ok(demo.theme_color === base.theme_color, 'the theme colour drifted from the chat app');
 ok(demo.background_color === base.background_color, 'the background colour drifted from the chat app');
 
+section('Every icon set on disk can answer that manifest, whichever one a deployment picks:');
+/*
+ * The icons are the one asset that differs per deployment — two deployments of this
+ * repository are two apps on the same phone, and `pwa.iconDir` in the config is
+ * which set ships (see pwa-icons/README.md). The config that picks a set is
+ * gitignored, so no test can check the choice; what a test can check is that every
+ * set present is complete, because the alternative is finding out from a phone. An
+ * install whose icon 404s is not an install, and the deploy that shipped it says
+ * nothing.
+ *
+ * Sizes are read from the PNG header rather than trusted: a 512 declared and 192
+ * delivered is the same broken install, arriving more quietly.
+ */
+const ICON_ROOT = path.join(root, 'pwa-icons');
+const iconSets = [
+  ICON_ROOT,
+  ...fs.readdirSync(ICON_ROOT, { withFileTypes: true })
+    .filter((e) => e.isDirectory())
+    .map((e) => path.join(ICON_ROOT, e.name)),
+];
+/** Width and height out of a PNG's IHDR, which is always the first chunk. */
+const pngSize = (file) => {
+  const head = fs.readFileSync(file).subarray(0, 24);
+  return { width: head.readUInt32BE(16), height: head.readUInt32BE(20) };
+};
+for (const set of iconSets) {
+  const setName = path.relative(root, set);
+  for (const icon of base.icons) {
+    const file = path.join(set, icon.src.split('/').pop());
+    const present = fs.existsSync(file);
+    ok(present, `${setName} is missing ${icon.src.split('/').pop()}, so a deployment using it installs without an icon`);
+    if (!present) continue;
+    const { width, height } = pngSize(file);
+    ok(
+      `${width}x${height}` === icon.sizes,
+      `${setName}/${path.basename(file)} is ${width}x${height} but the manifest promises ${icon.sizes}`,
+    );
+  }
+}
+
 section('And the chat app leaves the projects alone, which is the other half of it:');
 /*
  * A path per project was necessary and still not sufficient, because the chat app

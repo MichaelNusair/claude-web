@@ -10,7 +10,7 @@
  * On invalid config it prints a shell snippet that reports the error and exits
  * non-zero, so `eval "$(node infra/print-config.js)"` fails loudly.
  */
-import { loadConfig } from './config.js';
+import { loadConfig, requiredPwaIcons } from './config.js';
 
 /** Single-quote for the shell, escaping embedded single quotes safely. */
 const shellQuote = (value) => `'${String(value).replace(/'/g, `'\\''`)}'`;
@@ -42,6 +42,12 @@ const exported = {
   CFG_SECURITY_STACK: config.security.stackName,
   CFG_SECURITY_CLOUDTRAIL: config.security.cloudTrail,
   CFG_SECURITY_GUARDDUTY: config.security.guardDuty,
+  // Which icon set this deployment installs on a home screen, and the files it
+  // owes — both exported so deploy.sh copies a named list rather than a glob, and
+  // the list lives only in pwa/manifest.webmanifest. loadConfig has already
+  // checked they are all there.
+  CFG_PWA_ICON_DIR: config.pwa.iconDir,
+  CFG_PWA_ICON_FILES: requiredPwaIcons().join(' '),
   CFG_DEPLOY_INSTANCE: config.deployFrom.instanceId,
   CFG_DEPLOY_PATH: config.deployFrom.repoPath,
   CFG_DEPLOY_USER: config.deployFrom.user,

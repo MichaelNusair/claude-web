@@ -116,6 +116,24 @@ const DEFAULTS = {
   /** "low" | "medium" | "high" | "xhigh" | "max" — max is the highest there is. */
   effortLevel: 'max',
 
+  pwa: {
+    /**
+     * Which set of installable-app icons ships with the chat UI.
+     *
+     * A second deployment is a second icon on the same phone's home screen — same
+     * code, different product — so the icons cannot be a constant. This names a
+     * directory in this repository holding the files pwa/manifest.webmanifest
+     * asks for; the default set is `pwa-icons`, and a variant is a subdirectory of
+     * it, e.g. "pwa-icons/ribbon". See pwa-icons/README.md.
+     *
+     * The icons are tracked in git even though the config that selects them is
+     * not, because deploy.sh ships the tree the deploy box checked out from
+     * origin/main: an untracked icon would quietly become the default one there,
+     * and the deploy would report success over the wrong icon.
+     */
+    iconDir: 'pwa-icons',
+  },
+
   gitUserName: 'Claude Web',
   gitUserEmail: 'claude-web@example.invalid',
 
@@ -219,6 +237,29 @@ function fail(message) {
   throw new Error(`Invalid configuration: ${message}`);
 }
 
+/**
+ * The icon files a deployment must ship, read out of the manifest rather than
+ * listed here.
+ *
+ * pwa/manifest.webmanifest is the contract with the browser: it names each icon
+ * by path, and an install whose icon 404s is not an install. Two lists of those
+ * filenames — one in the manifest, one wherever the copy happens — drift the
+ * moment a size is added, and the symptom is a home screen icon that is missing
+ * on one deployment only. So there is one list, and this reads it.
+ */
+export function requiredPwaIcons() {
+  const file = join(REPO_ROOT, 'pwa', 'manifest.webmanifest');
+  let manifest;
+  try {
+    manifest = JSON.parse(readFileSync(file, 'utf8'));
+  } catch (err) {
+    fail(`${file} could not be read, so the icons a deployment needs are unknown — ${err.message}`);
+  }
+  const names = (manifest.icons || []).map((icon) => String(icon.src).split('/').pop());
+  if (!names.length) fail(`${file} declares no icons, so nothing it installs would have one.`);
+  return [...new Set(names)];
+}
+
 export function loadConfig() {
   const file = configPath();
   let fromFile = {};
@@ -240,6 +281,7 @@ export function loadConfig() {
     ...fromFile,
     oidc: { ...DEFAULTS.oidc, ...(fromFile.oidc || {}) },
     landing: { ...DEFAULTS.landing, ...(fromFile.landing || {}) },
+    pwa: { ...DEFAULTS.pwa, ...(fromFile.pwa || {}) },
     deployFrom: { ...DEFAULTS.deployFrom, ...(fromFile.deployFrom || {}) },
     security: { ...DEFAULTS.security, ...(fromFile.security || {}) },
   };
@@ -343,6 +385,30 @@ export function loadConfig() {
     if (!Number.isInteger(value) || value < 8) {
       fail(`${key} must be a whole number of GiB, at least 8. Got ${JSON.stringify(value)}.`);
     }
+  }
+
+  // --- PWA icons -----------------------------------------------------------
+  // Checked here rather than at the copy in deploy.sh because this is the error
+  // worth having early: the alternative is a deploy that goes green and an icon
+  // that is missing on a phone, where nobody is reading a log.
+  const iconDir = String(config.pwa.iconDir || '').trim();
+  if (!iconDir || iconDir.startsWith('/') || iconDir.split('/').includes('..')) {
+    fail(
+      `pwa.iconDir ${JSON.stringify(config.pwa.iconDir)} must be a directory inside this ` +
+        'repository, relative to its root — "pwa-icons" for the default set, or a ' +
+        'subdirectory of it for a deployment of your own, e.g. "pwa-icons/ribbon". ' +
+        'See pwa-icons/README.md.',
+    );
+  }
+  config.pwa.iconDir = iconDir;
+  const missingIcons = requiredPwaIcons().filter((name) => !existsSync(join(REPO_ROOT, iconDir, name)));
+  if (missingIcons.length) {
+    fail(
+      `pwa.iconDir "${iconDir}" is missing ${missingIcons.join(', ')}, which ` +
+        'pwa/manifest.webmanifest names. A manifest whose icons 404 is not installable, ' +
+        'so the app would stop being addable to a home screen. Add the files, or point ' +
+        'pwa.iconDir at a set that has them.',
+    );
   }
 
   // --- Landing site (optional) ---------------------------------------------

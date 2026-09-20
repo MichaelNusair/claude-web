@@ -98,6 +98,21 @@
   "permissionMode": "bypassPermissions",
   "effortLevel": "max",
 
+  "$comment_pwa": [
+    "Which set of home screen icons the installable app ships with. Directory in",
+    "this repository, relative to its root: 'pwa-icons' is the default set, and a",
+    "subdirectory of it is a set of your own, e.g. 'pwa-icons/ribbon'. It must",
+    "contain every file pwa/manifest.webmanifest names — a deploy refuses",
+    "otherwise, because an icon that 404s is an app that cannot be installed.",
+    "",
+    "Only worth changing if you run more than one deployment of this repository:",
+    "they are two apps on one phone, and the icon is how you tell them apart.",
+    "See pwa-icons/README.md."
+  ],
+  "pwa": {
+    "iconDir": "pwa-icons"
+  },
+
   "$comment_git": "Author on commits Claude makes in the workspace.",
   "gitUserName": "Your Name",
   "gitUserEmail": "you@example.com",

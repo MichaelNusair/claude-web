@@ -159,7 +159,7 @@ CLAUDE_WEB_CONFIG=$PWD/claude-web.work.config.json ./deploy.sh --app-only
 `CLAUDE_WEB_CONFIG` is read by `infra/config.js`, which every script and the CDK app
 load their settings through.
 
-Three things to know, each of which is a mistake someone would otherwise make once:
+Four things to know, each of which is a mistake someone would otherwise make once:
 
 - **The deploy box needs a second checkout, not a second flag.** `deploy.sh` reads
   `claude-web.config.json` from the tree it runs in, and `deploy-remote.sh` resets
@@ -175,6 +175,14 @@ Three things to know, each of which is a mistake someone would otherwise make on
   — otherwise the deploy succeeds and the provider refuses the login with
   `redirect_uri_mismatch`, which is a failure that happens at Google rather than on
   your box and so appears nowhere in its logs.
+- **Give the second one its own icon, and track it.** Installed on a phone, two
+  deployments of this repository are two apps with the same picture and the same
+  name. `pwa.iconDir` picks the set that ships — `pwa-icons` by default, or a
+  subdirectory of it holding every file `pwa/manifest.webmanifest` names
+  (`pwa-icons/README.md` has the sizes and the maskable safe area). Commit the set:
+  the config that selects it is gitignored, but a full deploy ships what the deploy
+  box checked out from `origin/main`, so an untracked directory there means the
+  default icons and a deploy that reports success anyway.
 - **Separate stacks are not separate blast radii.** With
   `instanceAdminAccess: true` on either deployment, that box's role is
   AdministratorAccess over the whole account — the other deployment included. If the
