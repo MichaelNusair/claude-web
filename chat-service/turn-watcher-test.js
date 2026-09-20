@@ -192,14 +192,38 @@ section('A finished turn, on a session this app is not driving:');
 
   // Same answer, transcript rewritten. Claude Code appends bookkeeping entries
   // after a turn ends, so this happens on its own within seconds of every reply.
-  await write(DEMO, S1, userText('and now?'), assistant('All three features are in, and the suite is green.'), JSON.stringify({ type: 'ai-title', title: 'shipping three features' }));
+  // The `ai-title` entry is spelled the way the CLI spells it — `aiTitle`, and not
+  // the `title` this fixture invented until 2026-09-20, which quietly asserted
+  // nothing.
+  await write(
+    DEMO,
+    S1,
+    userText('and now?'),
+    assistant('All three features are in, and the suite is green.'),
+    JSON.stringify({ type: 'ai-title', aiTitle: 'shipping three features', sessionId: S1 }),
+  );
   await watcher.scan();
   ok(sent.length === 1, 'the same message was announced twice');
 
-  await write(DEMO, S1, userText('one more'), assistant('Done — pushed and deployed.'));
+  // The conversation goes on, and the name written after the previous turn stays
+  // where it was — behind the newest exchange, which is where a reader walking
+  // backwards has to keep going to find it.
+  await write(
+    DEMO,
+    S1,
+    userText('and now?'),
+    assistant('All three features are in, and the suite is green.'),
+    JSON.stringify({ type: 'ai-title', aiTitle: 'shipping three features', sessionId: S1 }),
+    userText('one more'),
+    assistant('Done — pushed and deployed.'),
+  );
   await watcher.scan();
   ok(sent.length === 2, 'a genuinely new answer in the same conversation was not announced');
   ok(sent[1].payload.body === 'Done — pushed and deployed.', 'the second notification carries the wrong text');
+  // A notification names the conversation it is about, which is the whole of what
+  // distinguishes two lock-screen entries from the same project.
+  ok(sent[1].payload.conversation === 'shipping three features',
+    `the notification does not say which conversation finished: ${JSON.stringify(sent[1].payload.conversation)}`);
 }
 
 section('A turn that is still going says nothing:');

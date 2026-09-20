@@ -2376,7 +2376,7 @@ const marked = 'Done with my half. Here is where things stand.\n\n**Shipped** th
 statusReply = {
   ...answer(marked),
   conversations: [
-    { sessionId: 'abc123', state: 'idle', said: marked, at: Date.now() },
+    { sessionId: 'abc123', state: 'idle', title: 'Naming the windows', said: marked, at: Date.now() },
     { sessionId: 'def456', state: 'idle', said: '## Heading\n\nA second one.', at: Date.now() },
   ],
 };
@@ -2395,13 +2395,26 @@ ok(
     doc.getElementById('cmo-chip')?.querySelector('.cmo-chip-text')?.textContent ?? '',
   ),
 );
-const listText = [...doc.querySelectorAll('#cmo-convos .cmo-convo-label')]
-  .map((el) => el.textContent)
-  .join(' | ');
+/*
+ * The list is titles, and nothing else.
+ *
+ * It used to fall back to the opening of the last message, which read as a list of
+ * five rows all starting "Done —" and, worse, made a real bug invisible: the title
+ * was read from a field the CLI does not write, so every row took the fallback and
+ * the list looked wordy rather than broken. A row with no title now says so.
+ */
+const labels = [...doc.querySelectorAll('#cmo-convos .cmo-convo-label')].map((el) => el.textContent);
 ok(
-  'the conversation list shows raw markdown — the list is where a stray ** was ' +
-    'noticed on the phone',
-  listText && !/[*`#]/.test(listText),
+  `the titled conversation is not listed under its title: ${JSON.stringify(labels[0])}`,
+  labels[0] === 'Naming the windows',
+);
+ok(
+  `a conversation with no title is labelled with its last message: ${JSON.stringify(labels[1])}`,
+  labels[1] === 'Untitled conversation',
+);
+ok(
+  'the list quotes what was said somewhere in a row label',
+  !labels.join(' | ').includes('Heading') && !labels.join(' | ').includes('Done with my half'),
 );
 
 /*

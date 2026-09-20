@@ -1720,16 +1720,17 @@
   }
 
   /**
-   * A name for a conversation.
+   * A name for a conversation: Claude Code's own title, or nothing.
    *
-   * Claude Code's own title where there is one — it is written into the transcript
-   * as the conversation grows — and otherwise the opening of what was last said,
-   * which is what people recognise a conversation by anyway.
+   * The opening of the last message used to stand in for a missing title, and a
+   * list of those is unreadable — five rows all beginning "Done —" name nothing,
+   * and the row you want is the one whose subject you remember. It also hid a bug
+   * for a week: the title never arrived at all (see `aiTitle` in claude-status.js)
+   * and the list looked merely wordy rather than broken. So a conversation with no
+   * title says so, and the message stays in the sheet below where it belongs.
    */
   function nameOf(c) {
-    if (c?.title) return c.title;
-    const line = plainLine(c?.said || c?.last?.text || '');
-    return line ? line.slice(0, 48) : 'Untitled conversation';
+    return c?.title || 'Untitled conversation';
   }
 
   /** A single line: what it is doing, or the first of what it said. */

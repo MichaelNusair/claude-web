@@ -217,6 +217,21 @@ const textOf = (message) => {
 export async function lastExchange(file, windows = TAIL_WINDOWS) {
   let meta = null;
 
+  /*
+   * Everything except the message itself outlives the window it was found in.
+   *
+   * Every window ends at the end of the file, so a name or a state read from a
+   * narrow one is the same one a wider one would find again — and the walk is
+   * backwards, so the first `ai-title` it meets is the newest. Declaring these
+   * inside the loop instead meant the fallback return below reported `null` for a
+   * name it had already read: a conversation working through a long tool result,
+   * with its last text message further back than the window but its name 1.6KB
+   * from the end, was listed as "Untitled conversation". Observed 2026-09-20.
+   */
+  let state = null;
+  let title = null;
+  let cutOff = null;
+
   for (const bytes of windows) {
     let tail;
     try {
@@ -227,10 +242,7 @@ export async function lastExchange(file, windows = TAIL_WINDOWS) {
     meta = { size: tail.size, mtimeMs: tail.mtimeMs };
 
     const lines = tail.text.split('\n');
-    let state = null;
     let last = null;
-    let title = null;
-    let cutOff = null;
 
     for (let i = lines.length - 1; i >= 0; i -= 1) {
       if (!lines[i].trim()) continue;
@@ -244,8 +256,16 @@ export async function lastExchange(file, windows = TAIL_WINDOWS) {
       // What Claude Code called this conversation. Written as an `ai-title` entry
       // and rewritten as the conversation grows, so it is usually in the tail —
       // usually, not always, which is why every caller has a fallback label.
-      if (!title && entry.type === 'ai-title' && typeof entry.title === 'string') {
-        title = entry.title.trim() || null;
+      //
+      // The name is in `aiTitle`, not `title`: the entry is
+      // `{"type":"ai-title","aiTitle":"…","sessionId":"…"}`. Reading `title` here
+      // is what shipped until 2026-09-20, and it never once matched — 3,853
+      // `ai-title` entries on this box, none with a bare `title` — so every
+      // conversation came back unnamed and the overlay list fell back to showing
+      // the last thing said. It went unnoticed because the fixtures that covered
+      // it were written from this line rather than from a transcript.
+      if (!title && entry.type === 'ai-title' && typeof entry.aiTitle === 'string') {
+        title = entry.aiTitle.trim() || null;
       }
       if (entry.type !== 'assistant' && entry.type !== 'user') continue;
 
@@ -274,7 +294,9 @@ export async function lastExchange(file, windows = TAIL_WINDOWS) {
     // Nothing sayable in this window and there is more file behind it: widen.
   }
 
-  return { state: 'unknown', last: null, title: null, cutOff: null, ...meta };
+  // "Unknown" only when the windows really said nothing. A state read from one of
+  // them is knowledge, and reporting it as ignorance sends a device to ask again.
+  return { state: state || 'unknown', last: null, title, cutOff, ...meta };
 }
 
 /** Every conversation in a project, newest first. One `stat` each, no reads. */

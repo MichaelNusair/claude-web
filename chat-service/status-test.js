@@ -260,15 +260,18 @@ section('Which conversation the answer is about, when a project holds several:')
  */
 const OTHER = 'b2c3d4e5-1111-4000-8000-000000000000';
 const OTHER_FILE = path.join(PROJECT_DIR, `${OTHER}.jsonl`);
-const title = (text) => JSON.stringify({ type: 'ai-title', title: text });
+// Exactly as the CLI writes it, field names included. A fixture invented to match
+// the reader only proves that the reader agrees with itself: this one said `title`
+// and so did the reader, and neither spelling ever appeared on a real transcript.
+const title = (text, id) => JSON.stringify({ type: 'ai-title', aiTitle: text, sessionId: id });
 const writeConvo = (file, ...lines) => fs.writeFileSync(file, `${lines.join('\n')}\n`);
 const older = (file) => {
   const when = new Date(Date.now() - 60 * 1000);
   fs.utimesSync(file, when, when);
 };
 
-writeConvo(TRANSCRIPT, title('The one on screen'), assistant('what this conversation last said'));
-writeConvo(OTHER_FILE, title('The other one'), assistant('what the other one last said'));
+writeConvo(TRANSCRIPT, title('The one on screen', SESSION), assistant('what this conversation last said'));
+writeConvo(OTHER_FILE, title('The other one', OTHER), assistant('what the other one last said'));
 // The conversation being asked about is deliberately the OLDER file, so that an
 // answer which merely takes the newest transcript fails here.
 older(TRANSCRIPT);
