@@ -205,6 +205,49 @@ cd infra && npx cdk synth --quiet
 If you add a route to `server.js`, add it to the `guarded` list in
 `auth-test.js`. A route with no test is a route nobody is checking.
 
+## The box you are on
+
+**You have passwordless `sudo`. Install whatever the job needs.** A headless browser,
+a compiler, a language runtime, a font, a CLI — do not work around a missing package
+and do not ask the user to install it for you.
+
+```bash
+sudo dnf install -y <package>       # Amazon Linux 2023, so dnf
+sudo npx playwright install-deps    # the shared libraries a headless browser links against
+npx playwright install chromium     # the browser itself — no root; it lands in ~/.cache
+```
+
+This is written down because the previous state was invisible from inside a session and
+cost real work. Until 2026-09-21 the workspace account (`coder`) was deliberately outside
+sudoers, so an agent told to drive a browser got exactly as far as downloading one and
+then failed on its system libraries, which are RPMs. The reported symptom was always
+"I can't install browsers, I don't have sudo" — and nothing in the repository said
+whether that was policy or oversight, so each agent rediscovered the wall and stopped.
+It was an oversight. `bootstrap.sh` now writes `/etc/sudoers.d/90-coder`, validates it
+with `visudo` before installing it, and then asks `sudo -l` whether the grant is
+actually live, so a deploy cannot report success over an account that still cannot
+install anything.
+
+Two things to know about it:
+
+- **It does not widen the threat model.** `coder` owns `/opt/claude-web`, so it already
+  controlled the code the chat service's unit executes, and every session here already
+  runs `claude` under `bypassPermissions`. There is no second account on this box to
+  protect. [docs/SECURITY.md](docs/SECURITY.md) has always said that anyone past the
+  login page has a shell; this stops pretending that shell was fenced. What it does
+  mean is that **prompt injection now reaches root**, which changes the cleanup story
+  rather than the reachability one — that is the row it earns in the threat model, and
+  it is there.
+- **What you install by hand is not permanent.** `/home` and `/` are the root volume;
+  only `/workspace` persists, with `~/.claude` symlinked into it. A normal deploy or a
+  stop/start keeps your packages, but an *instance replacement* (a full deploy that
+  changes UserData) hands you a fresh root volume, and both the RPMs and anything
+  under `~/.cache` are gone. So if a tool needs to be there on every box rather than
+  just this one, add it to the package list at the top of
+  [`infra/userdata/bootstrap.sh`](infra/userdata/bootstrap.sh) — in the optional
+  `|| echo` group if the build does not depend on it — and ship that. Installing it
+  by hand is the right answer for a one-off and the wrong one for a dependency.
+
 ## Repository map
 
 ```

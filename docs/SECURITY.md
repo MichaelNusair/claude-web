@@ -5,7 +5,8 @@ Read this before you expose a deployment to the internet.
 ## What this software actually is
 
 A web page that runs shell commands on a server you own, as a user that can
-read and write every repository on it.
+read and write every repository on it — and, since 2026-09-21, become root on it
+without a password.
 
 That is the product, not a side effect. Claude Code is given a working directory
 and permission to act, and the whole point is that you can send it a message
@@ -38,6 +39,20 @@ What it explicitly does **not** defend against:
   execute with the same privileges you have. This is the sharpest edge in the
   product and it has no clean mitigation — see *Reducing the blast radius*.
 - A malicious dependency in a repo on the workspace.
+- **Privilege separation on the instance. There is none, deliberately.** The
+  workspace user has passwordless `sudo`, because a workspace that cannot
+  `dnf install` cannot do the work — a headless browser was the case that forced
+  it, since the browser downloads fine and its system libraries do not. Read the
+  trade honestly in both directions. It buys nothing back to withhold: `coder`
+  owns `/opt/claude-web`, so it already decides what the chat service's unit
+  executes on its next restart, and there is no second account here to shield.
+  But it does mean the two items above land as **root** rather than as a user,
+  and root is where the difference shows up — not in what an attacker can reach
+  (they could already run anything as `coder`, read every repo, and use the
+  instance profile) but in what they can *keep*: a systemd unit, a package, a
+  changed `/etc`, something that survives a restart and outlives the session that
+  planted it. Treat a compromised workspace as an instance to replace, not one to
+  clean, and keep `/workspace` in mind as the part that gets carried across.
 
 ## How authentication works
 

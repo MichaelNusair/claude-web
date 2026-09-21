@@ -22,6 +22,13 @@ The short version, if you read nothing else:
   change that is only app payload (`chat-service`, `pwa`, the extensions,
   `infra/userdata`). Either way both paths ship more than your diff and more than one
   agent works here at once, so run `git status` first and say what you are shipping.
+- **You have passwordless `sudo` on this box — install whatever you need.**
+  `sudo dnf install -y …`; for a headless browser, `sudo npx playwright install-deps`
+  and then `npx playwright install chromium`. Do not route around a missing package
+  or ask the user to install it. Anything a *deployment* depends on belongs in the
+  package list in `infra/userdata/bootstrap.sh` instead, because an instance
+  replacement gives you a fresh root volume and only `/workspace` survives it.
+  [AGENTS.md](AGENTS.md#the-box-you-are-on) has the rest.
 - This app runs shell commands on behalf of whoever is logged in. An
   authentication gap here is remote code execution. It has happened once already;
   [docs/SECURITY.md](docs/SECURITY.md) explains how.

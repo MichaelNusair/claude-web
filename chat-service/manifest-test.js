@@ -413,6 +413,41 @@ ok(
     'asks for is permanent on a box whose settings file survived the deploy',
 );
 
+section('And the workspace user can install software, which takes root:');
+/*
+ * Agents work on this box as `coder`, and for a long time that account was not in
+ * sudoers, so anything needing a package failed outright — a headless browser most
+ * visibly, since Playwright downloads its own browser but not the RPMs it links
+ * against. The grant is provisioning, not application code, which means nothing at
+ * runtime would notice it going missing: the account keeps working, and the next
+ * agent that needs to install something hits the old wall and has no way to tell
+ * whether this was removed on purpose. Hence a test.
+ *
+ * Three things, because two of them are the ways this silently does nothing:
+ * validating a sudoers file before installing it (an unparseable one takes sudo down
+ * with it, repair path included), and asking sudo afterwards whether the grant is
+ * real — dropping a file into /etc/sudoers.d only works if /etc/sudoers includes
+ * that directory.
+ */
+ok(
+  /^\s*visudo -cf "\$SUDOERS_STAGE"$/m.test(bootstrapSrc),
+  'bootstrap.sh installs a sudoers file without running visudo over it first, so a typo ' +
+    'there disables sudo on the whole box, including the way back',
+);
+ok(
+  /NOPASSWD:ALL/.test(bootstrapSrc) &&
+    /install -o root -g root -m 0440 "\$SUDOERS_STAGE" "\/etc\/sudoers\.d\/90-\$USER_NAME"/
+      .test(bootstrapSrc),
+  'bootstrap.sh no longer grants the workspace user passwordless sudo, so agents on this ' +
+    'box cannot install a browser, a compiler, or anything else that lives in a package — ' +
+    'see AGENTS.md "The box you are on" before deciding that is what you want',
+);
+ok(
+  /^sudo -l -U "\$USER_NAME" \| grep -q 'NOPASSWD: ALL'$/m.test(bootstrapSrc),
+  'bootstrap.sh does not verify the grant took effect, so a deploy would report success ' +
+    'over an account that still cannot install anything',
+);
+
 section('And the chat app leaves the projects alone, which is the other half of it:');
 /*
  * A path per project was necessary and still not sufficient, because the chat app

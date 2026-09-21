@@ -85,6 +85,40 @@ if [ "$CURRENT_SHELL" = /bin/bash ]; then
   echo "login shell for $USER_NAME: $CURRENT_SHELL -> /bin/zsh"
 fi
 
+# Passwordless sudo for the workspace user. This account used to be deliberately
+# outside sudoers, and that cost real work: an agent asked to drive a headless
+# browser could download the browser (Playwright fetches its own into ~/.cache)
+# but not the shared libraries it links against, because those are RPMs — so the
+# task simply failed, repeatedly, with no way for the agent to fix it. The same
+# went for every other `dnf install`.
+#
+# It bought nothing in exchange. The boundary it looked like is not one: `coder`
+# owns /opt/claude-web, so it already controls the code the chat service's unit
+# executes, and everyone who reaches this box arrives as `coder` running `claude`
+# under bypassPermissions. There is no second user to protect and no privilege
+# here that was not already reachable — docs/SECURITY.md is explicit that anyone
+# past the login has a shell, and this only stops pretending that shell is
+# fenced. Restricting the grant to package managers was the other option and is
+# worse: it is a denylist wearing an allowlist's clothes (`dnf`, `npm -g`, `pip`,
+# `rpm`, `curl | bash`, `systemctl`…), and each miss looks to an agent exactly
+# like the wall this removes.
+#
+# Validated before it is installed, because a sudoers file sudo cannot parse
+# disables sudo entirely — including the path you would use to repair it. No dot
+# in the filename: sudo ignores those.
+SUDOERS_STAGE="$(mktemp)"
+printf '# Written by bootstrap.sh; see AGENTS.md "The box you are on".\n%s ALL=(ALL) NOPASSWD:ALL\n' \
+  "$USER_NAME" > "$SUDOERS_STAGE"
+visudo -cf "$SUDOERS_STAGE"
+install -o root -g root -m 0440 "$SUDOERS_STAGE" "/etc/sudoers.d/90-$USER_NAME"
+rm -f "$SUDOERS_STAGE"
+
+# And then ask sudo itself, rather than trusting that dropping a file in that
+# directory was enough — /etc/sudoers has to `@includedir` it, and a deploy that
+# reported success over a still-unprivileged account is the failure this whole
+# block exists to end. Loud here beats an agent discovering it a week later.
+sudo -l -U "$USER_NAME" | grep -q 'NOPASSWD: ALL'
+
 # ---------------------------------------------------------------------------
 # Persistent data volume
 # ---------------------------------------------------------------------------
