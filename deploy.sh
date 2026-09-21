@@ -240,6 +240,20 @@ step "Checking that a message can be heard"
 ) || { echo "read-aloud tests failed — not deploying." >&2; exit 1; }
 
 # ---------------------------------------------------------------------------
+step "Checking the spoken conversation's client"
+# ---------------------------------------------------------------------------
+# The other half of realtime-test.js: that one covers minting a credential, this
+# one covers the browser spending it. Everything here is invisible from the server
+# because the audio never reaches it — so what is checked is that the conversation
+# sends nothing to our own box for the life of it (it is meant to be a dead end
+# Claude cannot be reached through), that the microphone is asked for before a
+# session is paid for, and that every way out of it stops the microphone.
+(
+  cd chat-service
+  node talk-test.js
+) || { echo "spoken conversation client tests failed — not deploying." >&2; exit 1; }
+
+# ---------------------------------------------------------------------------
 step "Checking the editor overlay"
 # ---------------------------------------------------------------------------
 # Nothing but nginx loads this file, so a load-time error removes the mic, the

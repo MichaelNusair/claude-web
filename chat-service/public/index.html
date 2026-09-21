@@ -227,6 +227,30 @@
   </div>
 </div>
 
+<!-- A spoken conversation about one message Claude has already finished.
+     Deliberately a dead end: nothing said in here reaches Claude, changes a file
+     or is remembered afterwards, which is why the sheet says so where it cannot
+     be missed rather than in a tooltip. See chat-service/realtime.js. -->
+<div id="talk-sheet" class="sheet hidden">
+  <div class="sheet-backdrop" data-close-talk></div>
+  <div class="sheet-body">
+    <h2>Talking it over</h2>
+    <p class="talk-warning">
+      This is a side channel. It has the message and what you asked for it, and
+      nothing else: it cannot run anything, change a file, or tell Claude what you
+      said.
+    </p>
+    <div class="talk-state">
+      <span id="talk-status" role="status" aria-live="polite">Connecting…</span>
+      <span id="talk-clock" class="talk-clock"></span>
+    </div>
+    <div id="talk-transcript" class="talk-transcript" aria-live="polite"></div>
+    <p class="hint" id="talk-note"></p>
+    <button type="button" id="btn-talk-end" class="wide danger">Hang up</button>
+    <button type="button" data-close-talk class="wide subtle">Close</button>
+  </div>
+</div>
+
 <div id="toast" class="toast hidden"></div>
 
 <script src="/chat/app.js"></script>

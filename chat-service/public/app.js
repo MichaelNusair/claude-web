@@ -3371,7 +3371,9 @@ const speech = {
 const speechReady = () => Boolean(speech.voices?.length) && typeof Audio === 'function';
 
 /**
- * Ask once whether this box can read, and in which voices.
+ * Ask once what this box can do with a voice: read a message aloud, and hold a
+ * spoken conversation about one. Two capabilities, one round trip, because they are
+ * one question from the client's side — what belongs on a message.
  *
  * Failure is silent and total: no controls anywhere, rather than buttons that
  * explain a 401. Every reason this can fail — a deployment with no Polly
@@ -3383,14 +3385,14 @@ async function loadVoices() {
     const res = await api('/api/voice-status', { headers: { Accept: 'application/json' } });
     if (!res.ok) return;
     const body = await res.json();
-    if (!body?.speech?.configured) return;
-    speech.voices = body.speech.voices || [];
-    speech.voice = body.speech.voice || '';
-    if (!speech.voices.length) {
-      speech.voices = null;
-      return;
+    talk.status = body?.realtime?.configured ? body.realtime : null;
+    if (body?.speech?.configured) {
+      speech.voices = body.speech.voices || [];
+      speech.voice = body.speech.voice || '';
+      if (!speech.voices.length) speech.voices = null;
     }
     paintVoicePicker();
+    if (!speechReady() && !talkReady()) return;
     // Messages already on screen were rendered before the answer arrived — which is
     // the normal order, because the transcript is drawn from cache in the first
     // frame and this is a round trip.
@@ -3398,7 +3400,7 @@ async function loadVoices() {
       if (el.dataset.raw) decorateSpoken(el, el.dataset.raw);
     }
   } catch {
-    /* no read-aloud on this device; nothing on screen claims otherwise */
+    /* no voice on this device; nothing on screen claims otherwise */
   }
 }
 
@@ -3458,12 +3460,21 @@ function stopSpeaking() {
   paintReadControls();
 }
 
-/** Every read control says what it does now: its own label, or Stop. */
+/**
+ * Every read control says what it does now: its own label, or Stop.
+ *
+ * The one that opened a conversation says Hang up instead, and is the only place to
+ * end it from besides the panel — a call you cannot find the end of is the whole
+ * reason phones show a green bar at the top.
+ */
 function paintReadControls() {
   for (const btn of document.querySelectorAll('[data-read]')) {
-    const mine = speech.reading && btn === speech.control;
-    btn.textContent = mine ? '■ Stop' : btn.dataset.readLabel || '🔊 Read';
-    btn.classList.toggle('reading', mine);
+    const mine = btn.dataset.talk
+      ? talking() && btn === talk.control
+      : speech.reading && btn === speech.control;
+    const stop = btn.dataset.talk ? '■ Hang up' : '■ Stop';
+    btn.textContent = mine ? stop : btn.dataset.readLabel || '🔊 Read';
+    btn.classList.toggle(btn.dataset.talk ? 'talking' : 'reading', mine);
   }
 }
 
@@ -3628,9 +3639,12 @@ function decorateSpoken(el, text) {
   if (!el) return;
   el.dataset.raw = text ?? '';
   for (const old of el.querySelectorAll('.read-row')) old.remove();
-  if (!speechReady()) return;
+  // Two separate capabilities: reading aloud needs a speech voice, talking it over
+  // needs an OpenAI key. A box can have either, and a message gets whichever
+  // controls are actually backed by something.
+  if (!speechReady() && !talkReady()) return;
 
-  const blocks = fencedBlocks(el.dataset.raw);
+  const blocks = speechReady() ? fencedBlocks(el.dataset.raw) : [];
   const pres = [...el.querySelectorAll('pre')];
 
   /* A block's own button goes under the block, where the code it reads is. */
@@ -3652,9 +3666,23 @@ function decorateSpoken(el, text) {
   // listen to the rest, and a row of controls above the text pushes the text down.
   const row = document.createElement('div');
   row.className = 'read-row';
-  const spoken = speakableText(el.dataset.raw, blocks.length);
-  row.appendChild(readButton('🔊 Read aloud', () =>
-    startSpeaking(spoken, { control: row.firstChild })));
+  if (speechReady()) {
+    const spoken = speakableText(el.dataset.raw, blocks.length);
+    row.appendChild(readButton('🔊 Read aloud', () =>
+      startSpeaking(spoken, { control: row.firstChild })));
+  }
+  /*
+   * And the conversation about it, beside the read. Next to each other because they
+   * are the same impulse a second apart — hear this, then ask about what I heard —
+   * and this one carries the raw markdown rather than the spoken reduction: the
+   * far end is reading code, not saying it, so the fences are what it wants.
+   */
+  if (talkReady()) {
+    const btn = readButton('💬 Talk it over', () =>
+      startTalking(el.dataset.raw, { prompt: promptBefore(el), control: btn }));
+    btn.dataset.talk = '1';
+    row.appendChild(btn);
+  }
   el.appendChild(row);
 }
 
@@ -3751,6 +3779,363 @@ function paintVoiceHint() {
         ? 'One voice for every language, so it reads a message with Hebrew and English in it. Slower to start, and metered by the character.'
         : 'An English voice. It cannot read Hebrew — Polly has no Hebrew voice at all — so a Hebrew message will come back refused rather than mispronounced.';
 }
+
+/* ---------------------------------------------------------------------------
+ * A spoken conversation about one message
+ * ---------------------------------------------------------------------------
+ *
+ * Read-aloud answers "say this to me". This answers what you want a second later —
+ * *wait, go back to the part about the timeout* — out loud, while walking, without
+ * typing and without waiting for a turn.
+ *
+ * Three things about it that are design and not accident:
+ *
+ * **It cannot reach Claude.** The server mints a session with no tools and an
+ * instruction saying so (`realtime.js`), and this side adds nothing: there is no
+ * code here that could send what was said to a session, and the panel says so where
+ * it cannot be missed. A voice channel with no transcript is the last place a
+ * command should be issued from — a misheard sentence there is a force-push nobody
+ * typed and nobody saw.
+ *
+ * **The audio does not pass through our box.** The browser holds a two-minute
+ * credential and opens WebRTC straight to OpenAI. Latency is the whole feature, and
+ * a relay on an instance that is also running a compiler is latency.
+ *
+ * **It is metered, so it ends by itself.** The server counts sessions per day; this
+ * end hangs up on its own timer and shows the clock while it runs, because the
+ * failure mode of a voice call is a pocket that is still connected.
+ */
+const talk = {
+  status: null,       // what /api/voice-status said about realtime, or null
+  pc: null,           // RTCPeerConnection
+  channel: null,      // the `oai-events` data channel
+  mic: null,          // MediaStream, so its tracks can actually be stopped
+  audio: null,        // the element playing the far end
+  control: null,      // the button that opened it, which is also its Stop
+  started: 0,
+  timer: null,
+  generation: 0,
+  lines: [],          // { who: 'you' | 'voice', text, partial }
+};
+
+function talkReady() {
+  return Boolean(talk.status?.configured && typeof RTCPeerConnection === 'function');
+}
+
+/** Whether a conversation is up, or on its way up. */
+function talking() {
+  return Boolean(talk.pc);
+}
+
+/**
+ * Start one. The credential is minted here and spent in the browser; `text` is the
+ * message being discussed and `prompt` is what was asked to produce it.
+ */
+async function startTalking(text, { prompt = '', control = null } = {}) {
+  if (talking()) {
+    endTalking();
+    return;
+  }
+  if (!talkReady() || !String(text || '').trim()) return;
+  if (voice.active) {
+    toast('Not while the microphone is listening');
+    return;
+  }
+  stopSpeaking();                       // one voice at a time, and this one answers back
+
+  const generation = ++talk.generation;
+  talk.control = control;
+  talk.lines = [];
+  openTalkSheet();
+  paintTalkStatus('Asking for a line…');
+  paintTalkTranscript();
+  paintReadControls();
+
+  try {
+    /*
+     * The microphone first, before the credential: it is the one step that can be
+     * refused by the person rather than by a server, and asking for it first means a
+     * refusal costs nothing. A session minted and then abandoned is counted against
+     * the day either way — the server reserves before it calls OpenAI, deliberately.
+     */
+    const mic = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+    });
+    if (generation !== talk.generation) {
+      for (const track of mic.getTracks()) track.stop();
+      return;
+    }
+    talk.mic = mic;
+
+    const res = await api('/api/realtime/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text, prompt }),
+    });
+    if (!res.ok) throw new Error(await speakRefusal(res));
+    const minted = await res.json();
+    if (generation !== talk.generation) return;
+    if (!minted?.value) throw new Error('the server minted nothing to connect with');
+
+    await connectTalk(minted, generation);
+  } catch (err) {
+    if (generation !== talk.generation) return;
+    endTalking();
+    const why = err?.name === 'NotAllowedError'
+      ? 'the microphone was not allowed'
+      : err?.message || 'the connection failed';
+    paintTalkStatus(`Not connected: ${why}`);
+    toast(`No conversation: ${why}`);
+  }
+}
+
+/**
+ * Open the WebRTC session with the minted credential.
+ *
+ * Nothing about the session is configured from here — the model, the voice, the
+ * instructions, the turn detection and the absence of tools are all baked into the
+ * credential by the server, so a tampered client gets a session shaped exactly the
+ * same way. This end sends an offer and plays what comes back.
+ */
+async function connectTalk(minted, generation) {
+  const pc = new RTCPeerConnection();
+  talk.pc = pc;
+  // From here on there is something to hang up, so the button that opened it says so
+  // — before the SDP round trip, not after: that is where a connection can stall.
+  paintReadControls();
+
+  if (!talk.audio) {
+    talk.audio = new Audio();
+    talk.audio.autoplay = true;
+    // iOS plays a stream inline rather than taking over the screen with it. Set on
+    // both, because the attribute is what older WebKit reads.
+    talk.audio.playsInline = true;
+    talk.audio.setAttribute?.('playsinline', '');
+  }
+  pc.ontrack = (event) => {
+    if (generation !== talk.generation) return;
+    talk.audio.srcObject = event.streams?.[0] || null;
+    talk.audio.play?.()?.catch?.(() => {
+      // The tap that opened this is the gesture, so this is nearly impossible —
+      // and silent audio with a connected session is worth a sentence either way.
+      paintTalkStatus('Connected, but this browser will not play the audio');
+    });
+  };
+  pc.onconnectionstatechange = () => {
+    if (generation !== talk.generation) return;
+    if (pc.connectionState === 'connected') paintTalkStatus('Listening');
+    if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
+      endTalking();
+      paintTalkStatus('The line dropped');
+    }
+  };
+
+  for (const track of talk.mic.getTracks()) pc.addTrack(track, talk.mic);
+
+  // The event channel carries the transcripts of both halves, which is what makes
+  // this auditable at all: you can see what it heard you say.
+  const channel = pc.createDataChannel('oai-events');
+  talk.channel = channel;
+  channel.onmessage = (event) => onTalkEvent(event, generation);
+
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+  const answer = await fetch(
+    `https://api.openai.com/v1/realtime/calls?model=${encodeURIComponent(minted.model || '')}`,
+    {
+      method: 'POST',
+      body: offer.sdp,
+      headers: { Authorization: `Bearer ${minted.value}`, 'Content-Type': 'application/sdp' },
+    },
+  );
+  if (!answer.ok) throw new Error(`OpenAI refused the connection (${answer.status})`);
+  const sdp = await answer.text();
+  if (generation !== talk.generation) return;
+  await pc.setRemoteDescription({ type: 'answer', sdp });
+
+  talk.started = Date.now();
+  const minutes = Number(minted.maxMinutes) || 10;
+  talk.timer = setInterval(() => {
+    paintTalkClock();
+    if (Date.now() - talk.started >= minutes * 60_000) {
+      endTalking();
+      paintTalkStatus(`The line closed after ${minutes} minutes`);
+    }
+  }, 1000);
+
+  paintTalkStatus('Listening');
+  paintTalkClock();
+  const spent = minted.budget;
+  $('#talk-note').textContent = [
+    `${minted.voice || 'a voice'} on ${minted.model || 'OpenAI'}, billed by the minute.`,
+    spent ? `${spent.sessions} of ${spent.limit} conversations today.` : '',
+    `The line closes by itself after ${minutes} minutes.`,
+  ].filter(Boolean).join(' ');
+}
+
+/**
+ * What the far end says about itself.
+ *
+ * Only the transcripts and the errors are read. Deltas rather than the completed
+ * events alone, so a sentence appears while it is being said — dimmed until it is
+ * final, because a half-heard line displayed as finished is how you end up certain
+ * it said something it did not.
+ */
+function onTalkEvent(event, generation) {
+  if (generation !== talk.generation) return;
+  let msg;
+  try {
+    msg = JSON.parse(event.data);
+  } catch {
+    return;                             // not ours to understand
+  }
+  const type = String(msg?.type || '');
+
+  // What it is saying. The event was renamed across API versions and both names are
+  // still in the wild, so match on the shape of it rather than one spelling.
+  if (/^response\.(output_)?audio_transcript\.delta$/.test(type)) {
+    addTalkText('voice', msg.delta || '', true);
+    return;
+  }
+  if (/^response\.(output_)?audio_transcript\.done$/.test(type)) {
+    finishTalkLine('voice', msg.transcript);
+    return;
+  }
+
+  // What it heard you say.
+  if (type === 'conversation.item.input_audio_transcription.delta') {
+    addTalkText('you', msg.delta || '', true);
+    return;
+  }
+  if (type === 'conversation.item.input_audio_transcription.completed') {
+    finishTalkLine('you', msg.transcript);
+    return;
+  }
+
+  if (type === 'error') {
+    const why = msg.error?.message || 'the far end reported an error';
+    paintTalkStatus(`Trouble: ${why}`);
+  }
+}
+
+/** Append to the open line for `who`, starting one if the last line was the other. */
+function addTalkText(who, text, partial) {
+  if (!text) return;
+  const last = talk.lines[talk.lines.length - 1];
+  if (last && last.who === who && last.partial) last.text += text;
+  else talk.lines.push({ who, text, partial });
+  paintTalkTranscript();
+}
+
+/** Close the open line, preferring the final transcript over the deltas. */
+function finishTalkLine(who, transcript) {
+  const last = talk.lines[talk.lines.length - 1];
+  const final = String(transcript || '').trim();
+  if (last && last.who === who && last.partial) {
+    if (final) last.text = final;
+    last.partial = false;
+  } else if (final) {
+    talk.lines.push({ who, text: final, partial: false });
+  }
+  paintTalkTranscript();
+}
+
+/** Hang up, and leave the panel open so the transcript can still be read. */
+function endTalking() {
+  talk.generation += 1;
+  if (talk.timer) clearInterval(talk.timer);
+  talk.timer = null;
+  try {
+    talk.channel?.close?.();
+  } catch { /* already gone */ }
+  try {
+    talk.pc?.close?.();
+  } catch { /* already gone */ }
+  // The tracks, not just the stream: a MediaStream that is dropped without stopping
+  // its tracks leaves the recording indicator on and the microphone live.
+  for (const track of talk.mic?.getTracks?.() || []) {
+    try {
+      track.stop();
+    } catch { /* already stopped */ }
+  }
+  if (talk.audio) talk.audio.srcObject = null;
+  talk.pc = null;
+  talk.channel = null;
+  talk.mic = null;
+  talk.control = null;
+  talk.started = 0;
+  paintTalkStatus('Hung up');
+  paintTalkClock();
+  paintReadControls();
+}
+
+function openTalkSheet() {
+  $('#talk-sheet')?.classList.remove('hidden');
+}
+
+function paintTalkStatus(text) {
+  const el = $('#talk-status');
+  if (el) el.textContent = text;
+}
+
+function paintTalkClock() {
+  const el = $('#talk-clock');
+  if (!el) return;
+  if (!talk.started) {
+    el.textContent = '';
+    return;
+  }
+  const secs = Math.floor((Date.now() - talk.started) / 1000);
+  el.textContent = `${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, '0')}`;
+}
+
+function paintTalkTranscript() {
+  const box = $('#talk-transcript');
+  if (!box) return;
+  box.textContent = '';
+  for (const line of talk.lines) {
+    const el = document.createElement('p');
+    el.className = `talk-line${line.partial ? ' partial' : ''}`;
+    const who = document.createElement('span');
+    who.className = 'who';
+    who.textContent = line.who === 'you' ? 'you' : 'the voice';
+    el.appendChild(who);
+    el.appendChild(document.createTextNode(line.text));
+    box.appendChild(el);
+  }
+  box.scrollTop = box.scrollHeight;
+}
+
+/**
+ * What was asked to produce this message, for the conversation's context.
+ *
+ * The bubble before it, and only if it is one of yours: a thread that starts with
+ * Claude's own message (a resumed session, a hook, a subagent) has no prompt to give,
+ * and inventing one from the message above would put a stranger's words in the
+ * prompt. The server treats an empty one as "not provided".
+ */
+function promptBefore(el) {
+  for (let node = el?.previousElementSibling; node; node = node.previousElementSibling) {
+    if (node.classList?.contains('msg')) {
+      return node.classList.contains('user') ? node.textContent || '' : '';
+    }
+  }
+  return '';
+}
+
+$('#btn-talk-end')?.addEventListener('click', () => endTalking());
+/*
+ * Closing the panel hangs up too. A hidden panel over a live session is a pocket
+ * call on someone else's credit: there is no green bar at the top of a web app to
+ * find it by, and the only other end of it is the button on a message that has
+ * probably scrolled away by then.
+ */
+document.querySelectorAll('[data-close-talk]').forEach((el) =>
+  el.addEventListener('click', () => {
+    if (talking()) endTalking();
+    $('#talk-sheet').classList.add('hidden');
+  }),
+);
 
 // --- settings ---------------------------------------------------------------
 $('#btn-settings').addEventListener('click', () => $('#sheet').classList.remove('hidden'));
@@ -4063,8 +4448,12 @@ window.__pushForTest = {
 // and inaudible from a test. So the pieces are driven directly.
 window.__speechForTest = {
   loadVoices, decorateSpoken, fencedBlocks, speakableText, stopSpeaking, paintVoicePicker,
-  speech, renderMarkdown,
+  speech, renderMarkdown, splitFences,
 };
+// The spoken conversation, for the same reason and more of it: this one holds a
+// credential for a paid service, a live microphone and a peer connection, none of
+// which a test can see from the outside.
+window.__talkForTest = { talk, startTalking, endTalking, promptBefore, onTalkEvent };
 
 // A device that wakes up may have been asleep for hours: iOS suspends timers
 // and freezes sockets when the app is backgrounded, and the close event often

@@ -287,6 +287,42 @@ html, body {
 .read-btn:active { background: rgba(255,255,255,.14); }
 /* The one that is reading, which is also the only Stop there is. */
 .read-btn.reading { background: var(--accent); color: #fff; border-color: transparent; }
+/* And the one that opens a spoken conversation, which costs money per minute and
+   says so by not looking like the free one next to it. */
+.read-btn.talking { background: var(--accent); color: #fff; border-color: transparent; }
+
+/*
+ * The spoken conversation.
+ *
+ * What the panel is for is the transcript: a voice channel with nothing written
+ * down is the one place a misheard sentence goes unnoticed, so both halves of it
+ * are on screen while it happens — and the warning above them stays visible the
+ * whole time rather than being an opening line you agree to and forget.
+ */
+.talk-warning {
+  margin: 0 0 12px; padding: 9px 11px; font-size: 13px; line-height: 1.45;
+  color: var(--text-dim); background: rgba(255,255,255,.05);
+  border: 1px solid var(--border); border-left: 3px solid var(--accent);
+  border-radius: 8px;
+}
+.talk-state { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; }
+.talk-state #talk-status { font-size: 14px; }
+.talk-clock { font-variant-numeric: tabular-nums; color: var(--text-dim); font-size: 13px; }
+.talk-transcript {
+  margin: 10px 0; padding: 10px; min-height: 96px; max-height: 44vh; overflow-y: auto;
+  background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
+  font-size: 14px; line-height: 1.5;
+}
+.talk-transcript:empty::before {
+  content: 'Say something — what you say and what it says back both appear here.';
+  color: var(--text-dim); font-size: 13px;
+}
+.talk-line { margin: 0 0 8px; }
+.talk-line:last-child { margin-bottom: 0; }
+.talk-line .who { color: var(--text-dim); font-size: 12px; display: block; }
+/* Still being spoken: dimmed, because a half-heard sentence on screen as if it were
+   final is how you end up sure it said something it did not. */
+.talk-line.partial { opacity: .6; }
 
 /* Tool cards — collapsed by default so the thread stays readable */
 .tool {
