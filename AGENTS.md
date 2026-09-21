@@ -213,9 +213,15 @@ and do not ask the user to install it for you.
 
 ```bash
 sudo dnf install -y <package>       # Amazon Linux 2023, so dnf
-sudo npx playwright install-deps    # the shared libraries a headless browser links against
-npx playwright install chromium     # the browser itself — no root; it lands in ~/.cache
+npx playwright install chromium     # a headless browser — no root; it lands in ~/.cache
 ```
+
+A browser works out of the box because `bootstrap.sh` installs the libraries it links
+against. Do **not** reach for `playwright install-deps` when something is missing: it
+only knows `apt` and exits 127 here. The package names are in the optional group at the
+top of `bootstrap.sh`, and `ldd <binary> | grep not-found` is how that list was built.
+`chromium` is not in the AL2023 repos, so Playwright's own download (or a direct fetch
+from Chrome for Testing) is the way to get one.
 
 This is written down because the previous state was invisible from inside a session and
 cost real work. Until 2026-09-21 the workspace account (`coder`) was deliberately outside
@@ -226,7 +232,8 @@ whether that was policy or oversight, so each agent rediscovered the wall and st
 It was an oversight. `bootstrap.sh` now writes `/etc/sudoers.d/90-coder`, validates it
 with `visudo` before installing it, and then asks `sudo -l` whether the grant is
 actually live, so a deploy cannot report success over an account that still cannot
-install anything.
+install anything. It also installs the browser libraries themselves, because sudo alone
+still left a wall — just a surmountable one twenty RPM names deep.
 
 Two things to know about it:
 

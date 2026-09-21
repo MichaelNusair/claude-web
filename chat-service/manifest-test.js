@@ -447,6 +447,21 @@ ok(
   'bootstrap.sh does not verify the grant took effect, so a deploy would report success ' +
     'over an account that still cannot install anything',
 );
+/*
+ * Sudo was necessary and not sufficient for the case that prompted it. Playwright's
+ * `install-deps` only knows apt and exits 127 on AL2023, and `chromium` is not in the
+ * repos, so the RPM names had to be recovered from `ldd` one NOT_FOUND at a time —
+ * which is a wall with a door in it rather than no door, and still not something to
+ * make every agent walk. These are in the optional `|| echo` group, so a rename in the
+ * repos cannot fail provisioning; this checks they are asked for at all.
+ */
+for (const lib of ['nss', 'mesa-libgbm', 'libXdamage', 'libxkbcommon', 'at-spi2-atk']) {
+  ok(
+    new RegExp(`(^|\\s)${lib}(\\s|\\\\)`).test(bootstrapSrc),
+    `bootstrap.sh no longer installs ${lib}, so a headless browser on a fresh instance ` +
+      'fails to start and the error names a shared object rather than a package',
+  );
+}
 
 section('And the chat app leaves the projects alone, which is the other half of it:');
 /*

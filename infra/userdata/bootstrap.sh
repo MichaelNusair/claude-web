@@ -67,6 +67,21 @@ dnf install -y git tar gzip unzip jq nginx gcc gcc-c++ make cmake python3 python
 # only a convenience for interactive shell use.
 dnf install -y ripgrep || echo "ripgrep unavailable in repos; skipping"
 
+# The shared libraries a headless Chromium links against. Not a runtime dependency
+# of anything here — this is for agents, and it is the other half of giving them
+# sudo (see the User section). A browser is the one install that does not work by
+# reading the error: Playwright fetches its own binary into ~/.cache with no
+# privileges, then fails on these, and `playwright install-deps` cannot help
+# because it only knows apt — on AL2023 it exits 127 on a missing apt-get. That
+# left the package names to be rediscovered from `ldd` output, one NOT_FOUND at a
+# time. `chromium` itself is not in the AL2023 repos (checked 2026-09-21), so
+# there is no distro package to lean on instead.
+# Verified by rendering a page with chrome-headless-shell on arm64, ldd clean.
+dnf install -y nss nspr atk at-spi2-atk at-spi2-core cups-libs libdrm libX11 \
+  libXcomposite libXdamage libXext libXfixes libXrandr libxcb libxkbcommon \
+  mesa-libgbm alsa-lib pango cairo expat dbus-libs libxshmfence ||
+  echo "headless browser libraries unavailable; a browser will need them installed by hand"
+
 # Node 22 (Claude Code CLI requires >= 18; 22 is current LTS)
 curl -fsSL https://rpm.nodesource.com/setup_22.x | bash -
 dnf install -y nodejs
