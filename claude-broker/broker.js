@@ -80,6 +80,31 @@ const RESULT_EVENT = '"type":"result"';
 const USER_MESSAGE = '"type":"user"';
 
 /*
+ * The model producing, as it appears in the stream — and the only turn-start
+ * signal that sees every turn.
+ *
+ * A turn does not have to begin with a device typing. It also begins when another
+ * Claude session sends this one a message, when a queued message is flushed, when
+ * a /loop wakeup or a cron fires, or when a hook injects one. All of those reach
+ * the CLI by its own socket, not down the stdin this daemon holds, so
+ * `#noteTurnStart` never sees them and `turnInFlight` stayed false for the whole
+ * turn. Measured on the box before this fix: koinespace session 44e6ff2e took a
+ * cross-session message at 02:48:02, was running a tool five minutes later, and
+ * `op: 'status'` called it idle throughout — three polls in a row — while the
+ * transcript plainly read `working`. A badge that says "your turn" while Claude is
+ * mid-tool is the direction that makes you type over live work, which is the one
+ * thing this flag exists to prevent.
+ *
+ * So the *output* side decides a turn has begun: an assistant event means the
+ * model is producing, whoever asked. That cannot latch on the way counting any
+ * stdin write did, for two reasons — a `result` always follows an assistant event
+ * in the same turn and clears it, and a resumed conversation replays nothing.
+ * Checked on this box: `--resume` with `--input-format stream-json` writes not one
+ * byte to stdout until it is spoken to, so there is no history to mistake for work.
+ */
+const ASSISTANT_EVENT = '"type":"assistant"';
+
+/*
  * A single input line is normally tiny, but a pasted file is one line and can be
  * megabytes. Past this, stop waiting for the newline and decide on what is here.
  */
@@ -129,9 +154,11 @@ class Session {
     // control frames to the probes it never uses, and counting those as being
     // spoken to parked nine of them on this box at ~210MB each.
     this.spokenTo = false;
-    // Whether Claude owes an answer: set by a user message going in, cleared by
-    // the `result` event that ends the turn. This is the stop-button-vs-send-button
-    // bit, and the reason anything asks this service for status at all.
+    // Whether Claude owes an answer: set by a user message going in OR by the model
+    // being heard producing, cleared by the `result` event that ends the turn. Both
+    // starts are needed — see ASSISTANT_EVENT for the turns stdin never sees. This
+    // is the stop-button-vs-send-button bit, and the reason anything asks this
+    // service for status at all.
     this.turnInFlight = false;
     // Trailing bytes of the last chunk, so a `result` split across two chunks is
     // still seen. Copied rather than kept as a view into a stream buffer.
@@ -154,7 +181,7 @@ class Session {
       this.#record(chunk);
       this.#broadcast('out', chunk);
       this.#sniffSessionId(chunk);
-      this.#noteTurnEnd(chunk);
+      this.#noteTurnEdges(chunk);
     });
 
     this.proc.stderr.on('data', (chunk) => {
@@ -234,35 +261,52 @@ class Session {
   }
 
   /**
-   * Notice the turn ending, so `op: 'status'` can answer the only question a
-   * joining device cannot answer for itself. Runs after the chunk has already
-   * been forwarded: this is a badge, and nothing waits on it.
+   * Notice the turn starting and ending, so `op: 'status'` can answer the only
+   * question a joining device cannot answer for itself. Runs after the chunk has
+   * already been forwarded: this is a badge, and nothing waits on it.
+   *
+   * Both edges are read from the output stream, and the start has to be, because
+   * the input side cannot see every turn. See ASSISTANT_EVENT.
    */
-  #noteTurnEnd(chunk) {
-    if (!this.turnInFlight) return;
+  #noteTurnEdges(chunk) {
     // Enough trailing bytes to bridge two chunks: an occurrence that straddles the
-    // boundary has at most this many bytes on the far side of it.
-    const span = RESULT_EVENT.length - 1;
+    // boundary has at most this many bytes on the far side of it. Kept for the
+    // longer of the two markers, and kept whatever the flag says — a turn has to
+    // become visible before there is a turn to be in the middle of.
+    const span = Math.max(RESULT_EVENT.length, ASSISTANT_EVENT.length) - 1;
 
-    // The chunk on its own first — the common case, and it copies nothing.
-    let ended = chunk.includes(RESULT_EVENT);
-    if (!ended && this.turnTail.length) {
-      ended = Buffer.concat([this.turnTail, chunk.subarray(0, RESULT_EVENT.length)])
-        .includes(RESULT_EVENT);
+    // The chunk on its own first — the common case, and it copies nothing. The
+    // seam is only worth assembling when the chunk alone says nothing.
+    const carries = (marker) => {
+      if (chunk.includes(marker)) return true;
+      if (!this.turnTail.length) return false;
+      return Buffer.concat([this.turnTail, chunk.subarray(0, marker.length)]).includes(marker);
+    };
+
+    if (!this.turnInFlight && carries(ASSISTANT_EVENT)) {
+      this.turnInFlight = true;
+      // Something asked it something, so this process holds a conversation and is
+      // not one of the panel's throwaway probes — `detach` must not stop it.
+      //
+      // `spokeAt` is deliberately left alone: it means a *person* spoke, and it is
+      // what picks the conversation someone is looking at out of several live ones.
+      // A peer session's message is traffic, not attention, and counting it would
+      // point every device at whichever conversation a robot last prodded.
+      this.spokenTo = true;
     }
-    if (ended) {
+    // Second, and not as an `else`: a chunk carrying the model's last words and the
+    // `result` after them is a chunk that ended the turn.
+    if (this.turnInFlight && carries(RESULT_EVENT)) {
       this.turnInFlight = false;
-      this.turnTail = Buffer.alloc(0);
-      return;
     }
 
     // The tail of the STREAM, not of this chunk. Keeping only the last chunk's
     // tail looks equivalent and is not: a CLI flushing a byte at a time — which it
     // does whenever a flush lands mid-token — then never accumulates enough
-    // context to recognise anything, and the turn never appears to end.
+    // context to recognise anything, and neither edge is ever seen.
     this.turnTail = chunk.length >= span
       ? Buffer.from(chunk.subarray(chunk.length - span))
-      : Buffer.concat([this.turnTail, chunk]).subarray(-span);
+      : Buffer.from(Buffer.concat([this.turnTail, chunk]).subarray(-span));
   }
 
   /**
@@ -372,10 +416,13 @@ class Session {
   write(data) {
     this.lastActivity = Date.now();
     this.attendedAt = Date.now();
-    // Only a message starts a turn; the panel's control traffic does not. The
-    // remaining way to be wrong is a missed `result`, which leaves a stale
-    // "working" — still the right direction to be wrong in, because "working"
-    // makes you wait and look again where "idle" makes you type over a live turn.
+    // Only a message starts a turn; the panel's control traffic does not. This is
+    // the *early* half of the answer — it marks the turn from the moment someone
+    // hits send, before the model has said anything back — and ASSISTANT_EVENT
+    // catches the turns that never come through here at all. The remaining way to
+    // be wrong is a missed `result`, which leaves a stale "working" — still the
+    // right direction to be wrong in, because "working" makes you wait and look
+    // again where "idle" makes you type over a live turn.
     if (this.#noteTurnStart(data)) {
       this.spokenTo = true;
       this.turnInFlight = true;

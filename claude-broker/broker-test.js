@@ -79,6 +79,30 @@ process.stdin.on('data', (c) => {
       process.stdout.write(JSON.stringify({ type: 'result', subtype: 'success' }) + '\\n');
       continue;
     }
+    // A turn nobody typed. The real CLI takes cross-session messages, queued
+    // messages and /loop wakeups on its OWN socket, so they never touch the stdin
+    // the broker holds — the turn simply appears in the output. Driven by a file
+    // for the same reason: the test has to start it without writing a byte here.
+    if (text === 'watch-for-off-stream-turns') {
+      const trigger = require('path').join(process.cwd(), '.off-stream');
+      let last = '';
+      setInterval(() => {
+        let want = '';
+        try { want = require('fs').readFileSync(trigger, 'utf8').trim(); } catch { return; }
+        if (want === last) return;
+        last = want;
+        if (want === 'assistant') {
+          process.stdout.write(JSON.stringify({
+            type: 'assistant',
+            message: { role: 'assistant', content: [{ type: 'text', text: 'a peer asked me something' }] },
+          }) + '\\n');
+        }
+        if (want === 'result') {
+          process.stdout.write(JSON.stringify({ type: 'result', subtype: 'success' }) + '\\n');
+        }
+      }, 40).unref();
+      continue;
+    }
     // The same event, one byte per write, so the broker sees it split across
     // chunks. The real CLI does this whenever a flush lands mid-token.
     if (text === 'end-turn-slowly') {
@@ -564,6 +588,43 @@ async function main() {
   await sleep(900);
   const dribbled = await mineNow();
   ok(dribbled?.working === false, 'a result split across chunks still ends the turn');
+
+  /*
+   * A turn this daemon never saw begin.
+   *
+   * Not every turn starts with a device hitting send. Another Claude session can
+   * message this one, a queued message can be flushed, a /loop wakeup or a cron can
+   * fire — and all of those reach the CLI by its own socket, leaving stdin silent.
+   * Before this was read off the output stream, `working` stayed false for the whole
+   * turn: koinespace 44e6ff2e took a cross-session message at 02:48:02 on
+   * 2026-09-21, was still running a tool five minutes later, and status called it
+   * idle three polls running. That is the direction that makes a device type over
+   * live work, and it is also what put "Claude finished" on a phone repeatedly for
+   * one conversation that had not finished anything.
+   */
+  const trigger = path.join(TMP, '.off-stream');
+  // Armed with raw bytes, not a `user` frame: arming must not itself be a turn, or
+  // this proves nothing about where the flag came from.
+  send(a, 'watch-for-off-stream-turns\n');
+  await sleep(300);
+  ok((await mineNow())?.working === false, 'arming it is not a turn either');
+
+  // Somebody really did type in this conversation, further up — so what is being
+  // checked is that the peer's turn did not RESET that clock. `spokeMs` counts up
+  // from the last human message; a peer event mistaken for one would drop it to
+  // nearly zero and point every device at whichever conversation a robot last
+  // prodded, because that clock is what picks the conversation someone is in.
+  const spokeBefore = (await mineNow())?.spokeMs;
+  fs.writeFileSync(trigger, 'assistant');
+  await sleep(400);
+  const peerDriven = await mineNow();
+  ok(peerDriven?.working === true, 'the model producing is a turn, even with nothing written to stdin');
+  ok(peerDriven?.spokeMs >= spokeBefore, 'a peer session prodding it is traffic, not somebody speaking');
+
+  fs.writeFileSync(trigger, 'result');
+  await sleep(400);
+  ok((await mineNow())?.working === false, 'and that turn ends the same way every other one does');
+  fs.rmSync(trigger, { force: true });
 
   section('A process nobody ever spoke to is not parked for twelve hours:');
   // The panel spawns TWO claudes per page load — a probe with no `--resume` that
