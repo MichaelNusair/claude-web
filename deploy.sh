@@ -189,6 +189,16 @@ step "Checking authentication"
   cd chat-service
   node auth-test.js
 ) || { echo "AUTH TESTS FAILED — refusing to deploy." >&2; exit 1; }
+# Route *coverage* is the other half of that, and until 2026-09-21 this gate did not
+# run it: `manifest-test.js` reads the nginx config out of `infra/userdata/bootstrap.sh`
+# and requires `auth_request` on every location that reaches code-server. That file is
+# part of this payload, so without this line the deploy ships the routing and never
+# checks it — and a route that reaches the editor without the gate is a shell on this
+# box for whoever finds it, which is the failure that already happened once.
+(
+  cd chat-service
+  node manifest-test.js
+) || { echo "AUTH ROUTE COVERAGE FAILED — refusing to deploy." >&2; exit 1; }
 
 # ---------------------------------------------------------------------------
 step "Checking the client boots"
@@ -268,6 +278,30 @@ step "Checking which model hears you"
   cd chat-service
   node transcribe-test.js
 ) || { echo "dictation routing tests failed — not deploying." >&2; exit 1; }
+# And what happens to the words afterwards. The cleanup pass sends a half-finished
+# message to a model and puts the answer back in somebody's composer, so its two
+# failures are putting text there that nobody said, and losing text that was only
+# ever spoken once. Both are bounded in `polish.js` rather than prompted for.
+(
+  cd chat-service
+  node polish-test.js
+) || { echo "dictation cleanup tests failed — not deploying." >&2; exit 1; }
+
+# ---------------------------------------------------------------------------
+step "Checking the Hebrew voice and the Hebrew ear"
+# ---------------------------------------------------------------------------
+# Hebrew is the one language on this box that has no free local answer: Polly has
+# no he-IL voice at all and skips the characters silently, and the installed
+# dictation model is English-only. Azure AI Speech covers both, on an F0 tier that
+# answers 429 rather than billing — which is the whole reason it is the backend, so
+# the test asserts that the quota message says nothing is charged. The other half is
+# escaping: SSML is XML, a code block is full of `&&` and `<`, and unescaped it is
+# a 400 that would leave prose readable and code not. Runs against a fake Azure —
+# no key, no network, and none of the month's free characters spent.
+(
+  cd chat-service
+  node azure-speech-test.js
+) || { echo "Hebrew voice tests failed — not deploying." >&2; exit 1; }
 
 # ---------------------------------------------------------------------------
 step "Checking the project lifecycle"
@@ -310,6 +344,19 @@ step "Checking what a device is told, and what makes a phone buzz"
   cd chat-service
   node turn-watcher-test.js
 ) || { echo "turn watcher tests failed — not deploying." >&2; exit 1; }
+# The rest of the same chain, which fails in the same register. `push.js` hand-rolls
+# VAPID and RFC 8291 encryption, so a mistake there is a push service returning 400 to
+# a server nobody is reading the logs of; `sw.js` runs in a worker with no console
+# anyone sees, so a throw in `notificationclick` looks exactly like a phone ignoring
+# the tap. Every step of "a turn ended" → "a thumb on a notification" is now gated.
+(
+  cd chat-service
+  node push-test.js
+) || { echo "push tests failed — not deploying." >&2; exit 1; }
+(
+  cd chat-service
+  node sw-test.js
+) || { echo "service worker tests failed — not deploying." >&2; exit 1; }
 
 # ---------------------------------------------------------------------------
 step "Checking the Claude broker"
