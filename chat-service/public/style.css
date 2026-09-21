@@ -573,6 +573,31 @@ html, body {
 }
 .kill-btn:active { background: rgba(224, 82, 82, .16); }
 
+/* A whole surface's stop-all, in its section label. Smaller and quieter than a
+   row's button: it does fifteen times as much, so it must not be the easiest thing
+   on the page to hit with a thumb. */
+.section-label.with-action { display: flex; align-items: center; gap: 6px; }
+.label-btn {
+  margin-left: auto; flex: 0 0 auto;
+  padding: 3px 9px; border: 1px solid var(--border); border-radius: 9px;
+  background: var(--bg-input); color: var(--error);
+  font: inherit; font-size: 11px; font-weight: 600;
+  text-transform: none; letter-spacing: 0; cursor: pointer;
+}
+.label-btn:active { background: rgba(224, 82, 82, .16); }
+
+/* A project's sessions, banded together. Deliberately not a `.row`: it is a place
+   to act on the group, and nothing in it should read as another session. */
+.group-head {
+  display: flex; align-items: center; gap: 8px;
+  padding: 9px 16px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-raised);
+}
+.group-name { font-size: 12.5px; font-weight: 600; }
+.group-note { color: var(--text-dim); font-size: 11.5px; }
+.group-btn { margin-left: auto; padding: 4px 9px; font-size: 11.5px; }
+
 .empty.small { padding: 16px; text-align: left; font-size: 13px; }
 .label-note { font-weight: 400; text-transform: none; letter-spacing: 0; }
 .label-note code {

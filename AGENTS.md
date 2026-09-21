@@ -757,6 +757,19 @@ to turn a caller-supplied string into a signal for an arbitrary process.
 `admin-test.js` tests the refusals hardest, and `deploy.sh` will not deploy without
 it.
 
+**A bulk stop asks one question that carries all the refusals.** Fifteen panel
+sessions across two projects is the state this page is actually opened in, and
+tapping Stop fifteen times — answering fifteen separate 409s — is what "Stop all"
+in a section label, and per project in the band heading above its rows, exists to
+replace. It is still the same `/api/admin/kill`, once per session, with `force`: the
+client aggregates what the refusals would have said ("2 working right now, 1 open on
+a device") into the single confirm, and the server re-reads the process table and
+re-checks parentage for every pid, exactly as before. There is deliberately no bulk
+route — a loop over an audited kill is cheaper than a second code path that can
+signal things, and the list it loops over is re-fetched first, because polling stops
+while the tab is hidden and a stale list means killing a turn that started after it
+was drawn.
+
 ## Being told a turn ended
 
 The thing that made this box worth building is starting a turn and walking away.

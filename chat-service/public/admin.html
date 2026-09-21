@@ -41,13 +41,19 @@
     <div class="section-label">Services</div>
     <div id="units" class="units"></div>
 
-    <div class="section-label">Chat conversations</div>
+    <!-- The stop-all buttons live in the labels, as far from the per-row Stop as
+         the section is tall. They are hidden until there are two things to stop,
+         and admin.js writes the count into them. -->
+    <div class="section-label with-action">Chat conversations
+      <button id="stop-all-chat" class="label-btn hidden">Stop all</button></div>
     <div id="surface-chat"></div>
 
-    <div class="section-label">Editor panel <span class="label-note">via the broker</span></div>
+    <div class="section-label with-action">Editor panel <span class="label-note">via the broker</span>
+      <button id="stop-all-broker" class="label-btn hidden">Stop all</button></div>
     <div id="surface-broker"></div>
 
-    <div class="section-label">Terminal <span class="label-note">tmux, <code>cc</code></span></div>
+    <div class="section-label with-action">Terminal <span class="label-note">tmux, <code>cc</code></span>
+      <button id="stop-all-tmux" class="label-btn hidden">End all</button></div>
     <div id="surface-tmux"></div>
 
     <p class="hint" id="admin-footer"></p>

@@ -39,7 +39,14 @@ const escapeHtml = (s) =>
   String(s ?? '').replace(/[&<>"']/g, (c) =>
     ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
-const mb = (kb) => (kb == null ? '—' : kb >= 1024 ? `${(kb / 1024).toFixed(kb >= 10240 ? 0 : 1)} GB` : `${Math.round(kb)} MB`);
+// Both of these take kilobytes, which is what /proc, `df` and os.totalmem() all
+// deal in. The thresholds are in kilobytes too: comparing against 1024 read as "a
+// megabyte" and printed this box's 7.7 GB of memory as "7715 GB".
+const mb = (kb) => (kb == null
+  ? '—'
+  : kb >= 1024 * 1024
+    ? `${(kb / (1024 * 1024)).toFixed(kb >= 10 * 1024 * 1024 ? 0 : 1)} GB`
+    : `${Math.round(kb / 1024)} MB`);
 const rss = (kb) => (kb == null ? '—' : `${Math.round(kb / 1024)} MB`);
 
 function duration(seconds) {
@@ -71,6 +78,59 @@ function row({ title, sub, badges = [], action = null }) {
 }
 
 const badge = (text, kind = '') => `<span class="pill ${kind}">${escapeHtml(text)}</span>`;
+
+/**
+ * What a session is grouped and titled by. One expression, used by the rows, the
+ * headings and the bulk stop, because a group whose name does not match the rows
+ * under it would stop the wrong set.
+ */
+const groupKey = (s) =>
+  s.project || s.cwd || (s.pid ? `pid ${s.pid}` : s.name) || 'unknown';
+
+/**
+ * Sessions banded by project, biggest band first.
+ *
+ * This is how the box actually gets into the state worth acting on: one project's
+ * panel left open across a day, eight sessions deep, interleaved with another's.
+ * Grouping them is what makes "stop that project's sessions" one tap.
+ *
+ * Biggest first, so the bands that get a heading come before the projects with a
+ * single session — which are left as bare rows, because a heading over one row
+ * only repeats the project name the row already carries.
+ */
+function byProject(sessions) {
+  const groups = new Map();
+  for (const s of sessions) {
+    const key = groupKey(s);
+    groups.set(key, [...(groups.get(key) || []), s]);
+  }
+  return [...groups].sort((a, b) => b[1].length - a[1].length);
+}
+
+/**
+ * A project's heading inside a surface. Quieter than a row on purpose: it is a
+ * place to act on the group, not another session.
+ *
+ * The button appears only from two sessions up. With one, the row's own Stop does
+ * the same thing, and two buttons for one outcome is how you tap the wrong one.
+ */
+function groupHeading(kind, name, sessions) {
+  const el = document.createElement('div');
+  el.className = 'group-head';
+  const stoppable = SURFACES[kind].targets(sessions).length;
+  const totalKb = sessions.reduce((sum, s) => sum + (s.rssKb || 0), 0);
+  el.innerHTML =
+    `<span class="group-name">${escapeHtml(name)}</span>`
+    + `<span class="group-note">${sessions.length} · ${mb(totalKb)}</span>`;
+  if (stoppable > 1) {
+    const btn = document.createElement('button');
+    btn.className = 'kill-btn group-btn';
+    btn.textContent = `${SURFACES[kind].verb} all ${stoppable}`;
+    btn.addEventListener('click', () => stopAll(kind, name));
+    el.appendChild(btn);
+  }
+  return el;
+}
 
 function empty(text) {
   const el = document.createElement('div');
@@ -120,6 +180,126 @@ async function kill(kind, target, label) {
     }
   } catch (err) {
     if (!redirecting) toast(err.message);
+  }
+}
+
+/**
+ * The three surfaces, as the bulk stop needs to see them: what one of these is
+ * called, which group it belongs to, and what the server would refuse it for.
+ *
+ * That last field is the one that earns this table. A bulk stop cannot ask per row
+ * — asking fifteen times is the thing it exists to avoid — so it aggregates the
+ * same facts the fifteen refusals would have carried and puts them in the single
+ * question it does ask. These reasons therefore mirror the rules in
+ * `chat-service/admin.js`'s `kill()`, and must not drift from them: the server
+ * still enforces them, and still refuses anything this page gets wrong.
+ */
+const SURFACES = {
+  chat: {
+    noun: 'chat conversation',
+    verb: 'Stop',
+    risk: 'a turn in flight cannot be recovered',
+    targets: (list) => list.map((s) => ({
+      target: s.id,
+      group: groupKey(s),
+      live: s.busy ? 'working right now' : null,
+    })),
+  },
+  broker: {
+    noun: 'editor panel session',
+    verb: 'Stop',
+    risk: 'a turn in flight cannot be recovered',
+    targets: (list) => list.map((s) => ({
+      target: s.pid,
+      group: groupKey(s),
+      // A probe has no reason at all, which is why a page full of them asks the
+      // short question. `working` is null when the broker could not be asked, and
+      // null is not a reason to claim anything.
+      live: s.working ? 'working right now' : s.clients ? 'open on a device' : null,
+    })),
+  },
+  tmux: {
+    noun: 'terminal session',
+    verb: 'End',
+    risk: 'scrollback cannot come back',
+    // Only what `cc` started, matching the row buttons: the server refuses the
+    // rest, and a bulk action must not quietly try things that cannot work.
+    targets: (list) => list.filter((s) => s.isClaudeSession).map((s) => ({
+      target: s.name,
+      group: groupKey(s),
+      live: s.attachedClients ? 'open on a device' : 'holding its scrollback',
+    })),
+  },
+};
+
+/** "2 working right now, 1 open on a device" — the refusals, counted. */
+function liveSummary(targets) {
+  const counts = new Map();
+  for (const t of targets) if (t.live) counts.set(t.live, (counts.get(t.live) || 0) + 1);
+  return [...counts].map(([reason, n]) => `${n} ${reason}`).join(', ');
+}
+
+let stopping = false;
+
+/**
+ * Stop a whole surface, or one project's sessions on it.
+ *
+ * The list comes from a fresh `overview()` rather than from the rows on screen.
+ * Polling stops while the tab is hidden, so what is rendered can be minutes old,
+ * and this is the one place where acting on a stale list means killing a turn that
+ * started after it was drawn.
+ *
+ * Then it is the ordinary per-item kill, N times, with `force` — the answer the
+ * user just gave to the aggregate question. No new route: `kill()` re-reads the
+ * process table and re-checks parentage for every pid it signals, and a bulk stop
+ * is not a reason to give up the one check that keeps a pid from the client from
+ * becoming a signal to an arbitrary process.
+ */
+async function stopAll(kind, group = null) {
+  const surface = SURFACES[kind];
+  if (!surface || stopping) return;
+  try {
+    const res = await api('/api/admin/overview');
+    if (!res.ok) throw new Error(`server returned ${res.status}`);
+    const data = await res.json();
+    const targets = surface.targets(data.surfaces[kind] || [])
+      .filter((t) => group === null || t.group === group);
+    if (!targets.length) {
+      toast('Nothing left to stop.');
+      refresh();
+      return;
+    }
+
+    const plural = targets.length === 1 ? '' : 's';
+    const summary = liveSummary(targets);
+    const question =
+      `${surface.verb} all ${targets.length} ${group ? `${group} ` : ''}${surface.noun}${plural}?`
+      + (summary ? `\n\n${summary} — ${surface.risk}.` : '');
+    if (!confirm(question)) return;
+
+    stopping = true;
+    toast(`Stopping ${targets.length} ${surface.noun}${plural}…`, 60_000);
+    let stopped = 0;
+    let lastError = null;
+    for (const t of targets) {
+      const one = await api('/api/admin/kill', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ kind, target: t.target, force: true }),
+      });
+      if (one.status === 200) stopped += 1;
+      else lastError = (await one.json().catch(() => ({}))).error || `server returned ${one.status}`;
+    }
+    // Partial is the normal outcome, not an error: something on this list can exit
+    // on its own between the overview and its turn in the loop.
+    toast(stopped === targets.length
+      ? `Stopped ${stopped} ${surface.noun}${plural}.`
+      : `Stopped ${stopped} of ${targets.length} — ${lastError}`);
+    refresh();
+  } catch (err) {
+    if (!redirecting) toast(err.message);
+  } finally {
+    stopping = false;
   }
 }
 
@@ -205,21 +385,24 @@ function renderChat(sessions) {
     el.appendChild(empty('No chat conversations running.'));
     return;
   }
-  for (const s of sessions) {
-    const badges = [];
-    if (s.busy) badges.push(badge('working', 'hot'));
-    if (!s.alive) badges.push(badge('process gone', 'warn'));
-    el.appendChild(
-      row({
-        title: s.project || s.cwd,
-        sub:
-          `${escapeHtml(s.sessionId ? `${s.sessionId.slice(0, 8)}…` : 'starting')} · ` +
-          `${rss(s.rssKb)} · ${duration(s.ageSeconds)} · ${escapeHtml(s.permissionMode)}`,
-        badges,
-        action: { label: 'Stop', onClick: () => kill('chat', s.id, `the ${s.project} chat`) },
-      }),
-    );
+  for (const [name, group] of byProject(sessions)) {
+    if (group.length > 1) el.appendChild(groupHeading('chat', name, group));
+    for (const s of group) el.appendChild(chatRow(s));
   }
+}
+
+function chatRow(s) {
+  const badges = [];
+  if (s.busy) badges.push(badge('working', 'hot'));
+  if (!s.alive) badges.push(badge('process gone', 'warn'));
+  return row({
+    title: groupKey(s),
+    sub:
+      `${escapeHtml(s.sessionId ? `${s.sessionId.slice(0, 8)}…` : 'starting')} · ` +
+      `${rss(s.rssKb)} · ${duration(s.ageSeconds)} · ${escapeHtml(s.permissionMode)}`,
+    badges,
+    action: { label: 'Stop', onClick: () => kill('chat', s.id, `the ${s.project} chat`) },
+  });
 }
 
 function renderBroker(sessions) {
@@ -229,30 +412,33 @@ function renderBroker(sessions) {
     el.appendChild(empty('No editor conversations running.'));
     return;
   }
-  // Probes last: they are noise until you want to reap them, and a live
-  // conversation is what you came here to look at.
-  const sorted = [...sessions].sort((a, b) => Number(a.probe) - Number(b.probe));
-  for (const s of sorted) {
-    const badges = [];
-    if (s.probe) badges.push(badge('idle probe', 'warn'));
-    // Only the broker can say either of these, and only about a process it still
-    // holds. Both are absent rather than false when it could not be asked.
-    if (s.working) badges.push(badge('working', 'hot'));
-    if (s.clients) badges.push(badge(`${s.clients} attached`));
-    el.appendChild(
-      row({
-        title: s.project || s.cwd || `pid ${s.pid}`,
-        sub:
-          `${escapeHtml(s.sessionId ? `${s.sessionId.slice(0, 8)}…` : 'no session')} · ` +
-          `pid ${s.pid} · ${rss(s.rssKb)} · ${duration(s.ageSeconds)}`,
-        badges,
-        action: {
-          label: 'Stop',
-          onClick: () => kill('broker', s.pid, s.probe ? 'the probe' : `the ${s.project} panel session`),
-        },
-      }),
-    );
+  for (const [name, group] of byProject(sessions)) {
+    if (group.length > 1) el.appendChild(groupHeading('broker', name, group));
+    // Probes last, within the project: they are noise until you want to reap them,
+    // and a live conversation is what you came here to look at.
+    const sorted = [...group].sort((a, b) => Number(a.probe) - Number(b.probe));
+    for (const s of sorted) el.appendChild(brokerRow(s));
   }
+}
+
+function brokerRow(s) {
+  const badges = [];
+  if (s.probe) badges.push(badge('idle probe', 'warn'));
+  // Only the broker can say either of these, and only about a process it still
+  // holds. Both are absent rather than false when it could not be asked.
+  if (s.working) badges.push(badge('working', 'hot'));
+  if (s.clients) badges.push(badge(`${s.clients} attached`));
+  return row({
+    title: groupKey(s),
+    sub:
+      `${escapeHtml(s.sessionId ? `${s.sessionId.slice(0, 8)}…` : 'no session')} · ` +
+      `pid ${s.pid} · ${rss(s.rssKb)} · ${duration(s.ageSeconds)}`,
+    badges,
+    action: {
+      label: 'Stop',
+      onClick: () => kill('broker', s.pid, s.probe ? 'the probe' : `the ${s.project} panel session`),
+    },
+  });
 }
 
 function renderTmux(sessions) {
@@ -283,6 +469,22 @@ function renderTmux(sessions) {
   }
 }
 
+/**
+ * The whole-surface button, in that surface's label.
+ *
+ * Shown only for two or more sessions spread across two or more projects. With one
+ * session the row's own button is the same action; with one project the band
+ * heading's is — and two buttons that do the same thing, a thumb-width apart, is
+ * how you stop the wrong set.
+ */
+function setStopAll(kind, sessions) {
+  const btn = $(`#stop-all-${kind}`);
+  const targets = SURFACES[kind].targets(sessions);
+  const projects = new Set(targets.map((t) => t.group));
+  btn.classList.toggle('hidden', targets.length < 2 || projects.size < 2);
+  btn.textContent = `${SURFACES[kind].verb} all ${targets.length}`;
+}
+
 let failures = 0;
 
 async function refresh() {
@@ -298,6 +500,7 @@ async function refresh() {
     renderChat(data.surfaces.chat);
     renderBroker(data.surfaces.broker);
     renderTmux(data.surfaces.tmux);
+    for (const kind of Object.keys(SURFACES)) setStopAll(kind, data.surfaces[kind]);
 
     const total =
       data.surfaces.chat.length + data.surfaces.broker.length + data.surfaces.tmux.length;
@@ -318,6 +521,9 @@ async function refresh() {
 }
 
 $('#btn-refresh').addEventListener('click', refresh);
+for (const kind of Object.keys(SURFACES)) {
+  $(`#stop-all-${kind}`).addEventListener('click', () => stopAll(kind));
+}
 
 // Polled rather than pushed. The numbers here are cheap (one `ps`, one `df`, five
 // `systemctl show`) but they are not free, so this only runs while the page is
@@ -347,7 +553,7 @@ document.addEventListener('visibilitychange', () => {
 // Exposed for admin-test.js, which boots this file in jsdom for the same reason
 // smoke-test.js boots app.js: a runtime error at load leaves a page that looks
 // like the server is down, and this is the page you would be checking.
-window.__adminForTest = { refresh, kill, reap, renderFindings, duration, rss };
+window.__adminForTest = { refresh, kill, stopAll, reap, renderFindings, duration, rss };
 
 refresh();
 startPolling();

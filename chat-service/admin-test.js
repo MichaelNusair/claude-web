@@ -546,6 +546,12 @@ const $ = (sel) => w.document.querySelector(sel);
 
   check('four host cards', $('#host').querySelectorAll('.card').length === 4);
   check('memory is on one of them', $('#host').innerHTML.includes('90%'));
+  // 8 GiB of memory, said in the units it is in. The threshold used to be compared
+  // against a kilobyte count as though it were megabytes, so this box's 7.7 GB of
+  // memory and 100 GB volume were reported as "7715 GB" and "97656 GB".
+  check('and in the right units', $('#host').textContent.includes('7.2 GB of 8.0 GB'),
+    $('#host').textContent);
+  check('the volume too', $('#host').textContent.includes('38 GB of 95 GB'), $('#host').textContent);
   check('a hot meter reads hot', $('#host').innerHTML.includes('class="hot"'));
 
   check('five service rows', $('#units').querySelectorAll('.unit').length === 5);
@@ -567,6 +573,25 @@ const $ = (sel) => w.document.querySelector(sel);
     $('#surface-broker').textContent);
   check('and what the broker said about it', freshRow?.textContent.includes('working')
     && freshRow?.textContent.includes('2 attached'), freshRow?.textContent);
+
+  // Banded by project, because the state this page is opened in is one project's
+  // panel eight sessions deep next to another's.
+  const bands = [...$('#surface-broker').querySelectorAll('.group-head')];
+  check('a project with several sessions gets a band', bands.length === 1, `${bands.length} bands`);
+  check('named, and carrying what it costs', bands[0]?.textContent.includes('demo')
+    && bands[0]?.textContent.includes('4'), bands[0]?.textContent);
+  check('with one button for the four', bands[0]?.querySelector('.group-btn')?.textContent === 'Stop all 4',
+    bands[0]?.querySelector('.group-btn')?.textContent);
+  // The other project has one session, and a heading over one row would only
+  // repeat the project name that row already carries — hence a single band here.
+  check('the surface offers to stop the lot', $('#stop-all-broker').textContent === 'Stop all 5'
+    && !$('#stop-all-broker').classList.contains('hidden'), $('#stop-all-broker').textContent);
+  check('so does the chat surface', $('#stop-all-chat').textContent === 'Stop all 2'
+    && !$('#stop-all-chat').classList.contains('hidden'), $('#stop-all-chat').textContent);
+  // One cc session and someone's own shell: a stop-all over one thing is a bigger
+  // gesture than the thing it does, and the shell is not ours to end.
+  check('the terminal surface does not, with one session on it',
+    $('#stop-all-tmux').classList.contains('hidden'));
 
   check('the tmux sessions are listed', $('#surface-tmux').querySelectorAll('.row').length === 2);
   // No button is better than a button whose only outcome is a refusal.
@@ -610,6 +635,79 @@ console.log('\nThe page asks before forcing anything:');
   await kill('chat', 'c1', 'the demo chat');
   check('a non-409 failure is not turned into a force prompt', confirmed.length === 0 && posts.length === 1);
   check('and is reported', $('#toast').textContent.includes('something else broke'), $('#toast').textContent);
+
+  posts.length = 0;
+  confirmed.length = 0;
+  killReplies = [];
+  confirmAnswer = true;
+  // Fifteen rows is the state this page is actually opened in, and tapping Stop
+  // fifteen times is what the bulk stop exists to replace. The question it asks
+  // stands in for the refusals it will not be getting, so it must carry them.
+  await w.__adminForTest.stopAll('broker');
+  check('one question for the whole surface', confirmed.length === 1, `${confirmed.length} questions`);
+  check('it says how many', confirmed[0]?.includes('all 5 editor panel sessions'), confirmed[0]);
+  check('and what is live among them', confirmed[0]?.includes('1 working right now')
+    && confirmed[0]?.includes('1 open on a device'), confirmed[0]);
+  check('a turn in flight is named as the cost', confirmed[0]?.includes('cannot be recovered'), confirmed[0]);
+  check('every session is stopped', posts.length === 5, `${posts.length} posts`);
+  check('each with force, which is what the one question answered',
+    posts.every((p) => p.body.force === true && p.body.kind === 'broker'));
+  const stoppedPids = posts.map((p) => p.body.target).sort().join(',');
+  check('and only the broker\'s own children', stoppedPids === '901,902,903,904,905', stoppedPids);
+  check('it says what it stopped', $('#toast').textContent.includes('Stopped 5'), $('#toast').textContent);
+
+  posts.length = 0;
+  confirmed.length = 0;
+  // The per-project stop: one project's panel left open all day is how the box gets
+  // here, and the other project's conversation must survive it.
+  await w.__adminForTest.stopAll('broker', 'demo');
+  check('a project\'s stop names the project', confirmed[0]?.includes('all 4 demo editor panel sessions'), confirmed[0]);
+  const demoPids = posts.map((p) => p.body.target).sort().join(',');
+  check('and stops only that project', demoPids === '901,902,903,905', demoPids);
+
+  posts.length = 0;
+  confirmed.length = 0;
+  confirmAnswer = false;
+  await w.__adminForTest.stopAll('chat');
+  check('answering no to a bulk stop stops nothing', posts.length === 0, `${posts.length} posts`);
+  confirmAnswer = true;
+
+  posts.length = 0;
+  confirmed.length = 0;
+  await w.__adminForTest.stopAll('tmux');
+  check('the terminal surface offers only what `cc` started', posts.length === 1
+    && posts[0].body.target === 'claude-demo', JSON.stringify(posts.map((p) => p.body.target)));
+  check('and says scrollback is the thing being lost',
+    confirmed[0]?.includes('scrollback cannot come back'), confirmed[0]);
+
+  posts.length = 0;
+  confirmed.length = 0;
+  // A partial is the normal outcome: something can exit between the overview and
+  // its turn in the loop, and that is not an error to hide.
+  killReplies = [
+    { status: 200, body: { stopped: true } },
+    { status: 409, body: { error: 'that process has already gone' } },
+  ];
+  await w.__adminForTest.stopAll('broker', 'demo');
+  check('a partial bulk stop reports both halves',
+    $('#toast').textContent.includes('Stopped 3 of 4')
+    && $('#toast').textContent.includes('already gone'), $('#toast').textContent);
+  killReplies = [];
+
+  // One project holding the whole surface: the band heading's button already IS the
+  // surface's button, and two of them a thumb-width apart is how you stop the wrong
+  // set. The fixture is mutated and put back, because the fetch stub hands out this
+  // same object to every poll.
+  const projects = payload.surfaces.broker.map((s) => s.project);
+  for (const s of payload.surfaces.broker) s.project = 'demo';
+  await w.__adminForTest.refresh();
+  check('with one project, the surface button steps aside',
+    $('#stop-all-broker').classList.contains('hidden'));
+  check('and the band covers everything', [...$('#surface-broker').querySelectorAll('.group-head')]
+    .map((h) => h.querySelector('.group-btn')?.textContent).join('|') === 'Stop all 5',
+    $('#surface-broker').querySelector('.group-btn')?.textContent);
+  payload.surfaces.broker.forEach((s, i) => { s.project = projects[i]; });
+  await w.__adminForTest.refresh();
 
   posts.length = 0;
   await w.__adminForTest.reap();
