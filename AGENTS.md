@@ -804,8 +804,8 @@ with `stop_reason: 'tool_use'`, and the process really does have a turn in fligh
 the transcript said "working", the broker agreed, and every surface reported a
 conversation that had stopped and would stay stopped until a person walked back to the
 panel. Measured across the transcripts on this box: 71 answered asks, a median wait of
-three minutes, a longest of 5.9 hours, three sitting unanswered right now. The fact
-neither source has on its own is whether a `tool_result` for that ask ever arrived, and
+three minutes, a longest of 5.9 hours, three sitting unanswered as it was written. The
+fact neither source has on its own is whether a `tool_result` for that ask arrived, and
 that is in the file — so `lastExchange()` decides it, reports `state: 'question'`, and
 `claudeStatus()` lets it beat a live broker's "working" (the second place the
 transcript outranks the broker, after `OVERRIDE_QUIET_MS`). It takes a live process: an
