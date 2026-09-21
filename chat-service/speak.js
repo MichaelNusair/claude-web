@@ -105,6 +105,12 @@ import {
   DescribeVoicesCommand,
 } from '@aws-sdk/client-polly';
 import { openAiKey, openAiRefusal, resetOpenAi } from './openai.js';
+import {
+  AZURE_VOICES,
+  azureSpeechConfigured,
+  resetAzureSpeech,
+  speakAzure,
+} from './azure-speech.js';
 
 const REGION = process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || 'us-east-1';
 // `generative` is the point of this file. `neural` ($16/M) and `standard` ($4/M)
@@ -127,6 +133,8 @@ const DEFAULT_VOICE = process.env.SPEAK_VOICE || 'Ruth';
  */
 const OPENAI_MODEL = process.env.SPEAK_OPENAI_MODEL || 'gpt-4o-mini-tts';
 const OPENAI_VOICE = process.env.SPEAK_OPENAI_VOICE || 'marin';
+/** Which of Azure's two Hebrew voices reads by default. Both are neural. */
+const AZURE_VOICE = process.env.SPEAK_AZURE_VOICE || 'Hila';
 const OPENAI_URL = 'https://api.openai.com/v1/audio/speech';
 
 /**
@@ -164,6 +172,14 @@ const DAILY_CHARS = Number(process.env.SPEAK_DAILY_CHARS || 300_000);
 // spent reading Hebrew cannot exhaust the English voice, and so that the number
 // can be reasoned about per provider when either price moves.
 const OPENAI_DAILY_CHARS = Number(process.env.SPEAK_OPENAI_DAILY_CHARS || 300_000);
+/*
+ * Azure's allowance is not about money — the F0 tier is free and answers 429 rather
+ * than billing — it is about not spending the whole month in an afternoon. 0.5M
+ * characters a month over 31 days is 16,129, so 16,000 a day keeps the Hebrew voice
+ * working on the 28th. Going over is not a charge and this is not protecting anyone
+ * from one; it is rationing a free thing so it lasts.
+ */
+const AZURE_DAILY_CHARS = Number(process.env.SPEAK_AZURE_DAILY_CHARS || 16_000);
 // Long enough to finish reading a message and to read it again; short enough that
 // a phone left on the sheet is not holding megabytes of audio for the afternoon.
 const TTL_MS = Number(process.env.SPEAK_TTL_MS || 10 * 60 * 1000);
@@ -254,6 +270,169 @@ export function hebrewShare(text) {
 /** Does this text need a voice Polly does not have? */
 export function needsMultilingualVoice(text) {
   return hebrewShare(text) >= HEBREW_SHARE;
+}
+
+/**
+ * How many lines of a block are read before the voice stops and says how many are
+ * left. A 300-line file pasted into a message is not something anyone listens to,
+ * and it is billed per character.
+ */
+export const CODE_LINES = Number(process.env.SPEAK_CODE_LINES || 40);
+
+/** Tags people actually write on a fence, spoken as the language's name. */
+const CODE_LANGUAGES = {
+  js: 'JavaScript', jsx: 'JavaScript', mjs: 'JavaScript', cjs: 'JavaScript',
+  javascript: 'JavaScript', ts: 'TypeScript', tsx: 'TypeScript', typescript: 'TypeScript',
+  py: 'Python', python: 'Python', rb: 'Ruby', go: 'Go', rs: 'Rust', java: 'Java',
+  c: 'C', h: 'C', cpp: 'C plus plus', cs: 'C sharp', php: 'PHP', swift: 'Swift',
+  kt: 'Kotlin', sh: 'shell', bash: 'shell', zsh: 'shell', console: 'shell',
+  shell: 'shell', json: 'JSON', yaml: 'YAML', yml: 'YAML', toml: 'TOML',
+  html: 'HTML', css: 'CSS', scss: 'CSS', sql: 'SQL', md: 'markdown',
+  markdown: 'markdown', diff: 'diff', patch: 'diff', xml: 'XML', ini: 'config',
+  env: 'config', dockerfile: 'Dockerfile', text: '', txt: '', '': '',
+};
+
+/**
+ * Operators, in words, longest first.
+ *
+ * This list is the reason this function exists. A synthesiser does not mispronounce
+ * punctuation — it says nothing at all for it — so `if (!ok) return` read literally
+ * is "if ok return", which is the opposite of the code, and `a !== b` is "a b".
+ * That is the same failure as Polly and Hebrew: not a wrong noise, a silent change
+ * of meaning. The ones that alter what a line *does* are spoken; the ones that only
+ * group it (braces, parens, semicolons) are left to become pauses, because "open
+ * brace" on every line is how a listener stops listening.
+ *
+ * The single-character operators are only spoken when they are spaced, which is how
+ * they are written in an expression and is not how they appear in `<div>`, `a/b/c`
+ * or `-flag`. Sequential replacement is safe: every replacement is made of letters,
+ * so no later pattern can match what an earlier one produced.
+ */
+const CODE_OPERATORS = [
+  [/=>/g, ' arrow '],
+  [/===/g, ' strictly equals '],
+  [/!==/g, ' strictly not equals '],
+  [/==/g, ' equals '],
+  [/!=/g, ' not equals '],
+  [/<=/g, ' less than or equal to '],
+  [/>=/g, ' greater than or equal to '],
+  [/&&/g, ' and '],
+  [/\|\|/g, ' or '],
+  [/\?\?/g, ' or else '],
+  [/\+\+/g, ' plus plus '],
+  [/--(?=\s|$)/g, ' minus minus '],
+  [/\.\.\./g, ' spread '],
+  [/->/g, ' arrow '],
+  // `!ok`, `!isReady` — a negation directly on a word or a bracket.
+  [/!(?=[A-Za-z_$(])/g, ' not '],
+  [/ = /g, ' equals '],
+  [/ < /g, ' less than '],
+  [/ > /g, ' greater than '],
+  [/ \+ /g, ' plus '],
+  [/ \* /g, ' times '],
+  [/ % /g, ' modulo '],
+  [/ \| /g, ' piped to '],
+];
+
+/** One line of code, as words. */
+function lineAloud(line, { diff = false } = {}) {
+  let text = String(line).replace(/\t/g, '  ');
+
+  /*
+   * A diff's first column is the whole message. Read without it, "return null" and
+   * "return null" are the same sentence and the change has vanished — so it is said
+   * in words, and said first, before anything else reorders the line.
+   */
+  let prefix = '';
+  if (diff && /^[+-]/.test(text) && !/^(\+\+\+|---)/.test(text)) {
+    prefix = text.startsWith('+') ? 'added, ' : 'removed, ';
+    text = text.slice(1);
+  } else if (diff && /^(\+\+\+|---|@@)/.test(text)) {
+    // File headers and hunk markers are noise to a listener; the file name is
+    // already in the message around the block.
+    return '';
+  }
+
+  // Underscores join words that are meant to be heard as words: SPEAK_DAILY_CHARS
+  // is three of them, not one unpronounceable token.
+  text = text.replace(/([A-Za-z0-9])_(?=[A-Za-z0-9])/g, '$1 ');
+
+  for (const [pattern, word] of CODE_OPERATORS) text = text.replace(pattern, word);
+
+  // Quotes are silent anyway, and what is inside them is usually the readable part
+  // of the line. Structural punctuation becomes space, which becomes a pause.
+  text = text.replace(/[`"']/g, ' ');
+  text = text.replace(/[{}[\]();]/g, ' ');
+
+  text = text.replace(/\s+/g, ' ').trim();
+  if (!text) return '';
+  return prefix + text;
+}
+
+/**
+ * A code block, as something that can be listened to.
+ *
+ * The alternative, and what both surfaces do today, is to say "Code block." and move
+ * on — which is right for a summary being heard on a walk, and wrong in the one case
+ * the person asked for: when the code *is* the message and they want to hear it
+ * rather than stop and read it. So this is a mode, not a replacement.
+ *
+ * What it does not try to be is dictation of source: nobody can reconstruct a file
+ * from hearing it, and a voice that says "open brace close paren semicolon" makes
+ * that failure louder rather than fixing it. It aims at the thing a listener can
+ * actually use — which identifiers, which calls, what is compared with what, and
+ * which way round a negation goes — and says how many lines it did not read.
+ */
+export function codeAloud(code, { lang = '', maxLines = CODE_LINES } = {}) {
+  const raw = String(code == null ? '' : code);
+
+  // The caller may hand over the whole fenced block, fence and language tag and all,
+  // because that is what it has: the text of the element the button is attached to.
+  let language = String(lang || '').trim();
+  const fenced = /^\s*(?:```|~~~)([^\n]*)\n([\s\S]*?)(?:```|~~~)\s*$/.exec(raw);
+  const open = /^\s*(?:```|~~~)([^\n]*)\n([\s\S]*)$/.exec(raw);
+  const match = fenced || open;
+  let body = raw;
+  if (match) {
+    language = language || match[1].trim().split(/\s+/)[0];
+    body = match[2];
+  }
+
+  const lines = body.split('\n');
+  while (lines.length && !lines[0].trim()) lines.shift();
+  while (lines.length && !lines[lines.length - 1].trim()) lines.pop();
+  if (!lines.length) return 'That code block is empty.';
+
+  const tag = language.toLowerCase().replace(/^\./, '');
+  const name = tag in CODE_LANGUAGES ? CODE_LANGUAGES[tag] : /^[a-z+#]{1,12}$/.test(tag) ? tag : '';
+  const diff = name === 'diff';
+
+  const shown = lines.slice(0, Math.max(1, maxLines));
+  const spoken = [];
+  for (const line of shown) {
+    const said = lineAloud(line, { diff });
+    if (!said) continue;
+    /*
+     * A line that ends where an expression does gets a full stop; one that is
+     * plainly continued gets a comma. Both are pacing — the stop is what keeps two
+     * statements from running together into a sentence that says neither.
+     */
+    const open_ = /[,(+\-=&|?:]$|\b(and|or|equals|arrow|plus|times)$/.test(said);
+    spoken.push(/[.!?]$/.test(said) ? said : `${said}${open_ ? ',' : '.'}`);
+  }
+
+  const count = lines.length;
+  const header = `${name ? `${name} ` : ''}code, ${count === 1 ? 'one line' : `${count} lines`}.`;
+  const rest = count - shown.length;
+  const tail = rest > 0
+    ? ` That is the first ${shown.length} lines; the other ${rest} are on screen.`
+    : '';
+
+  // Every line being unreadable — a block of nothing but braces — is still worth an
+  // honest answer rather than a header followed by silence.
+  if (!spoken.length) return `${header} There is nothing in it that can be read aloud.`;
+
+  return `${header} ${spoken.join(' ')}${tail}`.replace(/\s+/g, ' ').trim();
 }
 
 /**
@@ -663,12 +842,29 @@ async function openAiSynthesize(text, voice, model) {
  */
 function synthesize(text, voice, engine, provider) {
   if (provider === 'openai') return openAiSynthesize(text, voice, engine);
+  if (provider === 'azure') return azureSynthesize(text, engine);
   return pollySynthesize(text, voice, engine);
+}
+
+/**
+ * Azure's half, with its refusals given the type the routes answer from.
+ *
+ * `engine` carries the full Azure voice name — `he-IL-HilaNeural` — because the bare
+ * id is what a picker shows and what a phone remembers, and the long name is what the
+ * wire wants. It is also part of the cache id, so a change of voice cannot be served
+ * yesterday's audio.
+ */
+async function azureSynthesize(text, voiceName) {
+  try {
+    return await speakAzure(text, voiceName);
+  } catch (err) {
+    throw new SpeakError(err.message, err.status || 502);
+  }
 }
 
 const cache = new VoiceCache({
   synthesize,
-  dailyChars: { polly: DAILY_CHARS, openai: OPENAI_DAILY_CHARS },
+  dailyChars: { polly: DAILY_CHARS, openai: OPENAI_DAILY_CHARS, azure: AZURE_DAILY_CHARS },
 });
 
 /**
@@ -721,14 +917,44 @@ async function knownVoices() {
     provider: 'polly',
     engine: ENGINE,
   }));
-  if (!(await openAiKey())) return polly;
-
   const taken = new Set(polly.map((v) => v.id.toLowerCase()));
-  const openai = OPENAI_VOICES.filter((v) => !taken.has(v.id.toLowerCase())).map((v) => ({
-    ...v,
-    engine: OPENAI_MODEL,
-  }));
-  return [...polly, ...openai];
+  const out = [...polly];
+
+  // Azure before OpenAI, because its Hebrew is free and OpenAI's is not: when both
+  // are configured and a message needs a Hebrew voice, the one picked below is the
+  // first in this list that can speak it.
+  if (await azureSpeechConfigured()) {
+    for (const voice of AZURE_VOICES) {
+      if (taken.has(voice.id.toLowerCase())) continue;
+      taken.add(voice.id.toLowerCase());
+      // The long Azure name travels as the engine; see azureSynthesize.
+      out.push({ ...voice, engine: voice.name });
+    }
+  }
+
+  if (await openAiKey()) {
+    for (const voice of OPENAI_VOICES) {
+      if (taken.has(voice.id.toLowerCase())) continue;
+      taken.add(voice.id.toLowerCase());
+      out.push({ ...voice, engine: OPENAI_MODEL });
+    }
+  }
+
+  return out;
+}
+
+/**
+ * Can this voice say a Hebrew sentence without dropping it?
+ *
+ * Two ways to qualify, and they are different in kind. An Azure `he-IL` voice is a
+ * Hebrew voice — that is all it is. An OpenAI voice is multilingual and reads whatever
+ * it is given, which is why its `language` is `multi` rather than a locale. Polly has
+ * neither, in any voice, in any region, at any price.
+ */
+export function speaksHebrew(voice) {
+  if (!voice) return false;
+  if (voice.provider === 'openai') return true;
+  return String(voice.language || '').toLowerCase().startsWith('he');
 }
 
 /**
@@ -757,18 +983,26 @@ export function chooseVoice(requested, text, known) {
 
   let chosen = byName(wanted) || byName(DEFAULT_VOICE) || known[0];
 
-  if (needsMultilingualVoice(text) && chosen?.provider !== 'openai') {
-    const multilingual = byName(OPENAI_VOICE) || known.find((v) => v.provider === 'openai');
-    if (!multilingual) {
+  if (needsMultilingualVoice(text) && !speaksHebrew(chosen)) {
+    // In order: the Hebrew voice this deployment prefers, any Hebrew voice, any
+    // multilingual one. `known` is already ordered Azure before OpenAI, so a box with
+    // both reads Hebrew on the free tier without being told to.
+    const hebrew =
+      known.find((v) => speaksHebrew(v) && v.id === AZURE_VOICE) ||
+      known.find((v) => speaksHebrew(v) && v.provider === 'azure') ||
+      byName(OPENAI_VOICE) ||
+      known.find(speaksHebrew);
+    if (!hebrew) {
       throw new SpeakError(
         'there is Hebrew in this message and Polly has no Hebrew voice, so the box ' +
           'cannot read it — this device will use its own voice instead. To read ' +
-          'Hebrew here, put an OpenAI key in the `openaiApiKey` field of the voice ' +
-          'secret and call /api/voice-status?refresh=1',
+          'Hebrew here, put `speechKey` and `speechRegion` for an Azure Speech ' +
+          'resource (its free tier covers this) or an `openaiApiKey` in the voice ' +
+          'secret, then call /api/voice-status?refresh=1',
         409,
       );
     }
-    chosen = multilingual;
+    chosen = hebrew;
   }
 
   if (!chosen) {
@@ -797,9 +1031,20 @@ async function pickVoice(requested, text = '') {
  * It is read once and cached for the life of the process, so this is a real await
  * exactly once per restart.
  */
-export async function prepare(text, { voice } = {}) {
-  const chosen = await pickVoice(voice, text);
-  return cache.prepare(text, chosen.id, chosen.engine, chosen.provider);
+/**
+ * A message, ready to be read, as pieces a phone can fetch.
+ *
+ * `kind: 'code'` is the per-block read: the text is one fenced block and it is turned
+ * into listenable words here rather than replaced by "Code block". Doing it on the
+ * server, not in the two clients, is what keeps the editor overlay and the chat app
+ * saying the same thing — and the voice is chosen from the *spoken* text, which
+ * matters because a Hebrew comment inside a code block is still Hebrew and Polly
+ * would drop it without a sound.
+ */
+export async function prepare(text, { voice, kind = 'prose', lang = '' } = {}) {
+  const spoken = kind === 'code' ? codeAloud(text, { lang }) : text;
+  const chosen = await pickVoice(voice, spoken);
+  return cache.prepare(spoken, chosen.id, chosen.engine, chosen.provider);
 }
 
 /** The audio for one piece of a prepared message. */
@@ -817,19 +1062,31 @@ export async function speechStatus({
   lang = 'en',
   describe = describeVoices,
   hasOpenAi = async () => Boolean(await openAiKey()),
+  hasAzure = azureSpeechConfigured,
 } = {}) {
   const { voices, reason } = await describe();
   const openAiReady = await hasOpenAi();
+  const azureReady = await hasAzure();
 
   const pollyVoices = voices.map((v) => ({ ...v, provider: 'polly', engine: ENGINE }));
   const taken = new Set(pollyVoices.map((v) => v.id.toLowerCase()));
+  const azureVoices = azureReady
+    ? AZURE_VOICES.filter((v) => !taken.has(v.id.toLowerCase())).map((v) => ({
+        ...v,
+        engine: v.name,
+      }))
+    : [];
+  for (const v of azureVoices) taken.add(v.id.toLowerCase());
   const openAiVoices = openAiReady
     ? OPENAI_VOICES.filter((v) => !taken.has(v.id.toLowerCase())).map((v) => ({
         ...v,
         engine: OPENAI_MODEL,
       }))
     : [];
-  const all = [...pollyVoices, ...openAiVoices];
+  // Azure ahead of OpenAI, matching `knownVoices`: both can read Hebrew and only one
+  // of them is free, so the order is the preference.
+  const all = [...pollyVoices, ...azureVoices, ...openAiVoices];
+  const hebrewVoices = all.filter(speaksHebrew);
 
   const wanted = String(lang || 'en').slice(0, 5).toLowerCase();
   // Everything for this language, then everything else: a picker should offer the
@@ -852,7 +1109,11 @@ export async function speechStatus({
     // reads. `budgets` is both, for a sheet that wants to show which voice has room
     // left — they are separate allowances (see OPENAI_DAILY_CHARS).
     budget: cache.budget('polly'),
-    budgets: { polly: cache.budget('polly'), openai: cache.budget('openai') },
+    budgets: {
+      polly: cache.budget('polly'),
+      openai: cache.budget('openai'),
+      azure: cache.budget('azure'),
+    },
     firstSegmentChars: FIRST_SEGMENT_CHARS,
     /*
      * Whether this box can read Hebrew at all, stated separately from `configured`.
@@ -864,12 +1125,21 @@ export async function speechStatus({
      * it", because `speechSynthesis` has a Hebrew voice on both phone platforms.
      */
     hebrew: {
-      available: openAiVoices.length > 0,
-      voice: openAiVoices.length ? (openAiVoices.find((v) => v.id === OPENAI_VOICE)?.id || openAiVoices[0].id) : null,
-      reason: openAiVoices.length
+      available: hebrewVoices.length > 0,
+      // The same order `chooseVoice` uses, so what this advertises is what speaks.
+      voice:
+        hebrewVoices.find((v) => v.id === AZURE_VOICE)?.id ||
+        hebrewVoices.find((v) => v.provider === 'azure')?.id ||
+        hebrewVoices.find((v) => v.id === OPENAI_VOICE)?.id ||
+        hebrewVoices[0]?.id ||
+        null,
+      via: hebrewVoices[0]?.provider || null,
+      voices: hebrewVoices.map((v) => v.id),
+      reason: hebrewVoices.length
         ? null
-        : 'Polly has no Hebrew voice, and there is no OpenAI key on this box — a ' +
-          "Hebrew message is read by the device's own voice instead",
+        : 'Polly has no Hebrew voice, and this box has neither Azure Speech ' +
+          "credentials nor an OpenAI key — a Hebrew message is read by the device's " +
+          'own voice instead',
     },
     reason: ordered.length ? null : reason,
   };

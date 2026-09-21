@@ -42,6 +42,8 @@ import {
   chooseVoice,
   hebrewShare,
   needsMultilingualVoice,
+  codeAloud,
+  CODE_LINES,
   FALLBACK_VOICES,
   OPENAI_VOICES,
   HEBREW_SHARE,
@@ -346,6 +348,7 @@ section('What the phone is told:');
   // The voice picker is built from this, so a voice that cannot be used has to be
   // reported as unavailable rather than offered and then failing on the tap.
   const working = await speechStatus({
+    hasAzure: async () => false,
     describe: async () => ({
       voices: [
         { id: 'Lupe', gender: 'Female', language: 'es-US' },
@@ -362,6 +365,7 @@ section('What the phone is told:');
   ok(working.firstSegmentChars === FIRST_SEGMENT_CHARS, 'and how long the first piece is');
 
   const denied = await speechStatus({
+    hasAzure: async () => false,
     describe: async () => ({ voices: [], reason: "this instance's role cannot call polly:SynthesizeSpeech" }),
   });
   ok(denied.configured === false, 'a box with no Polly access says it cannot speak');
@@ -612,7 +616,7 @@ section('What the phone is told about the second voice:');
     reason: null,
   });
 
-  const withKey = await speechStatus({ lang: 'en', describe, hasOpenAi: async () => true });
+  const withKey = await speechStatus({ lang: 'en', describe, hasOpenAi: async () => true, hasAzure: async () => false });
   ok(
     withKey.voices.some((v) => v.id === 'marin' && v.provider === 'openai'),
     'a box with a key offers the OpenAI voices too',
@@ -627,7 +631,7 @@ section('What the phone is told about the second voice:');
   ok(withKey.budget?.provider === 'polly', "and `budget` still means Polly's, for clients that only know that field");
 
   // A phone set to Hebrew: the voices that can actually read to it come first.
-  const hebPhone = await speechStatus({ lang: 'he-IL', describe, hasOpenAi: async () => true });
+  const hebPhone = await speechStatus({ lang: 'he-IL', describe, hasOpenAi: async () => true, hasAzure: async () => false });
   ok(
     hebPhone.voices[0].provider === 'openai',
     'a Hebrew phone is offered the voices that can read Hebrew first',
@@ -636,7 +640,7 @@ section('What the phone is told about the second voice:');
   ok(hebPhone.voices.some((v) => v.id === 'Ruth'), 'without hiding the English ones');
 
   // The case this deployment is in until a key is put in the secret.
-  const noKey = await speechStatus({ lang: 'en', describe, hasOpenAi: async () => false });
+  const noKey = await speechStatus({ lang: 'en', describe, hasOpenAi: async () => false, hasAzure: async () => false });
   ok(
     !noKey.voices.some((v) => v.provider === 'openai'),
     'a box with no key offers no voice that would fail on the tap',
@@ -655,6 +659,7 @@ section('What the phone is told about the second voice:');
   const clash = await speechStatus({
     describe: async () => ({ voices: [{ id: 'marin', gender: 'Female', language: 'en-US' }], reason: null }),
     hasOpenAi: async () => true,
+    hasAzure: async () => false,
   });
   const marins = clash.voices.filter((v) => v.id.toLowerCase() === 'marin');
   ok(marins.length === 1 && marins[0].provider === 'polly', 'a name claimed by both providers is listed once, as Polly’s', JSON.stringify(marins));
@@ -684,6 +689,121 @@ section('What the phone is told about the second voice:');
     SILENT_WAV.subarray(36, 40).toString('ascii') === 'data' && SILENT_WAV.readUInt32LE(40) === 0,
     'and it is silence: a data chunk with no samples in it',
   );
+}
+
+// --------------------------------------------------------------------------
+/*
+ * Reading the code block instead of saying "Code block".
+ *
+ * Most of what is checked here is one thing: a synthesiser is silent on
+ * punctuation, so `if (!ok) return` read literally is "if ok return" — the
+ * opposite of the code, in a confident voice, with nothing to hear that anything
+ * was lost. Every operator that changes what a line *means* has to become a word,
+ * and the ones that only group it have to not.
+ */
+section('Reading a code block out loud:');
+{
+  const heard = codeAloud('```js\nif (!ok) return;\nconst id = messageId(text, voice);\n```');
+
+  ok(/^JavaScript code, 2 lines\./.test(heard), 'it says what it is about to read, and how much', heard.slice(0, 40));
+  ok(/not ok/.test(heard), 'a negation becomes a word, because the character is read as nothing', heard);
+  ok(!heard.includes('!'), 'and the character itself does not survive to be silent');
+  ok(!/[{}();]/.test(heard), 'the punctuation that only groups a line is dropped rather than named', heard);
+  ok(/messageId/.test(heard) && /voice/.test(heard), 'identifiers survive: they are the words');
+  ok(/\bequals\b/.test(heard), 'and an assignment is spoken, not skipped');
+}
+
+{
+  const heard = codeAloud('a === b\nc !== d\nx <= y\np && q\nr || s\nv ?? w\nn => n + 1', { lang: 'js' });
+  ok(/strictly equals/.test(heard), 'three equals signs are not the same as two', heard);
+  ok(/strictly not equals/.test(heard), 'and neither is the negated form');
+  ok(/less than or equal to/.test(heard), 'a comparison is read as one');
+  ok(/ and /.test(heard) && / or /.test(heard), 'and so are the boolean operators');
+  ok(/or else/.test(heard), 'including the nullish one, which is not "or"');
+  ok(/arrow/.test(heard), 'a function arrow is named, since a line of code without it is a different line');
+  ok(/plus/.test(heard), 'and spaced arithmetic is spoken');
+}
+
+{
+  const heard = codeAloud('const SPEAK_DAILY_CHARS = 300000;', { lang: 'js' });
+  ok(/SPEAK DAILY CHARS/.test(heard), 'an upper-snake constant is three words, not one unsayable token', heard);
+}
+
+/*
+ * The guard against over-eagerness. `<` and `/` mean comparison and division only
+ * when they are spaced like operators; in a tag, a path or a flag they are neither,
+ * and a voice that says "less than div" or "auth divided by js" is worse than one
+ * that says nothing.
+ */
+{
+  const heard = codeAloud('<div className="x">\nimport x from "./a/b/c.js";\nrun(--force);', { lang: 'jsx' });
+  ok(!/less than/.test(heard), 'a tag is not a comparison', heard);
+  ok(!/divided by/.test(heard), 'and a path is not a division');
+  ok(/run --force\./.test(heard), 'and a command-line flag is read as one, not as two minuses', heard);
+}
+
+{
+  const heard = codeAloud('```bash\nnpm test && git push origin main\n```');
+  ok(/^shell code, one line\./.test(heard), 'a one-line block says "one line", not "1 lines"', heard);
+  ok(/npm test and git push origin main/.test(heard), 'and a shell chain reads as a sentence', heard);
+}
+
+/*
+ * A diff. The first column is the entire message: read without it, the line that
+ * was deleted and the line that replaced it are the same sentence twice, and the
+ * change — the only thing the block was showing — is gone without a trace.
+ */
+{
+  const heard = codeAloud(
+    '```diff\n--- a/auth.js\n+++ b/auth.js\n@@ -41,3 +41,3 @@\n-  return true;\n+  return false;\n```',
+  );
+  ok(/removed, return true/.test(heard), 'a deleted line says it was deleted', heard);
+  ok(/added, return false/.test(heard), 'and an added line says it was added');
+  ok(!/@@/.test(heard) && !heard.includes('+++'), 'the hunk headers are not read out as noise');
+}
+
+{
+  // A file pasted into a message is neither listenable nor free.
+  const many = Array.from({ length: CODE_LINES + 15 }, (_, i) => `line${i} = ${i};`).join('\n');
+  const heard = codeAloud(many);
+  ok(new RegExp(`code, ${CODE_LINES + 15} lines`).test(heard), 'the count is the whole block, not the part read', heard.slice(0, 40));
+  ok(/the other 15 are on screen/.test(heard), 'and it says how many it stopped short of');
+  ok(!heard.includes(`line${CODE_LINES + 5} `), 'having genuinely stopped, rather than reading and claiming otherwise');
+  ok(codeAloud(many, { maxLines: 3 }).length < heard.length, 'and the cap is a knob');
+}
+
+{
+  ok(/empty/.test(codeAloud('```js\n\n```')), 'an empty block says so rather than being played as silence');
+  ok(
+    /nothing in it that can be read/.test(codeAloud('```\n{\n}\n```')),
+    'and a block of nothing but punctuation says that, instead of a header and silence',
+    codeAloud('```\n{\n}\n```'),
+  );
+  ok(/code, 3 lines/.test(codeAloud('a\nb\nc')), 'a block with no fence and no language is still read');
+  ok(codeAloud(null) === 'That code block is empty.', 'and nothing at all is not a crash');
+}
+
+{
+  /*
+   * Why the voice is chosen from the reduction and not from the message: a Hebrew
+   * comment inside a code block is still Hebrew, and Polly does not mispronounce
+   * Hebrew — it skips it. Choosing the voice before reducing would read the code in
+   * a voice that silently omits the sentence explaining it.
+   */
+  const hebrew = Array.from({ length: 40 }, (_, i) => String.fromCodePoint(0x05d0 + (i % 27))).join('');
+  const block = `\`\`\`js\n// ${hebrew}\nconst x = 1;\n\`\`\``;
+  ok(needsMultilingualVoice(codeAloud(block)), 'a Hebrew comment survives the reduction and asks for the other voice');
+}
+
+{
+  // The route: the reduction happens on the server, so the editor overlay and the
+  // chat app cannot drift into hearing two different things.
+  const block = '```js\nif (!ok) return;\n```';
+  const asCode = await prepare(block, { kind: 'code' });
+  const asWords = await prepare(codeAloud(block), {});
+  ok(asCode.id === asWords.id, 'preparing a block as code is preparing its spoken form', `${asCode.id} vs ${asWords.id}`);
+  const asProse = await prepare(block, {});
+  ok(asProse.id !== asCode.id, 'and the default is still what every existing client sends');
 }
 
 console.log(`\n${checks - failures}/${checks} checks passed`);

@@ -598,7 +598,14 @@ const server = http.createServer(async (req, res) => {
         // key, because a message with Hebrew in it cannot be given to Polly. The
         // key is read from Secrets Manager once per process, so this is a real
         // round trip on the first read after a restart and free afterwards.
-        json(res, 200, await prepareSpeech(body.text, { voice: body.voice }));
+        // `kind: 'code'` is the per-block read button: the body is one fenced block,
+        // and what a listener hears is decided in speak.js so that both surfaces
+        // hear the same thing. Anything else is prose the client already reduced.
+        json(res, 200, await prepareSpeech(body.text, {
+          voice: body.voice,
+          kind: body.kind === 'code' ? 'code' : 'prose',
+          lang: typeof body.lang === 'string' ? body.lang.slice(0, 20) : '',
+        }));
       } catch (err) {
         speakRefusal(res, err);
       }
