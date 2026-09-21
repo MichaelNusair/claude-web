@@ -18,6 +18,9 @@ import net from 'net';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+// For a process with a known start time, which is what separates a turn in flight
+// from one abandoned by a process that no longer exists. See `startedAt`.
+import { spawn } from 'child_process';
 
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'status-test-'));
 const PROJECTS = path.join(TMP, 'projects');
@@ -62,11 +65,21 @@ const assistant = (text, stop = 'end_turn') =>
     timestamp: new Date().toISOString(),
     message: { role: 'assistant', stop_reason: stop, content: [{ type: 'text', text }] },
   });
+// The same entry, stamped as having been written a while ago. The timestamp is what
+// dates the *state* of a transcript, where the file's mtime only dates the last thing
+// written to it — a resume writes bookkeeping entries over a turn abandoned hours ago.
+const assistantAgo = (text, stop, ms) =>
+  JSON.stringify({
+    type: 'assistant',
+    timestamp: new Date(Date.now() - ms).toISOString(),
+    message: { role: 'assistant', stop_reason: stop, content: [{ type: 'text', text }] },
+  });
 const userText = (text) =>
   JSON.stringify({ type: 'user', timestamp: new Date().toISOString(), message: { role: 'user', content: text } });
 const toolResult = (size) =>
   JSON.stringify({
     type: 'user',
+    timestamp: new Date().toISOString(),
     message: { role: 'user', content: [{ type: 'tool_result', content: 'x'.repeat(size) }] },
   });
 
@@ -167,6 +180,33 @@ ok(
 write(assistant('the whole answer'));
 status = await claudeStatus(CWD);
 ok(status.cutOff === null, 'an ordinary finished turn is reported as cut off');
+
+/*
+ * The stop button, which leaves the other kind of killed turn: a `user` entry whose
+ * whole text is the marker, sitting under an assistant turn that had stopped to run a
+ * tool. Every other trailing user entry owes an answer, so the naive reading is the
+ * busiest state there is, and it is the one state where nothing at all is coming. 19
+ * of these across this project's transcripts, 3 of them the last word in the file.
+ *
+ * It has to be recognised for the section below to be safe: there the test of a
+ * mid-turn transcript is whether the live process wrote it, and the process that was
+ * interrupted is exactly the process that wrote this.
+ */
+write(assistant('let me look', 'tool_use'), userText('[Request interrupted by user]'));
+status = await claudeStatus(CWD);
+ok(status.state === 'idle', 'a turn stopped by hand owes no answer, however mid-turn the file looks');
+
+write(assistant('let me look', 'tool_use'), userText('[Request interrupted by user for tool use]'));
+status = await claudeStatus(CWD);
+ok(status.state === 'idle', 'including the variant written when the tool is what was stopped');
+
+write(
+  assistant('let me look', 'tool_use'),
+  userText('[Request interrupted by user]'),
+  userText('actually, do this instead'),
+);
+status = await claudeStatus(CWD);
+ok(status.state === 'working', 'and a message typed after the interrupt is a turn again');
 
 section('A question waiting on a person is a third state, neither working nor finished:');
 /*
@@ -315,6 +355,21 @@ status = await claudeStatus(CWD);
 ok(status.last?.text === 'the answer, buried',
   'it widens the read when the first window holds no message');
 ok(status.state === 'working', 'and the trailing tool result still reads as working');
+
+/*
+ * The same transcript seen from the list, which reads one small window and therefore
+ * lands entirely inside that one line: nothing in it parses, and a row with no state at
+ * all fell back to idle — about a conversation in the middle of the largest thing it had
+ * done all day, which is the one moment it is certainly working. 49 lines in this
+ * project's transcripts are over 64KB. See SUMMARY_RETRY.
+ */
+brokerReply = liveSession({ working: false, pid: process.pid });
+status = await claudeStatus(CWD);
+const buried = status.conversations?.find((c) => c.sessionId === SESSION);
+ok(buried?.state === 'working',
+  'a row whose whole window is inside one huge line is read again rather than called idle');
+ok(buried?.said === 'the answer, buried', 'and the second read finds the message that window could not hold');
+brokerReply = { ok: false, why: 'bad handshake' };
 
 section('It does not read the transcript, which is the entire point:');
 /*
@@ -515,24 +570,54 @@ section('A turn the broker never saw is working, while the file is still being w
  *
  * "Idle" is the expensive way to be wrong — it invites you to type over a live turn —
  * and the broker cannot be restarted to fix it without ending every conversation it
- * holds. So the transcript overrules it here, bounded by FRESH_TURN_MS.
+ * holds. So the transcript overrules it here, and what bounds that is not how old the
+ * file is but who wrote it: see `startedAt`.
  */
 writeConvo(TRANSCRIPT, title('The one on screen', SESSION), assistant('let me look', 'tool_use'));
-brokerReply = twoLive({ working: false, idleMs: 300, spokeMs: 40 * 60 * 1000 });
+brokerReply = twoLive({ working: false, idleMs: 300, spokeMs: 40 * 60 * 1000, pid: process.pid });
 status = await claudeStatus(CWD);
 ok(status.state === 'working' && status.source === 'transcript',
   'a broker that says idle about a conversation writing its transcript right now is overruled');
 ok(status.conversations?.find((c) => c.sessionId === SESSION)?.state === 'working',
   'and the list agrees, rather than offering a row you would type over');
 
-// The bound. Past it, an untouched mid-turn transcript is an abandoned turn as often
-// as a live one, and this answers what it answered before: your turn.
-staleBy(TRANSCRIPT, 3 * 60 * 1000);
+/*
+ * The case a clock got wrong, and the reason this stopped being a clock. A turn spends
+ * minutes at a time writing nothing — a Bash call running the suite, a Read of
+ * something large, a permission prompt nobody has answered yet — and 254 of the 21,683
+ * mid-turn silences in this project ran past two minutes. This process is the one that
+ * wrote the mid-turn entry (it is this test's own pid, which started before the fixture
+ * was written), so the turn is still its turn however long the file has sat there.
+ */
+staleBy(TRANSCRIPT, 8 * 60 * 1000);
+status = await claudeStatus(CWD);
+ok(status.state === 'working' && status.source === 'transcript',
+  'a turn that has written nothing for eight minutes is still the turn that process is on');
+ok(status.conversations?.find((c) => c.sessionId === SESSION)?.state === 'working',
+  'and the list still agrees');
+
+/*
+ * The other side of it, which is what the bound was really for: a conversation left
+ * mid-turn by a process that has since died, with a *new* process started over the top
+ * of it by a resume. On disk that is indistinguishable from a live turn, and the one
+ * thing that separates them is the order of the two clocks — this entry was written ten
+ * minutes before the process that is now running the conversation existed.
+ *
+ * `/proc` is what answers that, so this check is Linux-only in the sense that anywhere
+ * else it passes for the weaker reason (no process start to read, and a file too old
+ * for the fallback clock). That is the same verdict, reached the older way.
+ */
+const resumed = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'], { stdio: 'ignore' });
+resumed.unref();
+writeConvo(TRANSCRIPT, title('The one on screen', SESSION), assistantAgo('let me look', 'tool_use', 10 * 60 * 1000));
+staleBy(TRANSCRIPT, 10 * 60 * 1000);
+brokerReply = twoLive({ working: false, idleMs: 300, spokeMs: 40 * 60 * 1000, pid: resumed.pid });
 status = await claudeStatus(CWD);
 ok(status.state === 'idle' && status.source === 'broker',
-  'a mid-turn transcript nothing has touched for minutes is not overruling anything');
+  'a mid-turn transcript older than the process now running it is an abandoned turn, not a live one');
 ok(status.conversations?.find((c) => c.sessionId === SESSION)?.state === 'idle',
-  'and the list says that too');
+  'and the list says that too, rather than a row that will never answer');
+resumed.kill();
 
 writeConvo(TRANSCRIPT, title('The one on screen', SESSION), assistant('let me look', 'tool_use'));
 brokerReply = { ok: true, v: 1, sessions: [] };

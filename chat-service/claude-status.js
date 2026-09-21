@@ -85,6 +85,23 @@ const HEAD_WINDOWS = [256 * 1024, 4 * 1024 * 1024];
  */
 const SUMMARY_WINDOW = [64 * 1024];
 
+/*
+ * The second read a row gets when the cheap window said nothing at all.
+ *
+ * Contributing no preview is fine; contributing no *state* is not, and a window can
+ * land inside a single line and come back with neither. 49 lines in this project's
+ * transcripts are larger than 64KB — a tool result read back in full, the largest
+ * 849KB — and while one of them is the last line of a file, the whole window is
+ * inside it, nothing in it parses, and the row's state is `unknown`. That is exactly
+ * the moment the row is working: a tool result that big has just been written and
+ * the turn is still going. Reported as idle, which is what an unknown state falls
+ * back to, it is the wrong half of the one distinction this file exists to make.
+ *
+ * So the widening is paid for only where the cheap read failed, and one megabyte
+ * covers every oversized line in the corpus (none reaches it).
+ */
+const SUMMARY_RETRY = [1024 * 1024];
+
 /** How many conversations to describe. A project's history is unbounded; this is not. */
 const LIST_LIMIT = 6;
 
@@ -126,11 +143,20 @@ const OVERRIDE_QUIET_MS = 10 * 1000;
  * every live conversation, so it waits for a reboot and this half has to stand alone.
  *
  * A transcript being appended to is the one thing out here that only a turn in
- * flight does. Bounded, because the other thing a `working` transcript can mean is a
- * conversation abandoned mid-turn, which on disk never stops looking busy: two
- * minutes covers the longest gap measured between writes inside one turn (2m02s,
- * across a Bash call), and past it this answers idle — which is what it answered
- * before this existed.
+ * flight does. It has to be bounded somehow, because the other thing a `working`
+ * transcript can mean is a conversation abandoned mid-turn, which on disk never
+ * stops looking busy — but a clock is a poor way to draw that line and two minutes
+ * was far too short a one. Measured across the 39 transcripts of this project:
+ * 21,683 gaps between consecutive writes inside a turn, of which 254 ran past two
+ * minutes and 117 past five. They are not exotic — 51 waiting on a Bash call (the
+ * test suite here takes longer than two minutes on its own), 52 on a Read, 40 on an
+ * Edit, 77 on the model itself, plus permission prompts nobody has answered yet. The
+ * turn was in flight through every one of them, and a two-minute clock called each
+ * one your turn.
+ *
+ * So the clock is the fallback and no longer the test. The question asked first is
+ * `startedAt`: not how old the mid-turn entry is, but whether the process running
+ * this conversation is the one that wrote it.
  */
 const FRESH_TURN_MS = 2 * 60 * 1000;
 
@@ -178,6 +204,42 @@ export function brokerSessions({ socket = BROKER_SOCKET } = {}) {
     // A broker that accepts the connection and says nothing.
     client.on('close', () => done(null));
   });
+}
+
+/**
+ * When the process holding a conversation started, or null if that cannot be read.
+ *
+ * This is the fact that turns a mid-turn transcript from a guess into an answer, and
+ * it is the one the broker cannot supply while the daemon on this box predates its
+ * own output-side turn detection. A transcript says a turn is in flight; what it
+ * cannot say is whose. Compare the two:
+ *
+ *   entry written AFTER the process started  ->  this process wrote it and has not
+ *                                                finished the turn. Working, whether
+ *                                                that was two seconds or ten minutes
+ *                                                ago — see FRESH_TURN_MS for how long
+ *                                                a live turn can go without writing.
+ *   entry written BEFORE it started          ->  a predecessor was killed mid-turn and
+ *                                                this process was started over the top
+ *                                                of it by a resume. The abandoned turn,
+ *                                                which must never read as work.
+ *
+ * `/proc/<pid>` is stamped with the moment the process began — checked against `ps -o
+ * lstart` here — at the kernel's tick granularity, which is 10ms and so far below the
+ * gap being measured that it does not matter. The pid comes from the broker over a
+ * unix socket, but it still goes into a path, so it is required to be a number.
+ *
+ * Linux only. Anywhere `/proc` is not there this returns null and the fallback clock
+ * answers instead, which is the behaviour this file had before.
+ */
+async function startedAt(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return null;
+  try {
+    const { mtimeMs } = await stat(`/proc/${pid}`);
+    return mtimeMs;
+  } catch {
+    return null; // exited between the broker's answer and this read, or no /proc
+  }
 }
 
 /**
@@ -341,9 +403,29 @@ function inferState(entry) {
   if (entry.type === 'assistant') {
     return entry.message?.stop_reason === 'tool_use' ? 'working' : 'idle';
   }
-  // A `user` entry: either something typed, or a tool result going back in.
-  return 'working';
+  // A `user` entry is normally something typed or a tool result going back in, both
+  // of which owe an answer — except for the one the harness writes when a turn is
+  // stopped by hand, which owes nothing. See INTERRUPTED.
+  return INTERRUPTED.test(textOf(entry.message).trim()) ? 'idle' : 'working';
 }
+
+/*
+ * What the stop button leaves behind.
+ *
+ * Pressing it writes a `user` entry whose whole text is `[Request interrupted by
+ * user]` (or `…by user for tool use]`), on top of an assistant turn that had stopped
+ * to run a tool. Read naively that is the busiest thing a transcript can look like —
+ * a tool call with a user entry under it — and it is the opposite: the turn was ended
+ * by hand and nothing is coming. 19 of them across this project's transcripts, 3 of
+ * which end on one.
+ *
+ * Recognising it matters more than it did. While a mid-turn transcript was trusted
+ * for two minutes, an interrupted conversation read "working" for two minutes and
+ * then corrected itself; now that the test is whether the live process wrote the
+ * mid-turn entry — which, for an interrupt, it did — it would read working for as
+ * long as that process lived.
+ */
+const INTERRUPTED = /^\[Request interrupted by user/i;
 
 /**
  * What Claude Code writes into a transcript *instead of* an answer.
@@ -406,6 +488,11 @@ export async function lastExchange(file, windows = TAIL_WINDOWS) {
    * from the end, was listed as "Untitled conversation". Observed 2026-09-20.
    */
   let state = null;
+  // When the entry that decided the state was written, which is not the same as when
+  // the file was last touched: bookkeeping entries move the mtime, and a resume
+  // writes several of them over a turn that was abandoned hours ago. `startedAt`
+  // needs the message's own clock to tell those apart.
+  let stateAt = null;
   let title = null;
   let cutOff = null;
   let question = null;
@@ -493,6 +580,7 @@ export async function lastExchange(file, windows = TAIL_WINDOWS) {
          * all of which have read as "Claude is working…" the whole time.
          */
         state = asked && !answered.has(asked.id) ? 'question' : inferState(entry);
+        stateAt = entry.timestamp ? Date.parse(entry.timestamp) || null : null;
         if (artifact) cutOff = artifact;
       }
 
@@ -505,7 +593,7 @@ export async function lastExchange(file, windows = TAIL_WINDOWS) {
 
     if (last || tail.complete) {
       const settled = state || 'idle';
-      return { state: settled, last, title, cutOff, question: withPending(question, settled), ...meta };
+      return { state: settled, stateAt, last, title, cutOff, question: withPending(question, settled), ...meta };
     }
     // Nothing sayable in this window and there is more file behind it: widen.
   }
@@ -513,7 +601,7 @@ export async function lastExchange(file, windows = TAIL_WINDOWS) {
   // "Unknown" only when the windows really said nothing. A state read from one of
   // them is knowledge, and reporting it as ignorance sends a device to ask again.
   const settled = state || 'unknown';
-  return { state: settled, last: null, title, cutOff, question: withPending(question, settled), ...meta };
+  return { state: settled, stateAt, last: null, title, cutOff, question: withPending(question, settled), ...meta };
 }
 
 /**
@@ -740,16 +828,25 @@ export async function claudeStatus(cwd, { sessionId: asked = null } = {}) {
   const asking = transcript?.state === 'question';
 
   /*
-   * The turn the broker never saw: it says idle, the file says a turn is in flight,
-   * and the file was written a moment ago. See FRESH_TURN_MS.
+   * The turn the broker never saw: it says idle, and the file says a turn is in
+   * flight that this very process started. See `startedAt`, then FRESH_TURN_MS.
    *
-   * Takes a live process, like every other transcript override here. A broker that
-   * reports no session for this conversation is already a definite idle — nothing
-   * exists to be working — and a mid-turn transcript with no process behind it is the
-   * abandoned turn this must never report as work.
+   * Two ways to believe the file, in that order. Either the process started before the
+   * mid-turn entry was written, so it wrote it and has not finished — which holds for
+   * as long as the turn takes, and that is the point: a Bash call running the test
+   * suite writes nothing for minutes, and the two-minute clock called every one of
+   * those minutes your turn. Or the process start cannot be read at all, and the clock
+   * answers as it used to.
+   *
+   * Takes a live process either way, like every other transcript override here. A
+   * broker that reports no session for this conversation is already a definite idle —
+   * nothing exists to be working — and a mid-turn transcript with no process behind it
+   * is the abandoned turn this must never report as work.
    */
   const fresh = transcript?.mtimeMs ? Date.now() - transcript.mtimeMs < FRESH_TURN_MS : false;
-  const unseen = Boolean(mine) && !mine.working && transcript?.state === 'working' && fresh;
+  const startMs = mine ? await startedAt(mine.pid) : null;
+  const wroteIt = startMs !== null && transcript?.stateAt ? transcript.stateAt > startMs : fresh;
+  const unseen = Boolean(mine) && !mine.working && transcript?.state === 'working' && wroteIt;
 
   let state;
   let source;
@@ -825,17 +922,25 @@ export async function claudeStatus(cwd, { sessionId: asked = null } = {}) {
  * One line about each conversation in the project: what it is called, what it
  * last said, and whether anything is running it.
  *
- * Small windows and no widening. This is a list, not the answer — the chosen
- * conversation is read properly above, and a preview that costs as much as the
- * answer would defeat the point of the whole file.
+ * Small windows, and widening only where the small one came back empty-handed. This
+ * is a list, not the answer — the chosen conversation is read properly above, and a
+ * preview that costs as much as the answer would defeat the point of the whole file.
+ * See SUMMARY_RETRY for the one case that is worth a second read anyway.
  */
 async function summarise(dir, files, { liveFor, live, sessionId }) {
   return Promise.all(
     files.map(async (file) => {
       const running = liveFor(file.sessionId);
-      const tail = await lastExchange(join(dir, `${file.sessionId}.jsonl`), SUMMARY_WINDOW);
+      const path = join(dir, `${file.sessionId}.jsonl`);
+      let tail = await lastExchange(path, SUMMARY_WINDOW);
+      // Nothing in the window parsed, which means the window is inside one huge line.
+      // See SUMMARY_RETRY: this is a row mid-tool-result, and the state is the half of
+      // it worth a second read.
+      if (tail?.state === 'unknown') tail = (await lastExchange(path, SUMMARY_RETRY)) || tail;
       const quiet = running ? running.idleMs > OVERRIDE_QUIET_MS : false;
       const fresh = Date.now() - file.mtimeMs < FRESH_TURN_MS;
+      const startMs = running ? await startedAt(running.pid) : null;
+      const wroteIt = startMs !== null && tail?.stateAt ? tail.stateAt > startMs : fresh;
       // The same verdict as above, on a smaller window, and it has to be the same one:
       // a list that contradicts the answer beside it is worse than either. A question
       // is the state worth the most in a row — it will never finish on its own — and a
@@ -845,7 +950,7 @@ async function summarise(dir, files, { liveFor, live, sessionId }) {
         if (!live) return tail?.state || 'unknown';
         if (tail?.state === 'question' && running) return 'question';
         if (running?.working) return quiet && tail?.state === 'idle' ? 'idle' : 'working';
-        if (running && tail?.state === 'working' && fresh) return 'working';
+        if (running && tail?.state === 'working' && wroteIt) return 'working';
         return 'idle';
       };
       const state = verdict();
