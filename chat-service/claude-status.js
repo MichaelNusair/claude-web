@@ -108,6 +108,32 @@ const BROKER_TIMEOUT_MS = 400;
  */
 const OVERRIDE_QUIET_MS = 10 * 1000;
 
+/*
+ * How recently a transcript must have been written to overrule a broker that says
+ * idle.
+ *
+ * The mirror of OVERRIDE_QUIET_MS, and there for the same reason: the broker's
+ * answer is the better one only where the broker can see the question. A turn
+ * somebody typed comes down the stdin the daemon holds, so it is marked. A turn
+ * begun by anything else — another session's message, a queued message flushed, a
+ * /loop wakeup, a cron, a hook — reaches the CLI over its own socket and is
+ * invisible from there, and the daemon on this box marks a turn from stdin only.
+ * Measured 2026-09-21: one conversation wrote twenty assistant frames to its stream
+ * between 09:23:30 and 09:24:08 while `op: 'status'` called it idle through sixteen
+ * polls, and three of six live conversations in this project read idle while their
+ * transcripts read working. The broker has since learned to hear a turn begin in its
+ * output too, but installing that does not apply it — restarting the daemon ends
+ * every live conversation, so it waits for a reboot and this half has to stand alone.
+ *
+ * A transcript being appended to is the one thing out here that only a turn in
+ * flight does. Bounded, because the other thing a `working` transcript can mean is a
+ * conversation abandoned mid-turn, which on disk never stops looking busy: two
+ * minutes covers the longest gap measured between writes inside one turn (2m02s,
+ * across a Bash call), and past it this answers idle — which is what it answered
+ * before this existed.
+ */
+const FRESH_TURN_MS = 2 * 60 * 1000;
+
 /**
  * Ask the broker what it is running.
  *
@@ -713,6 +739,18 @@ export async function claudeStatus(cwd, { sessionId: asked = null } = {}) {
    */
   const asking = transcript?.state === 'question';
 
+  /*
+   * The turn the broker never saw: it says idle, the file says a turn is in flight,
+   * and the file was written a moment ago. See FRESH_TURN_MS.
+   *
+   * Takes a live process, like every other transcript override here. A broker that
+   * reports no session for this conversation is already a definite idle — nothing
+   * exists to be working — and a mid-turn transcript with no process behind it is the
+   * abandoned turn this must never report as work.
+   */
+  const fresh = transcript?.mtimeMs ? Date.now() - transcript.mtimeMs < FRESH_TURN_MS : false;
+  const unseen = Boolean(mine) && !mine.working && transcript?.state === 'working' && fresh;
+
   let state;
   let source;
   if (!live) {
@@ -723,6 +761,9 @@ export async function claudeStatus(cwd, { sessionId: asked = null } = {}) {
     source = 'transcript';
   } else if (asking && mine) {
     state = 'question';
+    source = 'transcript';
+  } else if (unseen) {
+    state = 'working';
     source = 'transcript';
   } else {
     state = mine?.working ? 'working' : 'idle';
@@ -794,16 +835,20 @@ async function summarise(dir, files, { liveFor, live, sessionId }) {
       const running = liveFor(file.sessionId);
       const tail = await lastExchange(join(dir, `${file.sessionId}.jsonl`), SUMMARY_WINDOW);
       const quiet = running ? running.idleMs > OVERRIDE_QUIET_MS : false;
-      // Same three-way verdict as above, on a smaller window. A question is the one
-      // state worth the most in a list: it is the row that will never finish on its
-      // own, and the one you would otherwise keep opening to see whether it had.
-      const state = !live
-        ? tail?.state || 'unknown'
-        : tail?.state === 'question' && running
-          ? 'question'
-          : running?.working && !(quiet && tail?.state === 'idle')
-            ? 'working'
-            : 'idle';
+      const fresh = Date.now() - file.mtimeMs < FRESH_TURN_MS;
+      // The same verdict as above, on a smaller window, and it has to be the same one:
+      // a list that contradicts the answer beside it is worse than either. A question
+      // is the state worth the most in a row — it will never finish on its own — and a
+      // turn the broker never saw is the one worth the most after it, because that row
+      // is the one you would otherwise type over.
+      const verdict = () => {
+        if (!live) return tail?.state || 'unknown';
+        if (tail?.state === 'question' && running) return 'question';
+        if (running?.working) return quiet && tail?.state === 'idle' ? 'idle' : 'working';
+        if (running && tail?.state === 'working' && fresh) return 'working';
+        return 'idle';
+      };
+      const state = verdict();
       return {
         sessionId: file.sessionId,
         title: tail?.title || null,

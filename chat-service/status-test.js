@@ -343,10 +343,14 @@ ok(status.state === 'working' && status.source === 'broker',
   'a live turn is reported from the broker, which is the only thing that knows');
 ok(status.clients === 1, 'along with how many pages are driving it');
 
+// A settled transcript, deliberately: between turns is what this is about. A file
+// that ends mid-turn while the broker says idle is the one case where the broker is
+// not the better source — see the section on a turn the broker never saw.
+write(assistant('done'));
 brokerReply = liveSession({ working: false });
 status = await claudeStatus(CWD);
 ok(status.state === 'idle' && status.source === 'broker',
-  'a live process between turns is your turn, whatever the transcript looks like');
+  'a live process between turns is your turn, and the broker is what says so');
 
 /*
  * The case the whole feature turns on. The transcript ends mid-turn — a question
@@ -402,6 +406,12 @@ const title = (text, id) => JSON.stringify({ type: 'ai-title', aiTitle: text, se
 const writeConvo = (file, ...lines) => fs.writeFileSync(file, `${lines.join('\n')}\n`);
 const older = (file) => {
   const when = new Date(Date.now() - 60 * 1000);
+  fs.utimesSync(file, when, when);
+};
+// The same thing by a chosen amount, for the freshness bound a transcript has to
+// fall outside of before it stops overruling an idle broker. See FRESH_TURN_MS.
+const staleBy = (file, ms) => {
+  const when = new Date(Date.now() - ms);
   fs.utimesSync(file, when, when);
 };
 
@@ -493,6 +503,43 @@ status = await claudeStatus(CWD);
 ok(status.state === 'working',
   'a transcript that itself ends mid-turn overrules nothing — both sources agree');
 
+section('A turn the broker never saw is working, while the file is still being written:');
+/*
+ * The other direction, and the one that was shipped wrong. A turn only reaches the
+ * daemon's stdin when a person types it: a message from another session, a queued
+ * message flushed, a /loop wakeup, a cron or a hook all arrive over the CLI's own
+ * socket, and a daemon that marks a turn from stdin alone therefore calls the whole
+ * turn idle. Measured on this box 2026-09-21, with five sessions messaging each
+ * other: three of six live conversations read idle while their transcripts read
+ * working, one of them writing assistant frames to its stream throughout.
+ *
+ * "Idle" is the expensive way to be wrong — it invites you to type over a live turn —
+ * and the broker cannot be restarted to fix it without ending every conversation it
+ * holds. So the transcript overrules it here, bounded by FRESH_TURN_MS.
+ */
+writeConvo(TRANSCRIPT, title('The one on screen', SESSION), assistant('let me look', 'tool_use'));
+brokerReply = twoLive({ working: false, idleMs: 300, spokeMs: 40 * 60 * 1000 });
+status = await claudeStatus(CWD);
+ok(status.state === 'working' && status.source === 'transcript',
+  'a broker that says idle about a conversation writing its transcript right now is overruled');
+ok(status.conversations?.find((c) => c.sessionId === SESSION)?.state === 'working',
+  'and the list agrees, rather than offering a row you would type over');
+
+// The bound. Past it, an untouched mid-turn transcript is an abandoned turn as often
+// as a live one, and this answers what it answered before: your turn.
+staleBy(TRANSCRIPT, 3 * 60 * 1000);
+status = await claudeStatus(CWD);
+ok(status.state === 'idle' && status.source === 'broker',
+  'a mid-turn transcript nothing has touched for minutes is not overruling anything');
+ok(status.conversations?.find((c) => c.sessionId === SESSION)?.state === 'idle',
+  'and the list says that too');
+
+writeConvo(TRANSCRIPT, title('The one on screen', SESSION), assistant('let me look', 'tool_use'));
+brokerReply = { ok: true, v: 1, sessions: [] };
+status = await claudeStatus(CWD, { sessionId: SESSION });
+ok(status.state === 'idle' && status.live === false,
+  'with no process behind it there is nothing to overrule — a dead mid-turn conversation is idle');
+
 section('One project is never answered with another project’s conversation:');
 /*
  * The case the user had not tried yet. Sessions are matched on cwd, and this is
@@ -504,6 +551,10 @@ const PROJECT_DIR2 = path.join(CLAUDE_HOME, 'projects', CWD2.replace(/[/.]/g, '-
 const ELSEWHERE = 'c3d4e5f6-2222-4000-8000-000000000000';
 fs.mkdirSync(CWD2, { recursive: true });
 fs.mkdirSync(PROJECT_DIR2, { recursive: true });
+// A finished turn here, stated rather than inherited from the section above: what is
+// being tested is that another project's work does not leak in, and a conversation
+// that is mid-turn in its own right would answer "working" for its own good reason.
+writeConvo(TRANSCRIPT, title('The one on screen', SESSION), assistant('the finished answer'));
 writeConvo(
   path.join(PROJECT_DIR2, `${ELSEWHERE}.jsonl`),
   title('A different project'),
@@ -529,6 +580,10 @@ ok(status.sessionId === ELSEWHERE && status.state === 'working' && status.title 
 ok(status.conversations.length === 1, 'with only its own conversations listed');
 
 section('Every way of not knowing falls back rather than guessing:');
+// Mid-turn, and said so here: the point below is that a conversation left mid-turn is
+// reported as the file has it when there is no broker to ask, so the fixture has to be
+// this section's rather than whichever one ran last.
+writeConvo(TRANSCRIPT, title('The one on screen', SESSION), assistant('let me look', 'tool_use'));
 brokerReply = 'silent';
 const slowStart = Date.now();
 status = await claudeStatus(CWD);
