@@ -2788,6 +2788,174 @@ ok(
 doc.getElementById('cmo-status-close')?.dispatchEvent(new w.MouseEvent('click', { bubbles: true }));
 await settle(30);
 
+// ------------------------------------------------- arriving from a notification
+/*
+ * A tapped notification, from this end of it.
+ *
+ * pwa/sw.js opens `/p/<project>/?folder=…&session=<id>` — see chat-service/sw-test.js
+ * for the worker's half — and the whole value of that URL is what this file's subject
+ * does with the `session` in it. The panel cannot be told which conversation to show,
+ * so pinning it out here and opening the sheet over it is the only way the thing
+ * someone was buzzed about ends up in front of them. A tap that lands on the editor
+ * showing whatever it guessed is the bug that was reported, one step further along.
+ *
+ * Its own documents, because the URL is the input: this window's location cannot be
+ * changed after `w.eval`, and `navigator.serviceWorker` has to exist *before* the
+ * overlay runs for the message listener to be registered at all.
+ */
+{
+  /**
+   * A fresh overlay, with the two things this section is about wired up: the URL it
+   * loaded at, and a service worker container that can deliver a message.
+   */
+  function bootOverlay(url) {
+    const quiet = new VirtualConsole();
+    quiet.on('jsdomError', () => {});
+    quiet.on('error', (m) => fail(`console error in the notification boot: ${m}`));
+    const dom2 = new JSDOM('<!doctype html><html><head></head><body></body></html>', {
+      runScripts: 'outside-only',
+      url,
+      virtualConsole: quiet,
+    });
+    const win = dom2.window;
+    win.addEventListener('error', (e) => fail(`uncaught in the notification boot: ${e.message}`));
+
+    const statusAsks = [];
+    let reply = (sessionId) => ({
+      cwd: '/workspace/projects/demo',
+      sessionId: sessionId || 'guessed-one',
+      state: 'idle',
+      clients: 0,
+      conversations: [],
+      last: { role: 'assistant', text: `the answer in ${sessionId || 'the guess'}`, at: new Date().toISOString() },
+    });
+    win.fetch = (target) => {
+      const asked = String(target);
+      if (asked.includes('/api/claude-status')) {
+        const params = new win.URL(asked, url).searchParams;
+        statusAsks.push({ cwd: params.get('cwd'), sessionId: params.get('sessionId') });
+        return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(reply(params.get('sessionId'))) });
+      }
+      // Everything else this page asks for on load — the opening prompt, the voice —
+      // is refused, which is the state a lapsed chat-service session leaves it in and
+      // the state the rest of this file runs in.
+      return Promise.resolve({ ok: false, status: 401, json: () => Promise.resolve({}) });
+    };
+
+    const swMessages = [];
+    Object.defineProperty(win.navigator, 'serviceWorker', {
+      configurable: true,
+      value: {
+        addEventListener: (type, fn) => { if (type === 'message') swMessages.push(fn); },
+        register: () => Promise.resolve(null),
+        getRegistration: () => Promise.resolve(null),
+      },
+    });
+
+    try {
+      win.eval(overlayJs);
+    } catch (err) {
+      fail(`mobile-overlay.js threw when loaded at ${url} — ${err.message}`);
+    }
+    return {
+      win,
+      doc: win.document,
+      statusAsks,
+      setReply: (fn) => { reply = fn; },
+      /** What the worker does to a window that is already open. */
+      deliver: (data) => swMessages.forEach((fn) => fn({ data })),
+      listening: () => swMessages.length,
+    };
+  }
+
+  const PROJECT = 'https://claude.example.com/p/demo/?folder=%2Fworkspace%2Fprojects%2Fdemo';
+  const tapped = bootOverlay(`${PROJECT}&session=S9`);
+  await settle(60);
+
+  ok(
+    `the first status ask was ${JSON.stringify(tapped.statusAsks[0])} — the conversation the ` +
+      'notification named has to be pinned before the first fetch, or the sheet draws the ' +
+      'guess and replaces it a moment later',
+    tapped.statusAsks.length === 1 && tapped.statusAsks[0].sessionId === 'S9',
+  );
+  const tappedSheet = tapped.doc.getElementById('cmo-sheet');
+  ok(
+    'arriving from a notification showed nothing — the editor opens on whatever the ' +
+      'panel was already showing, which is the tap doing nothing all over again',
+    tappedSheet?.classList.contains('cmo-open'),
+  );
+  ok(
+    `the sheet does not show the message it was tapped for: ${JSON.stringify(
+      tapped.doc.getElementById('cmo-status-said')?.textContent,
+    )}`,
+    /the answer in S9/.test(tapped.doc.getElementById('cmo-status-said')?.textContent ?? ''),
+  );
+  /*
+   * And the parameter is spent. The workbench reloads itself on every bfcache restore
+   * — switch apps on a phone and come back — so a `session` left in the URL would
+   * re-open this sheet over the editor for as long as the window lived.
+   */
+  ok(
+    `the session parameter is still in the URL (${tapped.win.location.search}), so every ` +
+      'reload of this window re-opens the sheet for a notification tapped hours ago',
+    !tapped.win.location.search.includes('session='),
+  );
+  ok(
+    `?folder= did not survive being rewritten: ${tapped.win.location.search} — it is what ` +
+      'code-server opens the workspace from, and the overlay reads it for every ask',
+    tapped.win.location.search === '?folder=%2Fworkspace%2Fprojects%2Fdemo',
+  );
+
+  // A second notification, tapped while that window is open. There is no navigation
+  // this time — an installed app has one window — so the id arrives by message.
+  ok('the overlay never listened for the service worker, so a second tap says nothing',
+    tapped.listening() > 0);
+  tapped.doc.getElementById('cmo-status-close')?.dispatchEvent(new tapped.win.MouseEvent('click', { bubbles: true }));
+  await settle(30);
+  tapped.deliver({ type: 'cw-notification-click', project: 'demo', sessionId: 'S10', url: '/p/demo/?session=S10' });
+  await settle(60);
+  ok(
+    `the tap on an open window asked about ${JSON.stringify(tapped.statusAsks.at(-1))} — the ` +
+      'window cannot be renavigated without throwing away a loaded workbench, so this ' +
+      'message is the only way it can be told',
+    tapped.statusAsks.at(-1)?.sessionId === 'S10',
+  );
+  ok(
+    'the message from the worker did not open the sheet, so a notification tapped while ' +
+      'the editor is open still does nothing visible',
+    tappedSheet?.classList.contains('cmo-open') &&
+      /the answer in S10/.test(tapped.doc.getElementById('cmo-status-said')?.textContent ?? ''),
+  );
+
+  // Somebody else's postMessage. The workbench receives its own — this listener is on
+  // the same container — and must not treat one as a conversation to follow.
+  const asks = tapped.statusAsks.length;
+  tapped.deliver({ type: 'vscode-something-else', sessionId: 'not-a-conversation' });
+  tapped.deliver(null);
+  tapped.deliver('a string');
+  await settle(40);
+  ok(
+    'an unrelated message to the workbench was read as a notification tap',
+    tapped.statusAsks.length === asks,
+  );
+
+  /*
+   * And the ordinary load, which is every load that is not a tap: no pin, no sheet.
+   * Opening the editor must not put a sheet over it, and the answer has to be about
+   * whatever the panel is showing rather than about a conversation nobody named.
+   */
+  const plain = bootOverlay(PROJECT);
+  await settle(60);
+  ok(
+    `an ordinary load pinned a conversation: ${JSON.stringify(plain.statusAsks[0])}`,
+    plain.statusAsks.length === 1 && plain.statusAsks[0].sessionId === null,
+  );
+  ok(
+    'opening the editor put the status sheet over it, unasked',
+    !plain.doc.getElementById('cmo-sheet')?.classList.contains('cmo-open'),
+  );
+}
+
 // ------------------------------------------------------------------- results
 if (failures.length) {
   console.error(`\noverlay test: ${failures.length} failure(s) of ${checks} checks\n`);

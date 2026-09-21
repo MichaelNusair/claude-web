@@ -53,6 +53,7 @@ import { basename, join } from 'path';
 import { createHash } from 'crypto';
 import { CLAUDE_HOME, PROJECTS_ROOT, mangleCwd } from './session-manager.js';
 import { lastExchange } from './claude-status.js';
+import { appTitle, projectStartUrl } from './manifest.js';
 import { listSubscriptions, notifyAll, topicFor } from './push.js';
 
 /** How often to look. Fast enough to feel immediate, slow enough to be free. */
@@ -141,28 +142,82 @@ export function questionBody(question) {
 }
 
 /**
- * A readable name for the project a transcript belongs to.
+ * Which project a transcript belongs to, and where it lives.
  *
  * Transcript directories are named after the mangled cwd — every `/` and `.`
  * replaced by `-` — which cannot be turned back into a path, because the mangling
  * is not reversible. So the mapping is built in the other direction: mangle the
  * projects that exist and look the directory up. A conversation whose cwd is not a
- * project (someone's home directory, a checkout elsewhere) keeps the directory name,
- * which is ugly but never wrong.
+ * project (someone's home directory, a checkout elsewhere) is absent from this map
+ * and keeps the directory name, which is ugly but never wrong.
+ *
+ * The path is carried alongside the name because a notification now says where to go
+ * when it is tapped, and the address of a project's window includes the folder for
+ * code-server to open — `projectStartUrl` in manifest.js. This is the only side that
+ * knows that path: the phone has the mangled directory name and nothing else.
+ *
+ * Only the top level of PROJECTS_ROOT, deliberately. A project is no longer the same
+ * thing as a git repository — one can hold several — but a conversation's cwd is still
+ * a project root, because that is what the chat app and the editor both open. If
+ * something ever starts a conversation inside a sub-repository (`projects/foo/web`) it
+ * will not be found here: that notification keeps the mangled directory name and
+ * carries no URL, which is ugly and harmless rather than wrong. Walking deeper would
+ * mean guessing which of several directories a person calls the project.
  */
-async function projectNames() {
-  const names = new Map();
+async function projectsByDir() {
+  const found = new Map();
   let entries = [];
   try {
     entries = await readdir(PROJECTS_ROOT, { withFileTypes: true });
   } catch {
-    return names;
+    return found;
   }
   for (const entry of entries) {
     if (!entry.isDirectory()) continue;
-    names.set(await mangleCwd(join(PROJECTS_ROOT, entry.name)), entry.name);
+    const path = join(PROJECTS_ROOT, entry.name);
+    found.set(await mangleCwd(path), { name: entry.name, path });
   }
-  return names;
+  return found;
+}
+
+/**
+ * How much of a lock screen's one title line the conversation's name may have.
+ *
+ * Android gives a notification title a single line and truncates the end of it, so
+ * the order the title is built in decides what survives: the deployment and the
+ * project are the words that place the notification, and the conversation's name is
+ * the one that can afford to be cut. 64 is measured against the widest of these
+ * titles ("personal: claude-web · …") on a 390px phone rather than chosen.
+ */
+const TITLE_CHARS = 64;
+
+/**
+ * What a notification calls itself: deployment, project, conversation.
+ *
+ * Widest to narrowest, because that is the order in which the words stop being
+ * ambiguous. Two deployments can be running this repository (see deploymentName in
+ * manifest.js) and every project has several conversations in it, so a title reading
+ * "Claude finished · claude-web" answered neither "whose box" nor "which of the four
+ * things I left running". `appTitle` supplies the first two, exactly as it does for a
+ * home-screen icon, so a phone showing both deployments' icons and both deployments'
+ * notifications names them the same way in both places.
+ *
+ * The state — finished, stopped, waiting — is deliberately *not* here. It used to
+ * lead the title, and it was the least informative thing in it: a notification
+ * arriving is itself the news that a turn ended. The two cases where something more
+ * happened say so in the first words of the body instead (`cutOffBody`,
+ * `questionBody`), which is where there is room to say what.
+ */
+export function notificationTitle(project, conversation, limit = TITLE_CHARS) {
+  const head = appTitle(project);
+  const name = String(conversation || '').trim();
+  if (!name) return head;
+  // What is left for the conversation once the words that place it have been spent.
+  // Below about twenty characters a name is not worth the space it costs, so the
+  // title stops at the project rather than ending in a word and a half.
+  const room = limit - head.length - 3;
+  if (room < 20) return head;
+  return `${head} · ${name.length <= room ? name : `${name.slice(0, room - 1).trimEnd()}…`}`;
 }
 
 /**
@@ -231,7 +286,7 @@ export function createTurnWatcher({
       return { sent: [], scanned: 0 };
     }
 
-    const names = await projectNames();
+    const projects = await projectsByDir();
     const sent = [];
     let scanned = 0;
 
@@ -301,15 +356,25 @@ export function createTurnWatcher({
         const at = Date.parse((asking ? exchange.question.at : exchange.last?.at) || '') || mtimeMs;
         if (now() - at > FRESH_MS) continue;
 
-        const project = names.get(dir.name) || dir.name;
+        const found = projects.get(dir.name);
+        const project = found?.name || dir.name;
         const cut = exchange.cutOff;
         const notification = {
-          // "Finished" is a claim, and it was being made about turns that were
-          // killed partway — the one case where the person needs to come back and
-          // say "continue", and the one case the old wording talked them out of.
-          // A question is a third claim again: not finished, not stopped, waiting.
-          title: `${asking ? 'Claude is waiting for you' : cut ? 'Claude stopped' : 'Claude finished'} · ${project}`,
-          body: asking ? questionBody(exchange.question) : cut ? cutOffBody(cut, text) : preview(text),
+          title: notificationTitle(project, exchange.title),
+          /*
+           * The message, and — for the two cases that are not simply "it finished" —
+           * a few words of state in front of it.
+           *
+           * The state used to lead the title and is now here, because the title's one
+           * line is worth more spent on saying *which* conversation this is. "Waiting
+           * on you" is the case that cannot be dropped: a question and a finished
+           * answer are otherwise the same notification, and a finish can be ignored
+           * where a question stops the conversation dead until someone answers.
+           * `cutOffBody` already opens with "Stopped", so it needs no prefix.
+           */
+          body: asking
+            ? `Waiting on you — ${questionBody(exchange.question)}`
+            : cut ? cutOffBody(cut, text) : preview(text),
           // Per conversation, so a session that finishes twice replaces its own
           // notification rather than stacking two on the lock screen.
           tag: `turn-${topicFor(`${dir.name}|${sessionId}`)}`,
@@ -319,6 +384,20 @@ export function createTurnWatcher({
           question: asking,
           sessionId,
           conversation: exchange.title || null,
+          /*
+           * Where tapping it goes: this project's own window, with the conversation
+           * named in the query so the overlay in it can pin that one and open its
+           * status sheet — `notificationclick` in pwa/sw.js, `?session=` in
+           * pwa/mobile-overlay.js.
+           *
+           * Built here because this is the only side that can: the phone has a
+           * mangled directory name, and `?folder=` needs the real path. A transcript
+           * whose directory is not a project has no window to open and gets none —
+           * the worker falls back to the chat app.
+           */
+          url: found
+            ? `${projectStartUrl(found.name, found.path)}&session=${encodeURIComponent(sessionId)}`
+            : null,
           at: new Date(at).toISOString(),
         };
         try {

@@ -38,8 +38,15 @@ for (const cwd of [DEMO, OTHER, ELSEWHERE]) {
 process.env.PROJECTS_ROOT = PROJECTS;
 process.env.CLAUDE_HOME = CLAUDE_HOME;
 process.env.CW_PUSH_DIR = path.join(TMP, 'push');
+/*
+ * A named deployment, because that name is the first word of every title now and the
+ * unnamed case would quietly test a shorter string than anyone runs. Two deployments
+ * of this repository can point at the same phone (see deploymentName in manifest.js),
+ * which is the whole reason the word is there.
+ */
+process.env.PWA_NAME = 'personal';
 
-const { createTurnWatcher, preview, questionBody } = await import('./turn-watcher.js');
+const { createTurnWatcher, notificationTitle, preview, questionBody } = await import('./turn-watcher.js');
 const { topicFor } = await import('./push.js');
 
 let pass = 0;
@@ -166,7 +173,12 @@ section('A turn that was killed says so, instead of claiming it finished:');
 
   ok(sent.length === 1, `${sent.length} notifications for a killed turn — a repeat digest swallowed it`);
   const { payload } = sent[0] || { payload: {} };
-  ok(payload.title === 'Claude stopped · demo', `the title is ${JSON.stringify(payload.title)}`);
+  ok(payload.title === 'personal: demo', `the title is ${JSON.stringify(payload.title)}`);
+  ok(
+    payload.body.startsWith('Stopped'),
+    `a cut-off turn has to say so in the first words of the body, now that the title is ` +
+      `spent on naming the conversation: ${JSON.stringify(payload.body)}`,
+  );
   ok(payload.cutOff === 'interrupted', 'the payload does not say why it stopped');
   ok(
     /needs a nudge/.test(payload.body || ''),
@@ -206,9 +218,15 @@ section('A finished turn, on a session this app is not driving:');
 
   ok(sent.length === 1, `${sent.length} notifications for one finished turn`);
   const { payload, opts } = sent[0] || { payload: {}, opts: {} };
-  ok(payload.title === 'Claude finished · demo', `the title is ${JSON.stringify(payload.title)}`);
+  ok(payload.title === 'personal: demo', `the title is ${JSON.stringify(payload.title)}`);
   ok(payload.body === 'All three features are in, and the suite is green.', `the body is ${JSON.stringify(payload.body)}`);
   ok(payload.sessionId === S1, 'the notification does not say which session it came from');
+  // Where tapping it goes. Only this side can build it: the phone has a mangled
+  // directory name, and `?folder=` needs the real path — see pwa/sw.js.
+  ok(
+    payload.url === `/p/demo/?folder=${encodeURIComponent(DEMO)}&session=${S1}`,
+    `the notification does not say where to go when it is tapped: ${JSON.stringify(payload.url)}`,
+  );
   ok(opts.topic === topicFor(`${mangle(DEMO)}|${S1}`), 'the Topic is not derived from the conversation');
   ok(payload.tag === `turn-${topicFor(`${mangle(DEMO)}|${S1}`)}`, 'the tag is not per conversation, so two answers stack up');
 
@@ -246,6 +264,8 @@ section('A finished turn, on a session this app is not driving:');
   // distinguishes two lock-screen entries from the same project.
   ok(sent[1].payload.conversation === 'shipping three features',
     `the notification does not say which conversation finished: ${JSON.stringify(sent[1].payload.conversation)}`);
+  ok(sent[1].payload.title === 'personal: demo · shipping three features',
+    `the title does not name the conversation: ${JSON.stringify(sent[1].payload.title)}`);
 }
 
 section('A turn that is still going says nothing:');
@@ -294,12 +314,22 @@ section('A turn that stopped to ask you something is the one buzz worth having:'
   await watcher.scan();
   ok(sent.length === 1, `${sent.length} notifications for a question nobody has answered`);
   const { payload } = sent[0] || { payload: {} };
-  ok(payload.title === 'Claude is waiting for you · demo', `the title is ${JSON.stringify(payload.title)}`);
+  ok(payload.title === 'personal: demo', `the title is ${JSON.stringify(payload.title)}`);
   ok(payload.question === true && payload.cutOff === null,
     'the payload does not say this one is a question rather than a finish');
+  /*
+   * The one thing that must survive however the wording is arranged: a question has to
+   * be distinguishable from a finish on a lock screen. A finish can be ignored; a
+   * question stops the conversation until someone answers it. The title no longer
+   * carries the state, so the body's first words do.
+   */
   ok(
-    payload.body.startsWith('Deploy: ') && payload.body.includes(DEPLOY_Q),
-    `the body does not lead with the question itself: ${JSON.stringify(payload.body)}`,
+    payload.body.startsWith('Waiting on you — '),
+    `a question reads exactly like a finished answer: ${JSON.stringify(payload.body)}`,
+  );
+  ok(
+    payload.body.includes('Deploy: ') && payload.body.includes(DEPLOY_Q),
+    `the body does not carry the question itself: ${JSON.stringify(payload.body)}`,
   );
   ok(
     payload.body.includes('App only · Full deploy'),
@@ -337,7 +367,8 @@ section('A turn that stopped to ask you something is the one buzz worth having:'
     assistant('Pushed and deployed.'),
   );
   await watcher.scan();
-  ok(sent.length === 3 && sent[2].payload.title === 'Claude finished · demo' && sent[2].payload.question === false,
+  ok(sent.length === 3 && sent[2].payload.question === false
+      && !sent[2].payload.body.startsWith('Waiting on you'),
     'the answer that came after the question was not announced as the finish it is');
 
   /*
@@ -354,7 +385,7 @@ section('A turn that stopped to ask you something is the one buzz worth having:'
     ask(ASK3, DEPLOY_ASK),
   );
   await watcher.scan();
-  ok(sent.length === 4 && sent[3].payload.title === 'Claude is waiting for you · demo',
+  ok(sent.length === 4 && sent[3].payload.question === true,
     'a question asked just now was dropped for the age of the turn in front of it');
 
   // The other direction still holds: an ask nobody answered half an hour ago is not
@@ -385,7 +416,7 @@ section('The conversations this app drives are the app\'s business, not the lock
   // A different session in the same project is not the app's, and must still work.
   await write(OTHER, S1, userText('from the panel'), assistant('Panel answer.'));
   await watcher.scan();
-  ok(sent.length === 1 && sent[0].payload.title === 'Claude finished · other', 'a panel session in a project the app is also using was suppressed');
+  ok(sent.length === 1 && sent[0].payload.title === 'personal: other', 'a panel session in a project the app is also using was suppressed');
 }
 
 section('Old news is not news:');
@@ -443,13 +474,23 @@ section('Every project, named the way a person names it:');
 
   const titles = sent.map((s) => s.payload.title).sort();
   ok(sent.length === 3, `${sent.length} of three projects were announced`);
-  ok(titles.includes('Claude finished · demo') && titles.includes('Claude finished · other'), `titles were ${titles.join(', ')}`);
+  ok(titles.includes('personal: demo') && titles.includes('personal: other'), `titles were ${titles.join(', ')}`);
   ok(
     titles.some((t) => t.includes(mangle(ELSEWHERE))),
     'a conversation outside the projects tree was given no name at all',
   );
   const topics = new Set(sent.map((s) => s.opts.topic));
   ok(topics.size === 3, 'two conversations share a Topic, so one notification replaces another');
+
+  // …and that one has nowhere to go. There is no project window for a directory that
+  // is not a project, so it carries no URL and the worker falls back to the chat app
+  // rather than opening /p/<mangled-path>/, which is not a route.
+  const stray = sent.find((s) => s.payload.title.includes(mangle(ELSEWHERE)));
+  ok(stray?.payload.url === null,
+    `a conversation outside the projects tree points at ${JSON.stringify(stray?.payload.url)}`);
+  const inProject = sent.find((s) => s.payload.project === 'other');
+  ok(inProject?.payload.url === `/p/other/?folder=${encodeURIComponent(OTHER)}&session=${S2}`,
+    `the second project's URL is ${JSON.stringify(inProject?.payload.url)}`);
 }
 
 section('One push service failing does not lose the rest:');
@@ -522,6 +563,31 @@ section('The preview, which is all a lock screen shows:');
   ok(preview('here is code:\n```js\nconst x = 1;\n```\nand after') === 'here is code: and after', 'a code fence is read out into the preview');
   ok(preview(null) === '' && preview(undefined) === '', 'a missing message throws instead of previewing as empty');
   ok(preview('abcdef', 3) === 'abc…', 'a short limit is not honoured');
+}
+
+section('The title, which is one line and gets truncated from the end:');
+{
+  ok(
+    notificationTitle('claude-web', 'fixing the notification tap') === 'personal: claude-web · fixing the notification tap',
+    `the title reads ${JSON.stringify(notificationTitle('claude-web', 'fixing the notification tap'))}`,
+  );
+  // A conversation with no name yet — Claude Code writes `ai-title` a turn or two in,
+  // so the first notification of a conversation usually has none.
+  ok(notificationTitle('demo', null) === 'personal: demo', 'a nameless conversation leaves a dangling separator');
+  ok(notificationTitle('demo', '   ') === 'personal: demo', 'a blank name is treated as a name');
+  // Truncated on a word boundary where there is one, and marked, because a title cut
+  // by Android is cut silently and reads as the whole name.
+  const long = notificationTitle('demo', 'a conversation with a name far longer than any lock screen will show');
+  ok(long.length <= 64, `the title is ${long.length} characters, which is more than the line it gets`);
+  ok(long.startsWith('personal: demo · ') && long.endsWith('…'), `a long name was not marked as cut: ${JSON.stringify(long)}`);
+  /*
+   * A project whose own name fills the line keeps the whole line. Half a conversation
+   * name is worth less than the two words that say where the notification came from,
+   * so the title stops rather than spending five characters on "a co…".
+   */
+  const wide = notificationTitle('a-project-with-a-very-long-directory-name-indeed', 'some conversation');
+  ok(wide === 'personal: a-project-with-a-very-long-directory-name-indeed',
+    `a project name that fills the line left room for a fragment: ${JSON.stringify(wide)}`);
 }
 
 section('A question on a lock screen, which has to be decidable from:');

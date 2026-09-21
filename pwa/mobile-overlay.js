@@ -53,7 +53,7 @@
    *
    * Bump it when this file changes in a way anyone would look for.
    */
-  const OVERLAY_BUILD = '2026-09-21.2';
+  const OVERLAY_BUILD = '2026-09-21.3';
 
   // -------------------------------------------- survive a browser refresh
   /*
@@ -1712,6 +1712,49 @@
       return new URLSearchParams(location.search).get('folder') || '';
     } catch {
       return ''; // an empty window: no conversation to report on
+    }
+  }
+
+  /**
+   * The conversation a tapped notification was about — `?session=`.
+   *
+   * A notification names one conversation, and this window's own guess is about the
+   * project (see guessConversation in chat-service/claude-status.js), so arriving from
+   * a notification means arriving with an answer the page would otherwise have to
+   * infer. The URL is built by turn-watcher.js and opened by pwa/sw.js.
+   */
+  function notifiedSession() {
+    try {
+      return new URLSearchParams(location.search).get('session') || '';
+    } catch {
+      return '';
+    }
+  }
+
+  /**
+   * Spend the parameter: read once, then take it out of the URL.
+   *
+   * Because this page reloads itself. The workbench calls location.reload() on every
+   * bfcache restore (see `pageshow` at the bottom of this file), which on a phone
+   * means every time you switch apps and come back — and a `?session=` still in the
+   * URL would re-pin that conversation and re-open the sheet over the editor, hours
+   * after the notification was tapped, forever.
+   *
+   * The other pairs are put back byte for byte rather than re-serialized, because one
+   * of them is `?folder=` and it is the argument code-server opens the workspace from:
+   * a URLSearchParams round trip would turn a space in a project's path into `+`, and
+   * the next reload would look for a folder that does not exist.
+   */
+  function forgetNotifiedSession() {
+    try {
+      const kept = location.search
+        .replace(/^\?/, '')
+        .split('&')
+        .filter((pair) => pair && !pair.startsWith('session='));
+      const search = kept.length ? `?${kept.join('&')}` : '';
+      history.replaceState(history.state, '', `${location.pathname}${search}${location.hash}`);
+    } catch {
+      /* A browser that refuses replaceState still gets everything else. */
     }
   }
 
@@ -3989,7 +4032,58 @@
    * hidden — a suspended phone tab must not hold a request open every four
    * seconds — so returning is also when polling has to be picked back up.
    */
-  checkStatus();
+  /*
+   * Arriving from a tapped notification.
+   *
+   * The notification was about one conversation, so the window it opens says which —
+   * and this is the whole of what the phone can be told, because the panel itself
+   * cannot be addressed per conversation (it is a webview with no such URL). Pinning
+   * is what turns "the editor for this project" into "the conversation you were
+   * buzzed about": the status sheet then shows its last message, its opening prompt
+   * and Read aloud, which is what someone woken by a notification wants to see
+   * without going hunting through the panel for it.
+   *
+   * The pin happens *before* the first fetch, below, rather than after it: asking
+   * about the guess first would draw a chip for the wrong conversation and replace it
+   * a second later.
+   */
+  const arrivedFor = notifiedSession();
+  if (arrivedFor) forgetNotifiedSession();
+
+  /**
+   * Pin a conversation and show it, however word of it arrived.
+   *
+   * Two ways in, one behaviour: `?session=` on a window the worker opened, and a
+   * `cw-notification-click` message to a window that was already open — a phone gives
+   * an installed app one window, so a second notification lands on the workbench that
+   * is already there and there is no navigation to carry the id.
+   *
+   * `openStatus()` without `auto`, deliberately: this *is* a tap, so the sheet follows
+   * the conversation for a while afterwards rather than going still. If the chat
+   * service has no answer (its sign-in is separate from the editor's and may have
+   * lapsed) the sheet says so, which is better than a tap that appears to do nothing —
+   * that was the bug this whole change is about.
+   */
+  async function showNotified(sessionId) {
+    if (!sessionId || typeof sessionId !== 'string') return;
+    pinnedSession = sessionId;
+    await checkStatus();
+    openStatus();
+  }
+
+  /*
+   * `?.` on both, because this runs on desktop browsers and inside webviews where
+   * `navigator.serviceWorker` is absent — an unsupported browser must not throw here
+   * and take the rest of the overlay's wiring with it.
+   */
+  navigator.serviceWorker?.addEventListener?.('message', (event) => {
+    const data = event?.data;
+    if (!data || data.type !== 'cw-notification-click') return;
+    showNotified(data.sessionId);
+  });
+
+  if (arrivedFor) showNotified(arrivedFor);
+  else checkStatus();
   startStatusHeartbeat();
   /*
    * Which voices this box can read in, asked once and early.

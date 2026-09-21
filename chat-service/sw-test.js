@@ -1,0 +1,278 @@
+/**
+ * What tapping a notification does, which nothing else can check.
+ *
+ * pwa/sw.js runs in a service worker, and a service worker is the least observable
+ * place this repository puts code: it has no DOM, no console anyone reads, and it is
+ * woken by the operating system rather than by a page. A mistake in `notificationclick`
+ * therefore has exactly one symptom — a notification that does nothing when tapped —
+ * which is indistinguishable from the deliberate do-nothing this file's subject used to
+ * be, and from a phone that simply delivered the tap somewhere else. That was the
+ * reported bug, and it went unnoticed for as long as it did because no test loaded this
+ * file at all.
+ *
+ * So the worker is loaded here with `self` stubbed — the only dependency it has — and
+ * its two handlers are driven with the events a browser would hand them. What is
+ * asserted is the part that cannot be seen from a phone: which window gets focused,
+ * which URL gets opened when there is none, that the session id reaches the window
+ * either way, and that a payload arriving from the network cannot send the tap to
+ * another origin.
+ *
+ * Run: node chat-service/sw-test.js
+ */
+import { readFileSync } from 'fs';
+import { dirname, join } from 'path';
+import { fileURLToPath } from 'url';
+
+const here = dirname(fileURLToPath(import.meta.url));
+const workerJs = readFileSync(join(here, '..', 'pwa', 'sw.js'), 'utf8');
+
+const failures = [];
+let checks = 0;
+const ok = (msg, cond) => {
+  checks += 1;
+  if (!cond) failures.push(msg);
+};
+
+const ORIGIN = 'https://claude.example.com';
+
+/**
+ * Boot the worker against a fake `self`, and hand back both the handlers it
+ * registered and a log of everything it did through them.
+ *
+ * `new Function` rather than an import: this file is a classic script that expects
+ * `self` in scope and exports nothing, which is what a service worker is. Running it
+ * with `self` as a parameter is the closest thing to the environment it really has —
+ * and it means a syntax error or a reference to something a worker does not have
+ * fails here rather than on a phone.
+ */
+function boot({ windows = [] } = {}) {
+  const log = {
+    shown: [],      // registration.showNotification(...)
+    opened: [],     // clients.openWindow(...)
+    focused: [],    // client.focus()
+    posted: [],     // client.postMessage(...)
+    closed: 0,      // notification.close()
+    pending: [],    // whatever was handed to event.waitUntil
+  };
+  const listeners = new Map();
+
+  const self = {
+    location: new URL(`${ORIGIN}/chat/sw.js`),
+    addEventListener: (type, fn) => listeners.set(type, fn),
+    skipWaiting: () => {},
+    registration: {
+      showNotification: (title, options) => {
+        log.shown.push({ title, ...options });
+        return Promise.resolve();
+      },
+      pushManager: { subscribe: () => Promise.reject(new Error('not exercised here')) },
+    },
+    clients: {
+      claim: () => Promise.resolve(),
+      matchAll: () => Promise.resolve(windows),
+      openWindow: (url) => {
+        log.opened.push(String(url));
+        return Promise.resolve(null);
+      },
+    },
+  };
+
+  const caches = { keys: () => Promise.resolve([]), delete: () => Promise.resolve(true) };
+  const fetchStub = () => Promise.reject(new Error('the worker fetched something unasked'));
+
+  // eslint-disable-next-line no-new-func
+  new Function('self', 'caches', 'atob', 'fetch', workerJs)(
+    self,
+    caches,
+    (text) => Buffer.from(String(text), 'base64').toString('binary'),
+    fetchStub,
+  );
+
+  return { listeners, log };
+}
+
+/** A window the browser would hand back from clients.matchAll. */
+function fakeWindow(url, log, { focusable = true } = {}) {
+  const client = {
+    url,
+    focus: () => {
+      if (!focusable) return Promise.reject(new Error('cannot focus'));
+      log.focused.push(url);
+      return Promise.resolve(client);
+    },
+    postMessage: (message) => log.posted.push(message),
+  };
+  return client;
+}
+
+/** Tap a notification whose `data` is what the push handler would have stored. */
+async function tap(data, { windows = [] } = {}) {
+  // The array is handed to the worker before it is filled, and `matchAll` closes over
+  // it — which is how the windows can be built against the log of the same boot they
+  // will be reported by.
+  const clients = [];
+  const { listeners, log } = boot({ windows: clients });
+  for (const url of windows) clients.push(fakeWindow(url, log));
+
+  const handler = listeners.get('notificationclick');
+  if (!handler) {
+    failures.push('the worker registered no notificationclick handler at all');
+    return log;
+  }
+  const waits = [];
+  handler({
+    notification: { data, close: () => { log.closed += 1; } },
+    waitUntil: (promise) => waits.push(promise),
+  });
+  await Promise.all(waits);
+  return log;
+}
+
+// --------------------------------------------------------------- the payload
+/*
+ * The URL has to survive the push handler, because that is where it is read out of
+ * the encrypted payload and put somewhere the click handler can still find it minutes
+ * or hours later. A notification sits on a lock screen long after the push that made
+ * it, and `notification.data` is the only thing that persists with it.
+ */
+{
+  const { listeners, log } = boot();
+  const push = listeners.get('push');
+  ok('the worker registered no push handler', Boolean(push));
+  const waits = [];
+  const payload = {
+    title: 'Claude finished · demo',
+    body: 'Done.',
+    tag: 'turn-abc',
+    project: 'demo',
+    sessionId: 'S1',
+    at: '2026-09-21T08:00:00.000Z',
+    url: '/p/demo/?folder=%2Fworkspace%2Fprojects%2Fdemo&session=S1',
+  };
+  push({ data: { json: () => payload }, waitUntil: (p) => waits.push(p) });
+  await Promise.all(waits);
+
+  const shown = log.shown[0];
+  ok('the push handler showed no notification, which costs the subscription', Boolean(shown));
+  ok(
+    `the notification does not carry where to go: ${JSON.stringify(shown?.data)} — the ` +
+      'tap happens long after this, with nothing else left to read',
+    shown?.data?.url === payload.url,
+  );
+  ok('the notification lost which conversation it was about', shown?.data?.sessionId === 'S1');
+}
+
+// ------------------------------------------------------------- nothing open
+/*
+ * The plain case, and the one the bug report was about: a phone with nothing open,
+ * a tap, and an editor for that project on screen afterwards.
+ */
+{
+  const url = '/p/demo/?folder=%2Fworkspace%2Fprojects%2Fdemo&session=S1';
+  const log = await tap({ project: 'demo', sessionId: 'S1', url });
+  ok(
+    `the tap opened ${JSON.stringify(log.opened)} — it has to be the project window the ` +
+      'notification names, query and all, or the editor opens with no folder',
+    log.opened.length === 1 && log.opened[0] === url,
+  );
+  ok('the notification was left on the lock screen after being tapped', log.closed === 1);
+}
+
+// -------------------------------------------------- that project already open
+/*
+ * A window for this project is focused, not replaced.
+ *
+ * On Android an installed web app has exactly one window, so opening would mean
+ * navigating the workbench that is already there — a full code-server reload to arrive
+ * at the place it was already showing. The session id then has to travel by message,
+ * because the URL of a window that already exists cannot be changed without that
+ * reload being exactly what happens.
+ */
+{
+  const url = '/p/demo/?folder=%2Fworkspace%2Fprojects%2Fdemo&session=S2';
+  const log = await tap(
+    { project: 'demo', sessionId: 'S2', url },
+    { windows: [`${ORIGIN}/p/demo/?folder=%2Fworkspace%2Fprojects%2Fdemo`] },
+  );
+  ok(
+    'a window for this project was already open and the tap opened another one — on a ' +
+      'phone that is a workbench reload to land where it already was',
+    log.opened.length === 0,
+  );
+  ok('the window that was already open was never focused', log.focused.length === 1);
+  ok(
+    `the focused window was not told which conversation: ${JSON.stringify(log.posted)} — its ` +
+      'URL cannot change without a reload, so this message is the only way to say',
+    log.posted.length === 1 && log.posted[0]?.sessionId === 'S2',
+  );
+  ok(
+    'the message to the window carries no type, so the overlay cannot tell it from any ' +
+      'other postMessage the workbench receives',
+    log.posted[0]?.type === 'cw-notification-click',
+  );
+}
+
+// ------------------------------------------------- a different project open
+/*
+ * The editor open on *another* project must not absorb the tap. It is the same origin
+ * and the same installed code-server, so only the path tells them apart — which is
+ * the whole reason /p/<name>/ exists (see chat-service/manifest.js).
+ */
+{
+  const url = '/p/demo/?folder=%2Fworkspace%2Fprojects%2Fdemo&session=S1';
+  const log = await tap(
+    { project: 'demo', sessionId: 'S1', url },
+    { windows: [`${ORIGIN}/p/other/?folder=%2Fworkspace%2Fprojects%2Fother`, `${ORIGIN}/chat/`] },
+  );
+  ok(
+    'a window on a different project took the tap — the notification for demo would ' +
+      'focus the editor for other and change nothing on screen',
+    log.focused.length === 0,
+  );
+  ok(`the tap opened ${JSON.stringify(log.opened)} instead of ${url}`, log.opened[0] === url);
+}
+
+// --------------------------------------------------------------- the fallback
+/*
+ * Two notifications have no project window to go to: the test notification from the
+ * switch, which is about no conversation at all, and one for a transcript whose
+ * directory is not a project. Both are real, and both have to land somewhere.
+ */
+{
+  const log = await tap({ project: null, sessionId: null });
+  ok(
+    `a notification with no URL opened ${JSON.stringify(log.opened)} — the chat app is the ` +
+      'one address that is always right',
+    log.opened.length === 1 && log.opened[0] === '/chat/',
+  );
+}
+{
+  const log = await tap({ sessionId: 'S1', url: '/chat/' }, { windows: [`${ORIGIN}/chat/`] });
+  ok('the chat app was already open and the tap opened a second one', log.opened.length === 0);
+  ok('the open chat app was not focused by a tap that belongs to it', log.focused.length === 1);
+}
+
+// ------------------------------------------------------------ somebody else's URL
+/*
+ * The URL arrives over the network, inside the push payload. Nothing in this
+ * deployment sends anything but a path — but `//elsewhere.example` is a URL to another
+ * site that reads like one, and a worker that opened it would turn a notification into
+ * a redirect someone else chose. Rejected in favour of the fallback rather than
+ * repaired.
+ */
+for (const hostile of ['//elsewhere.example/', 'https://elsewhere.example/', 'javascript:alert(1)', 'p/demo/']) {
+  const log = await tap({ project: 'demo', sessionId: 'S1', url: hostile });
+  ok(
+    `a payload asking for ${JSON.stringify(hostile)} opened ${JSON.stringify(log.opened)} — ` +
+      'anything that is not a path on this origin has to fall back to the chat app',
+    log.opened.length === 1 && log.opened[0] === '/chat/',
+  );
+}
+
+// ----------------------------------------------------------------- the report
+if (failures.length) {
+  console.error(`sw-test: ${failures.length} of ${checks} checks failed\n`);
+  for (const line of failures) console.error(`  FAIL ${line}`);
+  process.exit(1);
+}
+console.log(`sw-test: ${checks}/${checks} checks passed`);

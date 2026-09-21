@@ -791,7 +791,7 @@ because the failure it prevents would make the feature something you turn off:
   moment the person has to come back and say `continue`, announced as the one moment
   they need not. `NO_ANSWER` in `claude-status.js` maps those two strings to a
   `cutOff` of `interrupted` or `overflow`, exposed on `/api/claude-status`; the
-  watcher titles it "Claude stopped" and says which, and the overlay's sheet, chip
+  watcher's body opens with "Stopped" and says which, and the overlay's sheet, chip
   and spoken line follow the same field. Two traps, both covered by tests: the
   artifact is *not* the last thing said (the real last message is the one before it,
   so that is what gets previewed), and because that message was usually announced
@@ -832,6 +832,50 @@ things an unanswered ask can be, and `question.pending` is what tells them apart
 one being waited on, one the conversation stopped in the middle of (nothing running it —
 the sheet says to send the answer as an ordinary message), and one that was dismissed
 and walked past, about which the right thing to say is nothing at all.
+
+**A notification names the conversation, and tapping it goes there.** Both halves of
+that were missing, and the second one was reported as a bug — "clicking does nothing,
+just dismisses it", on Android and on the desktop. It was accurate: `notificationclick`
+closed the notification and stopped, on the argument that there is no URL for a
+conversation inside the panel. Half of that is still true and the conclusion was still
+wrong; a tap that does nothing is indistinguishable from a broken app. So:
+
+- **The title is deployment → project → conversation** — `notificationTitle()` in
+  `turn-watcher.js`, built on the same `appTitle()` as a home-screen icon so a phone
+  carrying two deployments names them the same way in both places. Android gives a
+  title one line and truncates the end, so the order is widest to narrowest and the
+  conversation's name is the part that gets cut (marked with an ellipsis, and dropped
+  entirely rather than left as a fragment when the project fills the line).
+- **The state moved into the body**, where there is room to say what happened. A
+  notification arriving is itself the news that a turn ended, so "Claude finished" was
+  the least informative thing in the title — but the two cases that are *not* an
+  ordinary finish still have to be told apart at a glance, and they lead the body
+  instead: `cutOffBody()` opens with "Stopped", and a question with "Waiting on you —".
+  A finish can be ignored; a question stops the conversation until someone answers.
+- **The payload carries a `url`, and the server is the only side that can build it.**
+  `projectStartUrl(name, path)` plus `&session=<id>`: the phone has a mangled transcript
+  directory name, and `?folder=` needs the real path. A transcript whose directory is
+  not a project gets no URL and falls back to `/chat/`, which is also where the test
+  notification goes.
+- **The tap opens that project's window, not the chat app.** Notifications only ever
+  fire for sessions this app is *not* driving, so resuming one in the chat app would
+  start a second `claude --resume` against the same transcript — the thing
+  `claude-broker` exists to prevent. `/p/<project>/` is an installed app with one
+  window, so an existing window for that project is focused rather than navigated: the
+  session id then travels by `postMessage` (`cw-notification-click`), because the URL
+  of a window that already exists cannot be changed without the workbench reload that
+  focusing was meant to avoid. Anything that is not a path on this origin is refused in
+  favour of `/chat/` — the value arrives over the network, and `//elsewhere/` reads like
+  a path.
+- **The overlay is what turns an address into a conversation.** It reads `?session=`
+  before its first status fetch, pins it (`pinnedSession`, the same override the
+  conversation list uses) and opens the status sheet — the last message, the opening
+  prompt, Read aloud. Then it takes the parameter out of the URL with `replaceState`,
+  because the workbench reloads itself on every bfcache restore and would otherwise
+  re-open that sheet for a notification tapped hours ago. `sw-test.js` loads the worker
+  with `self` stubbed and `overlay-test.js` boots a second document at a `?session=`
+  URL; a service worker has no console anyone reads, so both of those failures look
+  exactly like a phone ignoring the tap.
 
 **Notifications are switched on from either surface, and there is only one of
 them.** The chat app's Settings sheet has a checkbox; the editor overlay's status

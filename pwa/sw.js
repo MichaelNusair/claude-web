@@ -63,24 +63,117 @@ self.addEventListener('push', (event) => {
         // When the turn actually ended, not when the phone happened to wake up: a
         // notification delivered late otherwise claims to be current.
         timestamp: Date.parse(data.at || '') || Date.now(),
-        data: { project: data.project || null, sessionId: data.sessionId || null, at: data.at || null },
+        data: {
+          project: data.project || null,
+          sessionId: data.sessionId || null,
+          at: data.at || null,
+          // Where tapping it goes. Built by the server, which is the only side that
+          // knows where a project lives on disk — see projectStartUrl in
+          // chat-service/manifest.js and the payload in turn-watcher.js.
+          url: typeof data.url === 'string' ? data.url : null,
+        },
       });
     })(),
   );
 });
 
 /**
- * Tapping it dismisses it, and that is all.
+ * Tapping it goes to the project it is about.
  *
- * No deep link on purpose. The place a notification would want to send you is a
- * conversation inside code-server's Claude panel, and there is no URL for that —
- * opening the editor would land you in whatever was last on screen, having
- * discarded nothing and helped nobody. The notification's job is to tell you the
- * wait is over; you decide what to open.
+ * This used to close the notification and stop, on the argument that there is no URL
+ * for a conversation inside code-server's Claude panel. Half of that is still true —
+ * the panel cannot be told which conversation to show, because it is a proprietary
+ * webview with no such address — but the conclusion was wrong: a tap that does
+ * nothing at all reads as a broken notification, and the reported symptom was exactly
+ * that ("clicking does nothing, just dismisses it"), on Android and on the desktop.
+ *
+ * So it opens the project's own window — `/p/<project>/?folder=…`, the installable
+ * app per project from chat-service/manifest.js — and hands the session id to the
+ * overlay in it, which *can* say which conversation this was about: it pins that
+ * conversation and opens its status sheet, with the message, the opening prompt and
+ * Read aloud. Deliberately not the chat app: notifications only ever fire for
+ * sessions this app is not driving (see turn-watcher.js), and opening one of those in
+ * the chat app would start a second `claude --resume` against the same transcript —
+ * the thing claude-broker exists to prevent.
+ *
+ * An existing window for that project is focused rather than replaced. A phone gives
+ * an installed web app one window, so "open" would mean navigating the workbench that
+ * is already there — throwing away a loaded editor to arrive where it already was.
+ * The session id therefore travels by postMessage as well as in the URL, because the
+ * URL of a window that already exists cannot be changed without reloading it.
  */
 self.addEventListener('notificationclick', (event) => {
   event.notification.close();
+  event.waitUntil(openFor(event.notification.data || {}));
 });
+
+/**
+ * Where a notification points, as a path on this origin.
+ *
+ * `/chat/` is the fallback, and it covers two real cases rather than being defensive
+ * for its own sake: the test notification from the switch, which is about no
+ * conversation at all, and a notification for a transcript whose directory is not a
+ * project (someone's home directory, a checkout elsewhere) — that has no project
+ * window to open. Anything that is not a path on this origin is treated as absent:
+ * this value arrives over the network, and `//elsewhere/` is a URL to somebody else's
+ * site that reads like a path.
+ */
+function destination(data) {
+  const url = typeof data.url === 'string' ? data.url : '';
+  return url.startsWith('/') && !url.startsWith('//') ? url : '/chat/';
+}
+
+/** Is this window already the app the notification is pointing at? */
+function inSameApp(clientUrl, target) {
+  try {
+    const here = new URL(clientUrl);
+    // Path prefix, not equality: the workbench navigates inside /p/<project>/ as it
+    // loads, and the query carries `?folder=` in one and not the other.
+    return here.origin === target.origin && here.pathname.startsWith(target.pathname);
+  } catch {
+    return false;
+  }
+}
+
+async function openFor(data) {
+  const url = destination(data);
+  const target = new URL(url, self.location.origin);
+  let windows = [];
+  try {
+    // `includeUncontrolled`, because every window this can reach is one: this worker
+    // is scoped to /chat/ and has no `fetch` handler, so it controls nothing — and the
+    // window worth focusing is an editor at /p/<project>/, outside that scope.
+    windows = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
+  } catch {
+    /* Answer as though there were none, which opens one. */
+  }
+
+  const existing = windows.find((client) => inSameApp(client.url, target));
+  if (existing) {
+    try {
+      // focus() answers with the client on Chrome and undefined on some others; the
+      // one we already hold is as good for postMessage either way.
+      const focused = (await existing.focus?.()) || existing;
+      focused.postMessage?.({
+        type: 'cw-notification-click',
+        project: data.project || null,
+        sessionId: data.sessionId || null,
+        at: data.at || null,
+        url,
+      });
+      return;
+    } catch {
+      // A window that cannot be focused (it is closing, another app owns the
+      // foreground) must not swallow the tap.
+    }
+  }
+
+  try {
+    await self.clients.openWindow(url);
+  } catch {
+    /* Nothing further to try: the tap is spent and the notification is closed. */
+  }
+}
 
 /**
  * The browser rotated the subscription.
