@@ -176,7 +176,12 @@ current design:
   [`chat-service/manifest-test.js`](chat-service/manifest-test.js): it discovers
   every nginx location that proxies to code-server and requires the gate on each,
   so adding a fourth editor route without one fails the suite. Add a route that
-  reaches code-server, and that is the test you will hear from.
+  reaches code-server, and that is the test you will hear from. `deploy.sh` gates
+  that one too, as of 2026-09-21 — it did not for months, and the two are not
+  interchangeable: `auth-test.js` proves the routes it knows about refuse an
+  anonymous caller, `manifest-test.js` proves a newly added route is one of them.
+  The nginx config it reads ships *in the payload* (`infra/userdata/bootstrap.sh`),
+  so without it a deploy shipped the routing and never checked it.
 
 If you are asked to "just disable auth for testing", use
 `CW_INSECURE_COOKIES=1` on `localhost` — which only drops the `Secure` cookie
