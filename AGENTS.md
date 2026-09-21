@@ -221,10 +221,10 @@ against. Do **not** reach for `playwright install-deps` when something is missin
 only knows `apt` and exits 127 here. The package names are in the optional group at the
 top of `bootstrap.sh`, and `ldd <binary> | grep not-found` is how that list was built.
 `chromium` is not in the AL2023 repos, so Playwright's own download (or a direct fetch
-from Chrome for Testing) is the way to get one. Chrome for Testing does publish `linux-arm64`,
-which two notes on this box got wrong; and use the *headless shell* binary, since the
-full `chrome` build crashes at launch here (`chrome_crashpad_handler: --database is
-required`) with `ldd` clean.
+from Chrome for Testing) is the way to get one. Chrome for Testing does publish
+`linux-arm64`, which two notes on this box got wrong; and use the *headless shell*
+binary, since the full `chrome` build crashes at launch here
+(`chrome_crashpad_handler: --database is required`) with `ldd` clean.
 
 One caution that belongs with the capability: **this repository serves a landing page
 that carries analytics, so do not point a browser at the live one.**
