@@ -221,7 +221,18 @@ against. Do **not** reach for `playwright install-deps` when something is missin
 only knows `apt` and exits 127 here. The package names are in the optional group at the
 top of `bootstrap.sh`, and `ldd <binary> | grep not-found` is how that list was built.
 `chromium` is not in the AL2023 repos, so Playwright's own download (or a direct fetch
-from Chrome for Testing) is the way to get one.
+from Chrome for Testing) is the way to get one. Chrome for Testing does publish `linux-arm64`,
+which two notes on this box got wrong; and use the *headless shell* binary, since the
+full `chrome` build crashes at launch here (`chrome_crashpad_handler: --database is
+required`) with `ldd` clean.
+
+One caution that belongs with the capability: **this repository serves a landing page
+that carries analytics, so do not point a browser at the live one.**
+`landing/analytics.js` runs PostHog with `disable_session_recording: false` and no bot
+or headless filtering, which makes a verification screenshot a *write* to the funnel
+rather than a read — and it fails silently, by being counted. Render the local file and
+keep the browser off the network (`--host-resolver-rules="MAP * 127.0.0.1"`) unless the
+live origin is the thing under test, and say so when it is.
 
 This is written down because the previous state was invisible from inside a session and
 cost real work. Until 2026-09-21 the workspace account (`coder`) was deliberately outside
@@ -980,16 +991,31 @@ Things that have burned people, in this codebase specifically:
   the script this expects, it says so and re-runs the copy on disk. What
   `--app-only` still cannot do is change an AWS resource in `infra/lib` — a security
   group, an ALB rule, an IAM policy. That needs a full deploy, from another machine.
-- **A deploy ends every chat conversation, and only the chat's.** `deploy.sh` runs
-  `systemctl restart claude-chat`, and a conversation is a child of that unit, so
+- **A deploy disturbs the chat *and* the editor, and agents are working in both.**
+  `deploy.sh` restarts `claude-chat` and `code-server` on consecutive lines (580-581),
+  and each one costs something different.
+  The chat half is the loud one: a conversation is a child of the claude-chat unit, so
   its cgroup takes all of them with it — the cgroup rule above, seen from the other
-  side. The broker's and tmux's conversations survive exactly because no deploy path
-  restarts those units. Nothing is corrupted (the transcripts are on disk and every
-  session is still offered in the chat list) but a turn in flight is lost, and the
-  client's tabs come back attached to fresh processes. So say so rather than being
-  clever about it when someone asks to deploy mid-task, and put long work on the
-  editor panel or `cc`. `/chat/admin` prints this under the chat's own conversations
-  for the same reason.
+  side. Nothing is corrupted (the transcripts are on disk and every session is still
+  offered in the chat list) but a turn in flight is lost, and the client's tabs come
+  back attached to fresh processes.
+  The editor half is quiet, and this file claimed for a long time that a deploy ended
+  "only the chat's" conversations. It does not. Restarting code-server tears down every
+  extension host, and a Claude session running in an editor panel gets `Read`, `Edit`,
+  `Write` and its hook bridge *from that host* — so those calls start failing with
+  "PreToolUse hook did not respond… host client may be unreachable" while `Bash`, which
+  does not go through the host, keeps working. That split is the signature; it looks
+  like a broken hook rather than a deploy. It also does not self-heal, because the
+  reconnect is driven by the editor page: the tab has to be reloaded. Measured
+  2026-09-21, when two `--app-only` deploys took the file tools out from under three
+  sessions at once and left all 75 lock files in `~/.claude/ide/` stale, every pid dead
+  and no listener on any recorded port.
+  So **only the broker's and tmux's conversations genuinely survive a deploy**, because
+  no deploy path restarts those units — and that, not the editor panel, is where long
+  work belongs. Say which surfaces you are about to disturb rather than being clever
+  about it when someone asks to deploy mid-task, and tell the other live sessions
+  first: `ListAgents` shows them, and they cannot see your deploy coming.
+  `/chat/admin` prints this under the chat's own conversations for the same reason.
 - **`/api/projects` reads every transcript, so nothing may poll it.** It stats and
   opens each `.jsonl` to build the titles — fine once per screen, ruinous every few
   seconds. Anything that needs to know what is *running* asks `/api/live`, which is
