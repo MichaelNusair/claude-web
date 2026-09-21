@@ -882,6 +882,198 @@ ok(
   /working/i.test(doc.querySelector('#cmo-panel .cmo-title')?.textContent ?? ''),
 );
 
+// ------------------------------------------------------------- the third branch
+/*
+ * The branch between the other two: Claude has stopped and is waiting for an answer.
+ *
+ * Reported as `state: 'question'` — an unanswered `AskUserQuestion` at the end of the
+ * transcript. It has to be its own thing on screen because it is the one state where
+ * waiting accomplishes nothing: on disk and to the broker it is a turn in flight, so
+ * every surface used to say "Claude is working…" about a conversation that had stopped
+ * and would stay stopped. On the transcripts on this box that was a median of three
+ * minutes and, once, 5.9 hours.
+ *
+ * The question itself is model output and lands in a sheet built from a template
+ * string, so — like the message above — the check is not that it renders but that it
+ * renders as text.
+ */
+const asking = (over = {}) => ({
+  id: 'toolu_bdrk_01waiting',
+  at: new Date().toISOString(),
+  answered: false,
+  pending: true,
+  questions: [
+    {
+      header: 'Deploy',
+      question: 'Ship this with <img src=x onerror="alert(1)"> app-only, or the whole stack?',
+      options: ['App only', 'Full deploy'],
+      multiSelect: false,
+      answer: null,
+    },
+  ],
+  ...over,
+});
+
+statusReply = { ...statusReply, state: 'question', clients: 1, question: asking() };
+await tapStatus();
+const askChip = doc.getElementById('cmo-chip');
+const askChipText = () => askChip?.querySelector('.cmo-chip-text')?.textContent ?? '';
+ok(
+  `a conversation waiting for an answer says something else on the chip: ${JSON.stringify(askChipText())}`,
+  /waiting for your answer/i.test(askChipText()),
+);
+ok(
+  'the chip does not say which question it is waiting on, so it is not specific enough to act on',
+  /Deploy/.test(askChipText()),
+);
+ok(
+  'a question reads as work in progress on the chip — the one thing it is not',
+  !/working/i.test(askChipText()),
+);
+ok(
+  'the waiting dot blinks like a working one, so a question looks like something in progress',
+  askChip?.querySelector('.cmo-dot')?.classList.contains('cmo-ask') &&
+    !askChip?.querySelector('.cmo-dot')?.classList.contains('cmo-busy'),
+);
+ok(
+  'the sheet does not say Claude is waiting for an answer',
+  /waiting for your answer/i.test(doc.querySelector('#cmo-panel .cmo-title')?.textContent ?? ''),
+);
+const askBlock = () => doc.getElementById('cmo-ask');
+ok(
+  'the question is not shown, so the sheet says someone is waiting without saying for what',
+  /app-only, or the whole stack\?/.test(askBlock()?.textContent ?? ''),
+);
+ok(
+  'the question’s own label is missing from the sheet',
+  /Deploy/.test(askBlock()?.querySelector('.cmo-ask-head')?.textContent ?? ''),
+);
+ok(
+  'the options are missing, and they are usually the whole of the decision',
+  [...(askBlock()?.querySelectorAll('.cmo-ask-opts li') ?? [])].map((li) => li.textContent).join('|') ===
+    'App only|Full deploy',
+);
+ok(
+  'a question from the model was injected as markup: an <img> in it built an element ' +
+    'in the editor',
+  !askBlock()?.querySelector('img'),
+);
+ok(
+  'the sheet does not say where the answer has to go, which is the only thing to do about it',
+  /in the panel/i.test(doc.getElementById('cmo-panel')?.textContent ?? ''),
+);
+
+// A multi-select ask says so, because "pick any" changes what the card in the panel
+// expects of you.
+statusReply = {
+  ...statusReply,
+  question: asking({ questions: [{ header: 'Surfaces', question: 'Which should say it?', options: ['Chip', 'Push'], multiSelect: true, answer: null }] }),
+};
+await tapStatus();
+ok(
+  'a multi-select question is shown as though only one option could be picked',
+  /pick any/i.test(askBlock()?.querySelector('.cmo-ask-head')?.textContent ?? ''),
+);
+
+/*
+ * The other half, and the one the panel cannot help with. Opening a conversation makes
+ * the panel re-render every question in it as a fresh card, answered or not — so the
+ * cards on screen say nothing about whether anything is waiting, and the same question
+ * can be answered twice. This is the only surface that can say otherwise, and
+ * `question.answer` is what it says it with.
+ *
+ * Only on a replay: the first answer of a page, or a switch to another conversation.
+ * Those are the two moments the panel redraws history, so those are the two moments
+ * this is news rather than noise.
+ */
+statusReply = {
+  ...statusReply,
+  sessionId: 'def456',
+  state: 'idle',
+  clients: 0,
+  question: asking({ answered: true, pending: false, questions: [{ header: 'Deploy', question: 'Ship app-only, or the whole stack?', options: ['App only', 'Full deploy'], multiSelect: false, answer: 'App only' }] }),
+};
+await tapStatus();
+const noteEl = () => doc.getElementById('cmo-chip')?.querySelector('.cmo-chip-note');
+ok(
+  `switching to a conversation whose question is already answered says nothing about it: ${JSON.stringify(noteEl()?.textContent ?? '')}`,
+  /already answered/i.test(noteEl()?.textContent ?? '') && noteEl()?.classList.contains('cmo-on'),
+);
+ok(
+  'the chip does not say which option was taken, which is what makes it checkable ' +
+    'against the card the panel is redrawing',
+  /App only/.test(noteEl()?.textContent ?? ''),
+);
+ok(
+  'the sheet does not say the question was already answered — the card in the panel ' +
+    'looks exactly like a live one',
+  /You answered this/i.test(askBlock()?.textContent ?? '') && /redraws every question card/.test(askBlock()?.textContent ?? ''),
+);
+
+// Same conversation, asked again: the panel is not redrawing anything, so the note
+// would be a fact repeated at someone who has already read it.
+await tapStatus();
+ok(
+  'the answered note stays on the chip after the first sight of the conversation, ' +
+    'where it is no longer news',
+  !noteEl()?.classList.contains('cmo-on') && !noteEl()?.textContent,
+);
+
+// Asked, dismissed, and the conversation carried on past it: two of the 76 asks on
+// this box. Nothing is waiting and nothing was chosen, so there is nothing to say.
+statusReply = { ...statusReply, sessionId: 'ghi789', question: asking({ answered: false, pending: false }) };
+await tapStatus();
+ok(
+  'a question the conversation walked past is described as though it mattered',
+  Boolean(askBlock()) && !askBlock().textContent,
+);
+
+// Unanswered, and nothing is running it: the card in the panel leads nowhere, so the
+// way on is to say the answer as an ordinary message.
+statusReply = { ...statusReply, sessionId: 'jkl012', live: false, question: asking() };
+await tapStatus();
+ok(
+  'an abandoned question offers no way to answer it, and the card in the panel goes nowhere',
+  /as a message instead/i.test(askBlock()?.textContent ?? ''),
+);
+
+// And in the list: the row that will never move on its own is the one to say so about.
+statusReply = {
+  ...statusReply,
+  sessionId: 'abc123',
+  state: 'idle',
+  question: null,
+  conversations: [
+    { sessionId: 'abc123', title: 'This one', state: 'idle', at: Date.now(), current: true },
+    { sessionId: 'def456', title: 'The waiting one', state: 'question', at: Date.now() - 6e5 },
+    { sessionId: 'ghi789', title: 'The busy one', state: 'working', at: Date.now() - 3e5 },
+  ],
+};
+await tapStatus();
+ok(
+  'the head of the list does not count the conversations waiting on an answer, which ' +
+    'are the ones to open first',
+  /1 waiting on you/.test(doc.getElementById('cmo-convo-head')?.textContent ?? ''),
+);
+const waitingRow = [...doc.querySelectorAll('#cmo-convos .cmo-convo')].find((row) =>
+  /The waiting one/.test(row.textContent ?? ''),
+);
+ok(
+  'a conversation waiting on an answer is listed like any other',
+  /waiting on you/.test(waitingRow?.querySelector('.cmo-convo-meta')?.textContent ?? ''),
+);
+ok(
+  'and its dot is the working one, so the list says it is busy rather than stuck',
+  waitingRow?.querySelector('.cmo-dot')?.classList.contains('cmo-ask') &&
+    !waitingRow?.querySelector('.cmo-dot')?.classList.contains('cmo-busy'),
+);
+
+// Back to the working branch, whose sheet the next section reads.
+delete statusReply.conversations;
+delete statusReply.live;
+statusReply = { ...statusReply, state: 'working', clients: 1, question: null };
+await tapStatus();
+
 // ---------------------------------------------------------- reading it aloud
 /*
  * Say the last message out loud.

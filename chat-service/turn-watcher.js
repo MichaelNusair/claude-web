@@ -30,6 +30,14 @@
  *   per conversation, so anything older than ten minutes is read for its state and
  *   never announced.
  *
+ * And one thing that is announced without having finished at all: a turn that stopped
+ * to ask you something. `state: 'question'` from claude-status.js — an `AskUserQuestion`
+ * at the end of a transcript with no result under it. It fails both tests above, being
+ * neither idle nor a new message, and it is the single most useful buzz this file can
+ * send: nothing will happen in that conversation until a person goes and answers it.
+ * On the transcripts here the median answer took three minutes and the slowest 5.9
+ * hours, all of it reading as "Claude is working…" to anyone who looked.
+ *
  * A turn that was *killed* is idle by both of those tests and is not finished, which
  * this used to announce as "Claude finished" over a body reading "No response
  * requested." — the harness artifact that stands where the answer would have been.
@@ -106,6 +114,30 @@ const CUT_OFF_REASON = {
 export function cutOffBody(reason, text = '') {
   const said = preview(text, 70);
   return `${CUT_OFF_REASON[reason] || CUT_OFF_REASON.interrupted}${said ? ` Last said: ${said}` : ''}`;
+}
+
+/**
+ * What a question looks like on a lock screen.
+ *
+ * The question itself, not a summary of it: the point of this notification is that
+ * someone can decide whether it is worth going to the panel for, and "Claude asked you
+ * something" cannot be decided on. The option labels follow it when they fit, because
+ * they are usually the whole of the decision — and their count when they do not, so a
+ * one-tap answer is never mistaken for an essay.
+ *
+ * `header` leads when there is one. It is Claude Code's own short label for the
+ * question and it is the part that reads well truncated, which on a lock screen
+ * everything eventually is.
+ */
+export function questionBody(question) {
+  const asked = question?.questions?.[0];
+  if (!asked) return 'Claude is waiting for an answer.';
+  const head = asked.header ? `${asked.header}: ` : '';
+  const options = asked.options || [];
+  const body = `${head}${preview(asked.question, 110)}`;
+  if (!options.length) return body;
+  const listed = options.join(' · ');
+  return `${body} — ${listed.length <= 90 ? listed : `${options.length} options`}`;
 }
 
 /**
@@ -231,6 +263,11 @@ export function createTurnWatcher({
         if (!exchange) continue;
         const text = exchange.last?.text || '';
         /*
+         * A question waiting on a person. Its own kind of news, and the one kind that
+         * is announced while the turn is technically still running — see the header.
+         */
+        const asking = exchange.state === 'question' && Boolean(exchange.question);
+        /*
          * The cut-off reason is part of what makes a turn new, not just its text.
          *
          * A killed turn leaves an artifact where its answer would be (see NO_ANSWER
@@ -238,17 +275,30 @@ export function createTurnWatcher({
          * it — usually one already announced. Digesting the text alone would make
          * that look like a repeat and swallow the one notification worth having: the
          * turn you are waiting on has stopped and needs a nudge.
+         *
+         * A question is digested by its tool_use id for the same reason and then
+         * some: it carries no text of its own, so it would digest to whatever was
+         * said before it — which is either a repeat (silence) or nothing at all
+         * (silence). The id is unique per ask, so a second question in the same
+         * conversation is news and the same one seen again never is.
          */
-        const mark = exchange.cutOff ? `${exchange.cutOff}|${text}` : text;
+        const mark = asking
+          ? `question|${exchange.question.id}`
+          : exchange.cutOff ? `${exchange.cutOff}|${text}` : text;
         const record = { mtimeMs, text: mark ? digest(mark) : '' };
         const changed = Boolean(record.text) && record.text !== before?.text;
         seen.set(file, record);
 
         // Read for its state, but never announced: the first pass of a process, a
-        // conversation this app is driving, a turn that is still going, a repeat of
-        // the message already sent, or something that finished long ago.
-        if (!seeded || !changed || ours.has(sessionId) || exchange.state !== 'idle') continue;
-        const at = Date.parse(exchange.last?.at || '') || mtimeMs;
+        // conversation this app is driving, a turn that is still going and not
+        // waiting on anyone, a repeat of what was already sent, or something that
+        // happened long ago.
+        const worthSaying = exchange.state === 'idle' || asking;
+        if (!seeded || !changed || ours.has(sessionId) || !worthSaying) continue;
+        // A question's clock starts when it was asked, not when the last message was
+        // said — that one is older, sometimes by the length of a turn, and a question
+        // older than FRESH_MS would be dropped for the age of its own preamble.
+        const at = Date.parse((asking ? exchange.question.at : exchange.last?.at) || '') || mtimeMs;
         if (now() - at > FRESH_MS) continue;
 
         const project = names.get(dir.name) || dir.name;
@@ -257,14 +307,16 @@ export function createTurnWatcher({
           // "Finished" is a claim, and it was being made about turns that were
           // killed partway — the one case where the person needs to come back and
           // say "continue", and the one case the old wording talked them out of.
-          title: `${cut ? 'Claude stopped' : 'Claude finished'} · ${project}`,
-          body: cut ? cutOffBody(cut, text) : preview(text),
+          // A question is a third claim again: not finished, not stopped, waiting.
+          title: `${asking ? 'Claude is waiting for you' : cut ? 'Claude stopped' : 'Claude finished'} · ${project}`,
+          body: asking ? questionBody(exchange.question) : cut ? cutOffBody(cut, text) : preview(text),
           // Per conversation, so a session that finishes twice replaces its own
           // notification rather than stacking two on the lock screen.
           tag: `turn-${topicFor(`${dir.name}|${sessionId}`)}`,
           project,
-          // So a client can tell the two apart without parsing the title.
-          cutOff: cut || null,
+          // So a client can tell them apart without parsing the title.
+          cutOff: asking ? null : cut || null,
+          question: asking,
           sessionId,
           conversation: exchange.title || null,
           at: new Date(at).toISOString(),

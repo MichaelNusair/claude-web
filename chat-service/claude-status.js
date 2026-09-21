@@ -197,6 +197,102 @@ async function readHead(file, bytes) {
 }
 
 /**
+ * The tool Claude asks a question with, and how much of one is worth carrying.
+ *
+ * `AskUserQuestion` is the one tool call that is not work in progress. Every other
+ * one is Claude doing something; this one is Claude stopping until a person picks an
+ * option, which on disk looks exactly like a turn still running — `stop_reason:
+ * 'tool_use'` — and to the broker looks like a process with a turn in flight, because
+ * that is what it is. Both are right and both are useless: the answer someone needs is
+ * that nothing will happen until they go and answer it. So an unanswered ask at the
+ * end of a transcript is its own state, `'question'`, decided in `lastExchange`.
+ *
+ * Only the panel can ask. The chat app runs `claude --print`, which is not offered
+ * this tool at all (checked against the flags in session-manager.js), so a question
+ * belongs to a conversation in the editor or under tmux — exactly the sessions nobody
+ * is necessarily watching.
+ *
+ * What is carried out of the transcript is deliberately not the whole question. An
+ * option's `description` and `preview` run to paragraphs each, and this answer is
+ * polled every few seconds; the labels and the question itself are what a chip, a
+ * lock screen and a sheet can show. The full thing is in the panel, which is where it
+ * has to be answered anyway.
+ */
+const ASK_TOOL = 'AskUserQuestion';
+
+/** As much of a question as any surface out here can show without becoming the panel. */
+const QUESTION_CHARS = 400;
+
+/** The last question in an assistant entry, or null. Batched asks are one card each. */
+function askedIn(entry) {
+  const content = entry.message?.content;
+  if (!Array.isArray(content)) return null;
+  let found = null;
+  for (const block of content) {
+    if (block?.type === 'tool_use' && block.name === ASK_TOOL && block.id) found = block;
+  }
+  return found;
+}
+
+/**
+ * A question, trimmed to what can be shown outside the panel, and its answer if it
+ * has one.
+ *
+ * `answers` on the tool result is what makes "you already answered this" a fact
+ * rather than an inference: Claude Code writes it keyed by the full question text,
+ * with the chosen label as the value (an array of them for a multi-select). That is
+ * the whole of bug A's handle — the panel redraws every question card in a
+ * conversation when it reloads one, so a card on screen says nothing about whether
+ * it is live, and this does.
+ */
+function describeAsk(block, entry, answered, chosen) {
+  const asked = Array.isArray(block.input?.questions) ? block.input.questions : [];
+  const answers = chosen.get(block.id) || null;
+  const clip = (text) => {
+    const flat = String(text || '').replace(/\s+/g, ' ').trim();
+    return flat.length > QUESTION_CHARS ? `${flat.slice(0, QUESTION_CHARS).trimEnd()}…` : flat;
+  };
+  return {
+    id: block.id,
+    at: entry.timestamp || null,
+    answered: answered.has(block.id),
+    questions: asked.map((q) => {
+      const picked = answers ? answers[q?.question] : undefined;
+      return {
+        header: q?.header ? String(q.header) : null,
+        question: clip(q?.question),
+        // Labels only: a label is what a person chooses between, and the paragraph
+        // under it is a paragraph per option.
+        options: (Array.isArray(q?.options) ? q.options : [])
+          .map((o) => (o?.label ? String(o.label) : ''))
+          .filter(Boolean),
+        multiSelect: Boolean(q?.multiSelect),
+        // What was chosen, in the same words the options are in. Null means this one
+        // has no answer on disk — either it is the question being waited on, or it
+        // was dismissed, which happens and leaves no result behind at all.
+        answer: Array.isArray(picked) ? picked.join(', ') : picked ? String(picked) : null,
+      };
+    }),
+  };
+}
+
+/**
+ * Whether the question found is the one the conversation is sitting on.
+ *
+ * Three things an unanswered ask can be, and a client has to tell them apart: the
+ * question being waited on (`pending`, and something is running it), a question the
+ * conversation stopped in the middle of (`pending`, and nothing is), and one that was
+ * dismissed before the conversation carried on past it (not `pending` — two of those
+ * among the 76 asks on this box). Only the first is worth answering, and only the
+ * first two are worth mentioning.
+ *
+ * `state === 'question'` is exactly that condition: the state comes from the nearest
+ * message entry, and the newest ask is the only one that can have set it.
+ */
+const withPending = (question, state) =>
+  (question ? { ...question, pending: state === 'question' } : null);
+
+/**
  * The state a transcript was left in, when the broker cannot be asked.
  *
  * `stop_reason` is what makes this possible: an assistant turn that ended says
@@ -210,6 +306,10 @@ async function readHead(file, bytes) {
  * indistinguishable from a turn still in progress. Only the broker knows whether a
  * process exists, which is why this is reported with `source: 'transcript'` and
  * never conflated with a broker answer.
+ *
+ * The one exception is the third state, `'question'`, which is decided by
+ * `lastExchange` rather than here because it needs a fact this function cannot see:
+ * whether a tool result for the ask arrived later in the file. See ASK_TOOL.
  */
 function inferState(entry) {
   if (entry.type === 'assistant') {
@@ -282,6 +382,7 @@ export async function lastExchange(file, windows = TAIL_WINDOWS) {
   let state = null;
   let title = null;
   let cutOff = null;
+  let question = null;
 
   for (const bytes of windows) {
     let tail;
@@ -294,6 +395,17 @@ export async function lastExchange(file, windows = TAIL_WINDOWS) {
 
     const lines = tail.text.split('\n');
     let last = null;
+    /*
+     * Which tool calls already have results, and what those results said.
+     *
+     * Collected as the walk goes and therefore complete by the time it matters: the
+     * walk is backwards, so every entry after an ask has been seen before the ask
+     * itself is. Per window rather than per file because every window ends at the end
+     * of the file — a result that follows an ask inside one window follows it inside
+     * a wider one too, so widening cannot change the answer.
+     */
+    const answered = new Set();
+    const chosen = new Map();
 
     for (let i = lines.length - 1; i >= 0; i -= 1) {
       if (!lines[i].trim()) continue;
@@ -320,6 +432,21 @@ export async function lastExchange(file, windows = TAIL_WINDOWS) {
       }
       if (entry.type !== 'assistant' && entry.type !== 'user') continue;
 
+      if (entry.type === 'user') {
+        const blocks = Array.isArray(entry.message?.content) ? entry.message.content : [];
+        for (const block of blocks) {
+          if (block?.type !== 'tool_result' || !block.tool_use_id) continue;
+          answered.add(block.tool_use_id);
+          // Only a question's result carries `answers`; every other tool's is output.
+          if (entry.toolUseResult?.answers) chosen.set(block.tool_use_id, entry.toolUseResult.answers);
+        }
+      }
+      // The newest question in the file, answered or not — the walk is backwards, so
+      // the first one met is the newest. Reported either way: an answered one is how a
+      // surface out here can say "the card the panel is redrawing is history".
+      const asked = entry.type === 'assistant' ? askedIn(entry) : null;
+      if (asked && !question) question = describeAsk(asked, entry, answered, chosen);
+
       const text = textOf(entry.message).trim();
       // See NO_ANSWER: an artifact stands where an answer would be, so it is never
       // reported as one — the walk continues past it to the last thing really said.
@@ -330,7 +457,16 @@ export async function lastExchange(file, windows = TAIL_WINDOWS) {
       // *last* word if nothing came after it: reply to a cut-off turn and the
       // trailing entry is that reply, which is a conversation owed an answer.
       if (!state) {
-        state = inferState(entry);
+        /*
+         * An unanswered ask is not "working", and this is the only place that can tell
+         * the difference. `inferState` sees an assistant entry with `stop_reason:
+         * 'tool_use'` and correctly says a tool is running; what it cannot see is that
+         * the tool is a question and that no result for it ever arrived. Measured on the
+         * transcripts here: 71 answered questions, a median wait of three minutes and a
+         * longest of 5.9 hours, plus three conversations sitting on an unanswered one —
+         * all of which have read as "Claude is working…" the whole time.
+         */
+        state = asked && !answered.has(asked.id) ? 'question' : inferState(entry);
         if (artifact) cutOff = artifact;
       }
 
@@ -341,13 +477,17 @@ export async function lastExchange(file, windows = TAIL_WINDOWS) {
       if (last && title) break;
     }
 
-    if (last || tail.complete) return { state: state || 'idle', last, title, cutOff, ...meta };
+    if (last || tail.complete) {
+      const settled = state || 'idle';
+      return { state: settled, last, title, cutOff, question: withPending(question, settled), ...meta };
+    }
     // Nothing sayable in this window and there is more file behind it: widen.
   }
 
   // "Unknown" only when the windows really said nothing. A state read from one of
   // them is knowledge, and reporting it as ignorance sends a device to ask again.
-  return { state: state || 'unknown', last: null, title, cutOff, ...meta };
+  const settled = state || 'unknown';
+  return { state: settled, last: null, title, cutOff, question: withPending(question, settled), ...meta };
 }
 
 /**
@@ -556,6 +696,23 @@ export async function claudeStatus(cwd, { sessionId: asked = null } = {}) {
     : mine.spokeMs > OVERRIDE_QUIET_MS;
   const overruled = Boolean(mine?.working) && quiet && spokeQuiet && transcript?.state === 'idle';
 
+  /*
+   * A question waiting is the second thing the transcript knows better than the
+   * broker, and it is not the same override as the one above.
+   *
+   * There the transcript wins because the broker's flag is stale. Here both sources
+   * are current and both are unhelpful: the process really does have a turn in
+   * flight, and that turn is a question nobody has answered. Only the file can say
+   * which — see ASK_TOOL.
+   *
+   * It takes a live process, because a question is only a question while something is
+   * waiting for the answer. An abandoned one — the transcript ends mid-ask and no
+   * process exists — is your turn in the ordinary way; `question` still rides along
+   * unanswered, so a client can say the conversation stopped while asking rather than
+   * offer to answer something nothing is listening for.
+   */
+  const asking = transcript?.state === 'question';
+
   let state;
   let source;
   if (!live) {
@@ -563,6 +720,9 @@ export async function claudeStatus(cwd, { sessionId: asked = null } = {}) {
     source = 'transcript';
   } else if (overruled) {
     state = 'idle';
+    source = 'transcript';
+  } else if (asking && mine) {
+    state = 'question';
     source = 'transcript';
   } else {
     state = mine?.working ? 'working' : 'idle';
@@ -593,6 +753,21 @@ export async function claudeStatus(cwd, { sessionId: asked = null } = {}) {
      * yesterday's news told in the present tense.
      */
     cutOff: state === 'idle' ? transcript?.cutOff || null : null,
+    /*
+     * The last question Claude asked, whether or not it is still waiting — see
+     * ASK_TOOL. Two different things are told from this one field, and both matter:
+     *
+     *   answered: false, state 'question'  ->  nothing moves until you answer it.
+     *   answered: true                     ->  the question cards the panel is
+     *                                          redrawing are history, and this says
+     *                                          which option was taken.
+     *
+     * The second is not decoration. Opening a conversation makes the panel re-render
+     * every question in it as a fresh card, and a card gives no sign of having been
+     * answered already, so the risk is answering the same question twice. Nothing out
+     * here can change what a webview draws; this is what makes it checkable.
+     */
+    question: transcript?.question || null,
     transcriptAt: transcript?.mtimeMs || null,
     // Why the panel is slow, in one number the client can show instead of
     // guessing. The wait scales with this.
@@ -619,11 +794,16 @@ async function summarise(dir, files, { liveFor, live, sessionId }) {
       const running = liveFor(file.sessionId);
       const tail = await lastExchange(join(dir, `${file.sessionId}.jsonl`), SUMMARY_WINDOW);
       const quiet = running ? running.idleMs > OVERRIDE_QUIET_MS : false;
+      // Same three-way verdict as above, on a smaller window. A question is the one
+      // state worth the most in a list: it is the row that will never finish on its
+      // own, and the one you would otherwise keep opening to see whether it had.
       const state = !live
         ? tail?.state || 'unknown'
-        : running?.working && !(quiet && tail?.state === 'idle')
-          ? 'working'
-          : 'idle';
+        : tail?.state === 'question' && running
+          ? 'question'
+          : running?.working && !(quiet && tail?.state === 'idle')
+            ? 'working'
+            : 'idle';
       return {
         sessionId: file.sessionId,
         title: tail?.title || null,

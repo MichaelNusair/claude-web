@@ -39,7 +39,7 @@ process.env.PROJECTS_ROOT = PROJECTS;
 process.env.CLAUDE_HOME = CLAUDE_HOME;
 process.env.CW_PUSH_DIR = path.join(TMP, 'push');
 
-const { createTurnWatcher, preview } = await import('./turn-watcher.js');
+const { createTurnWatcher, preview, questionBody } = await import('./turn-watcher.js');
 const { topicFor } = await import('./push.js');
 
 let pass = 0;
@@ -63,6 +63,28 @@ const assistant = (text, { stop = 'end_turn', at = new Date() } = {}) =>
   });
 const userText = (text) =>
   JSON.stringify({ type: 'user', timestamp: new Date().toISOString(), message: { role: 'user', content: text } });
+/** An `AskUserQuestion` call, as Claude Code writes one: the tool_use block alone. */
+const ask = (id, questions, { at = new Date() } = {}) =>
+  JSON.stringify({
+    type: 'assistant',
+    timestamp: new Date(at).toISOString(),
+    message: {
+      role: 'assistant',
+      stop_reason: 'tool_use',
+      content: [{ type: 'tool_use', id, name: 'AskUserQuestion', input: { questions } }],
+    },
+  });
+/** Its answer: a tool_result, and the chosen labels alongside it. */
+const answerTo = (id, answers) =>
+  JSON.stringify({
+    type: 'user',
+    timestamp: new Date().toISOString(),
+    message: {
+      role: 'user',
+      content: [{ type: 'tool_result', tool_use_id: id, content: 'Your questions have been answered.' }],
+    },
+    toolUseResult: { answers },
+  });
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -244,6 +266,105 @@ section('A turn that is still going says nothing:');
   ok(sent.length === 1 && sent[0].payload.body === 'Both suites pass.', 'the turn ending after the tool was not announced');
 }
 
+section('A turn that stopped to ask you something is the one buzz worth having:');
+{
+  /*
+   * The exception to everything above: a question has not finished, is not idle, and
+   * carries no new text of its own — it fails every test that makes a turn news — and
+   * it is the state where a person is the only thing that can move the conversation on.
+   * Until this existed, a conversation blocked on a human looked exactly like one doing
+   * work, for as long as it took someone to wander back to the panel: a median of three
+   * minutes on this box, and once 5.9 hours.
+   */
+  const { watcher, sent } = watcherWith();
+  const ASK = 'toolu_bdrk_01waiting';
+  const DEPLOY_Q = 'The change is app payload only. How should it ship?';
+  const DEPLOY_ASK = [
+    {
+      question: DEPLOY_Q,
+      header: 'Deploy',
+      options: [{ label: 'App only' }, { label: 'Full deploy' }],
+      multiSelect: false,
+    },
+  ];
+  await write(DEMO, S2, userText('ship it'), assistant('Looking at what changed.'));
+  await watcher.scan(); // seed: that answer is already known
+
+  await write(DEMO, S2, userText('ship it'), assistant('Looking at what changed.'), ask(ASK, DEPLOY_ASK));
+  await watcher.scan();
+  ok(sent.length === 1, `${sent.length} notifications for a question nobody has answered`);
+  const { payload } = sent[0] || { payload: {} };
+  ok(payload.title === 'Claude is waiting for you · demo', `the title is ${JSON.stringify(payload.title)}`);
+  ok(payload.question === true && payload.cutOff === null,
+    'the payload does not say this one is a question rather than a finish');
+  ok(
+    payload.body.startsWith('Deploy: ') && payload.body.includes(DEPLOY_Q),
+    `the body does not lead with the question itself: ${JSON.stringify(payload.body)}`,
+  );
+  ok(
+    payload.body.includes('App only · Full deploy'),
+    'the options are missing, and they are usually the whole of the decision',
+  );
+  // The digest is the ask's id, not its text — an ask has no text, so digesting text
+  // would compare the preamble against itself and stay silent.
+  await watcher.scan();
+  ok(sent.length === 1, 'the same unanswered question buzzed again on the next poll');
+
+  // A second question in the same conversation is a different id, so it is news.
+  const ASK2 = 'toolu_bdrk_02waiting';
+  await write(
+    DEMO,
+    S2,
+    userText('ship it'),
+    assistant('Looking at what changed.'),
+    ask(ASK, DEPLOY_ASK),
+    answerTo(ASK, { [DEPLOY_Q]: 'App only' }),
+    ask(ASK2, [{ question: 'Push to main first?', header: 'Push', options: [{ label: 'Yes' }, { label: 'No' }] }]),
+  );
+  await watcher.scan();
+  ok(sent.length === 2 && /Push: /.test(sent[1].payload.body), 'a second, different question was swallowed as a repeat');
+
+  // And the turn finishing afterwards is still its own news, told the ordinary way.
+  await write(
+    DEMO,
+    S2,
+    userText('ship it'),
+    assistant('Looking at what changed.'),
+    ask(ASK, DEPLOY_ASK),
+    answerTo(ASK, { [DEPLOY_Q]: 'App only' }),
+    ask(ASK2, [{ question: 'Push to main first?', header: 'Push', options: [{ label: 'Yes' }, { label: 'No' }] }]),
+    answerTo(ASK2, { 'Push to main first?': 'Yes' }),
+    assistant('Pushed and deployed.'),
+  );
+  await watcher.scan();
+  ok(sent.length === 3 && sent[2].payload.title === 'Claude finished · demo' && sent[2].payload.question === false,
+    'the answer that came after the question was not announced as the finish it is');
+
+  /*
+   * A question's clock is its own. The last thing *said* before an ask is the preamble
+   * to it, which can be a whole turn older — so measuring freshness from that would
+   * drop a question asked a moment ago for the age of the sentence in front of it.
+   */
+  const ASK3 = 'toolu_bdrk_03waiting';
+  await write(
+    DEMO,
+    S1,
+    userText('go'),
+    assistant('This took twenty minutes to work out.', { at: Date.now() - 20 * 60 * 1000 }),
+    ask(ASK3, DEPLOY_ASK),
+  );
+  await watcher.scan();
+  ok(sent.length === 4 && sent[3].payload.title === 'Claude is waiting for you · demo',
+    'a question asked just now was dropped for the age of the turn in front of it');
+
+  // The other direction still holds: an ask nobody answered half an hour ago is not
+  // news now, or a restored backup would buzz once per abandoned question.
+  const ASK4 = 'toolu_bdrk_04waiting';
+  await write(DEMO, S3, userText('go'), ask(ASK4, DEPLOY_ASK, { at: Date.now() - 30 * 60 * 1000 }));
+  await watcher.scan();
+  ok(sent.length === 4, 'a question left unanswered half an hour ago woke the phone now');
+}
+
 section('The conversations this app drives are the app\'s business, not the lock screen\'s:');
 {
   const live = [{ cwd: OTHER, sessionId: S3, busy: false }];
@@ -401,6 +522,29 @@ section('The preview, which is all a lock screen shows:');
   ok(preview('here is code:\n```js\nconst x = 1;\n```\nand after') === 'here is code: and after', 'a code fence is read out into the preview');
   ok(preview(null) === '' && preview(undefined) === '', 'a missing message throws instead of previewing as empty');
   ok(preview('abcdef', 3) === 'abc…', 'a short limit is not honoured');
+}
+
+section('A question on a lock screen, which has to be decidable from:');
+{
+  const one = (over = {}) => ({
+    questions: [{ header: 'Deploy', question: 'How should it ship?', options: ['App only', 'Full deploy'], ...over }],
+  });
+  ok(
+    questionBody(one()) === 'Deploy: How should it ship? — App only · Full deploy',
+    `the body reads ${JSON.stringify(questionBody(one()))}`,
+  );
+  ok(
+    questionBody(one({ header: null })) === 'How should it ship? — App only · Full deploy',
+    'a question with no header carries a stray separator',
+  );
+  ok(questionBody(one({ options: [] })) === 'Deploy: How should it ship?',
+    'a question with no options ends in an empty list');
+  // Four long labels do not fit a lock screen, and half a list of options reads as a
+  // shorter list rather than as a longer one. So they are counted instead.
+  const many = one({ options: ['Credentials missing in env', 'Do not show the failed message', 'Filter out unconfigured accounts', 'Something else'] });
+  ok(/— 4 options$/.test(questionBody(many)), `long options are listed anyway: ${JSON.stringify(questionBody(many))}`);
+  ok(questionBody(null) === 'Claude is waiting for an answer.' && questionBody({}) === 'Claude is waiting for an answer.',
+    'a question that arrived without its contents throws instead of saying the one thing it knows');
 }
 
 fs.rmSync(TMP, { recursive: true, force: true });

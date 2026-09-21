@@ -129,8 +129,8 @@ ok(status.state === 'working', 'a turn that stopped to run a tool is still worki
 
 write(assistant('done'), userText('a follow-up with no reply yet'));
 status = await claudeStatus(CWD);
-ok(status.state === 'working', 'a question with no answer under it is working');
-ok(status.last?.text === 'done', 'and the last thing said is still reported, not the question');
+ok(status.state === 'working', 'a typed message with no reply under it yet is working');
+ok(status.last?.text === 'done', 'and the last thing said is still reported, not the message');
 
 section('A turn that was killed is idle, and is not finished:');
 /*
@@ -167,6 +167,141 @@ ok(
 write(assistant('the whole answer'));
 status = await claudeStatus(CWD);
 ok(status.cutOff === null, 'an ordinary finished turn is reported as cut off');
+
+section('A question waiting on a person is a third state, neither working nor finished:');
+/*
+ * The state that did not exist, and why nothing else could stand in for it.
+ * `AskUserQuestion` is written as an ordinary `tool_use` with `stop_reason:
+ * 'tool_use'`, so reading the file says what it says about any other tool — working —
+ * and the broker says the same, because the process really does have a turn in
+ * flight. Both are true and neither is the thing a person needs to be told, which is
+ * that nothing at all will happen until they go and answer it. Measured on the
+ * transcripts on this box: 71 answered asks, median wait three minutes, longest 5.9
+ * hours, every one of them reading as "Claude is working…" the whole time.
+ *
+ * The fixtures are the shapes on disk, field for field, taken off a real transcript:
+ * the ask is an assistant entry whose content is the single `tool_use` block, and its
+ * answer is a `user` entry carrying a `tool_result` *and* a top-level
+ * `toolUseResult.answers` keyed by the full question text. Inventing either shape
+ * would only prove the reader agrees with itself.
+ */
+const ASK_ID = 'toolu_bdrk_01L3beAxtUAYuan4U9bbQYsa';
+const DEPLOY_Q = 'The change is app payload only. How should it ship?';
+const ask = (id, questions) =>
+  JSON.stringify({
+    type: 'assistant',
+    timestamp: new Date().toISOString(),
+    message: {
+      role: 'assistant',
+      stop_reason: 'tool_use',
+      content: [{ type: 'tool_use', id, name: 'AskUserQuestion', input: { questions } }],
+    },
+  });
+const answerTo = (id, answers) =>
+  JSON.stringify({
+    type: 'user',
+    timestamp: new Date().toISOString(),
+    message: {
+      role: 'user',
+      content: [{ type: 'tool_result', tool_use_id: id, content: 'Your questions have been answered.' }],
+    },
+    toolUseResult: { answers },
+  });
+const DEPLOY_ASK = [
+  {
+    question: DEPLOY_Q,
+    header: 'Deploy',
+    options: [
+      { label: 'App only', description: 'A paragraph per option, which is why these do not travel.' },
+      { label: 'Full deploy', description: 'Another paragraph, and this one reboots the box.' },
+    ],
+    multiSelect: false,
+  },
+];
+
+write(userText('ship it'), ask(ASK_ID, DEPLOY_ASK));
+brokerReply = { ok: false, why: 'bad handshake' };
+status = await claudeStatus(CWD);
+ok(status.state === 'question', 'an unanswered ask at the end of a transcript is not reported as work in progress');
+ok(status.question?.pending === true && status.question?.answered === false,
+  'and is marked as the one being waited on, which is what a surface may offer to answer');
+const asked1 = status.question?.questions?.[0];
+ok(asked1?.question === DEPLOY_Q && asked1?.header === 'Deploy',
+  'the question travels with its own short label, so a lock screen has something to say');
+ok(JSON.stringify(asked1?.options) === JSON.stringify(['App only', 'Full deploy']),
+  'along with the labels, which are usually the whole of the decision');
+ok(!JSON.stringify(status.question).includes('paragraph'),
+  'but not the descriptions: paragraphs each, on an answer polled every few seconds');
+
+/*
+ * Bug A, and the only handle on it there is. The panel re-renders every question in a
+ * conversation as a fresh card when it reloads one, and a card gives no sign of having
+ * been answered — so the risk is answering the same question twice. Nothing out here
+ * can change what a webview draws; `answers` on the tool result is what makes
+ * "you already picked this" a fact that can be shown beside it.
+ */
+write(userText('ship it'), ask(ASK_ID, DEPLOY_ASK), answerTo(ASK_ID, { [DEPLOY_Q]: 'App only' }), assistant('shipping it'));
+status = await claudeStatus(CWD);
+ok(status.state === 'idle', 'a question with a result under it is waiting for nothing');
+ok(status.question?.answered === true && status.question?.pending === false,
+  'the question is still reported after it was answered — the redrawn card needs explaining');
+ok(status.question?.questions?.[0]?.answer === 'App only',
+  'and names the option that was taken, in the same words the card shows');
+
+// Two questions in one ask, one of them multi-select: each answer is matched to its
+// own question by text, which is the only key `answers` has.
+const PAIR_ID = 'toolu_bdrk_02pair';
+const Q_ONE = 'Which surfaces should say it?';
+const Q_TWO = 'When should the phone buzz?';
+write(
+  ask(PAIR_ID, [
+    { question: Q_ONE, header: 'Surfaces', options: [{ label: 'Chip' }, { label: 'Sheet' }, { label: 'Push' }], multiSelect: true },
+    { question: Q_TWO, header: 'Timing', options: [{ label: 'Immediately' }, { label: 'Never' }] },
+  ]),
+  answerTo(PAIR_ID, { [Q_ONE]: ['Chip', 'Push'], [Q_TWO]: 'Immediately' }),
+);
+status = await claudeStatus(CWD);
+ok(status.question?.questions?.length === 2, 'a batched ask is reported as the several questions it is');
+ok(status.question?.questions?.[0]?.answer === 'Chip, Push' && status.question?.questions?.[0]?.multiSelect === true,
+  'a multi-select answer arrives as every label that was picked');
+ok(status.question?.questions?.[1]?.answer === 'Immediately',
+  'and each answer is matched to its own question rather than to the first one');
+
+/*
+ * The third thing an unanswered ask can be, found by counting: 2 of the 76 asks on
+ * this box were dismissed, and the conversation carried on past them. There is no
+ * result on disk and there never will be, so `answered: false` on its own cannot mean
+ * "waiting" — `pending` is what separates them, and a client shows nothing at all for
+ * this one.
+ */
+write(ask(ASK_ID, DEPLOY_ASK), assistant('never mind, I picked one myself'));
+status = await claudeStatus(CWD);
+ok(status.state === 'idle', 'a dismissed question the conversation walked past leaves it idle');
+ok(status.question?.answered === false && status.question?.pending === false,
+  'and is reported as neither answered nor waiting, so nothing offers to answer it');
+
+write(userText('ship it'), ask(ASK_ID, DEPLOY_ASK));
+brokerReply = liveSession({ working: true });
+status = await claudeStatus(CWD);
+ok(status.state === 'question' && status.source === 'transcript',
+  'a live process whose turn is a question is reported as waiting, not as the work the broker sees');
+ok(status.conversations?.find((c) => c.sessionId === SESSION)?.state === 'question',
+  'and the row in the list says the same — the one row that will never move on its own');
+
+/*
+ * An abandoned ask: the transcript stops mid-question and no process exists to hear
+ * an answer. That is your turn in the ordinary way, and offering to answer it would
+ * be offering to talk to nothing — but the question still rides along so a client can
+ * say what the conversation stopped in the middle of.
+ */
+brokerReply = { ok: true, v: 1, sessions: [] };
+status = await claudeStatus(CWD);
+ok(status.state === 'idle' && status.source === 'broker',
+  'a question with nothing running it is your turn, not a question anybody is waiting on');
+ok(status.question?.pending === true,
+  'while still reporting that this is where the conversation stopped');
+
+brokerReply = { ok: false, why: 'bad handshake' };
 
 section('A big tool result does not hide the message behind it:');
 /*

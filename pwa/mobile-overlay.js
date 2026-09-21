@@ -53,7 +53,7 @@
    *
    * Bump it when this file changes in a way anyone would look for.
    */
-  const OVERLAY_BUILD = '2026-09-21.1';
+  const OVERLAY_BUILD = '2026-09-21.2';
 
   // -------------------------------------------- survive a browser refresh
   /*
@@ -292,15 +292,45 @@
     -webkit-tap-highlight-color: transparent; touch-action: manipulation;
   }
   #cmo-chip.cmo-gone { opacity: 0; pointer-events: none; transition: opacity .4s; }
+  /* Two lines at most, and the second one only when there is something for it: see
+     showChip. A column so the dot stays centred against both of them. */
+  .cmo-chip-lines { min-width: 0; display: flex; flex-direction: column; }
   .cmo-chip-text {
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
+  .cmo-chip-note {
+    display: none;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    color: #a8a49b; font-size: 11.5px;
+  }
+  .cmo-chip-note.cmo-on { display: block; }
   .cmo-dot {
     flex: 0 0 auto; width: 8px; height: 8px; border-radius: 50%;
     background: #6db26d;
   }
   .cmo-dot.cmo-busy { background: #d97757; animation: cmo-blink 1.2s infinite; }
+  /* A question is not work in progress and must not look like it: steady, not
+     blinking, and the colour the sheet uses for something waiting on a person. */
+  .cmo-dot.cmo-ask { background: #e6a23c; animation: none; }
   @keyframes cmo-blink { 0%,100% { opacity: 1 } 50% { opacity: .25 } }
+  /*
+   * The question itself, when one is waiting. Shaped like .cmo-said — it is the same
+   * kind of thing, something Claude wrote that has to be read — with the option labels
+   * under it as a list, because the labels are usually the whole of the decision.
+   */
+  .cmo-ask-block {
+    margin: 10px 0 0; padding: 12px; border-radius: 12px;
+    background: #2b2823; color: #f5f4ef; font: 14px/1.5 inherit;
+    box-shadow: inset 0 0 0 1px #4a4132; overflow-wrap: anywhere;
+  }
+  .cmo-ask-head {
+    font-size: 12px; text-transform: uppercase; letter-spacing: .06em;
+    color: #e6a23c; margin: 0 0 4px;
+  }
+  .cmo-ask-q { margin: 0; white-space: pre-wrap; }
+  .cmo-ask-opts { margin: 8px 0 0; padding-left: 20px; color: #d7d4cc; font-size: 13.5px; }
+  .cmo-ask-opts li { margin: 0 0 3px; }
+  .cmo-ask-block + .cmo-ask-block { margin-top: 8px; }
   .cmo-said {
     margin: 10px 0 0; padding: 12px; border-radius: 12px;
     background: #272725; color: #f5f4ef;
@@ -415,9 +445,13 @@
   const chip = document.createElement('button');
   chip.id = 'cmo-chip';
   chip.type = 'button';
-  chip.innerHTML = '<span class="cmo-dot"></span><span class="cmo-chip-text"></span>';
+  chip.innerHTML =
+    '<span class="cmo-dot"></span>' +
+    '<span class="cmo-chip-lines">' +
+    '<span class="cmo-chip-text"></span><span class="cmo-chip-note"></span></span>';
   const chipDot = chip.querySelector('.cmo-dot');
   const chipText = chip.querySelector('.cmo-chip-text');
+  const chipNote = chip.querySelector('.cmo-chip-note');
 
   const sheet = document.createElement('div');
   sheet.id = 'cmo-sheet';
@@ -1819,8 +1853,26 @@
     return c?.title || 'Untitled conversation';
   }
 
+  /**
+   * The first question waiting, or the last one asked. See `question` on
+   * /api/claude-status.
+   */
+  const askedOf = (s) => s?.question?.questions?.[0] || null;
+
   /** A single line: what it is doing, or the first of what it said. */
   function chipLine(s) {
+    /*
+     * A question outranks everything else the chip could say.
+     *
+     * It is the only state where nothing at all happens until the person acts, and
+     * the state the panel is least able to show them: inside it a pending ask and an
+     * ask answered last week are the same card. The header — Claude Code's own short
+     * label for the question — is what makes this specific enough to act on.
+     */
+    if (s.state === 'question') {
+      const head = askedOf(s)?.header;
+      return head ? `Claude is waiting for your answer · ${head}` : 'Claude is waiting for your answer';
+    }
     const line =
       s.state === 'working'
         ? 'Claude is working…'
@@ -1836,15 +1888,50 @@
     return many && s.title ? `${s.title} · ${line}` : line;
   }
 
-  function showChip(s, { linger = true } = {}) {
+  /**
+   * The second line, for the one moment it is worth having: the panel is redrawing a
+   * conversation's history, and the question cards in it are already answered.
+   *
+   * This is the half of the double-answer problem that can be fixed from out here.
+   * The panel re-renders every question in a conversation as a fresh card whenever it
+   * loads one — on a page load, and on a switch to a conversation it is not already
+   * showing — and a card gives no sign of having been answered, so the same question
+   * can be answered twice. Nothing outside a webview can change what it draws. What
+   * it can do is say, beside it and unasked, that the answer is already on disk and
+   * what it was.
+   *
+   * Only when a question is *not* waiting: if one is, the line above says so and the
+   * card at the bottom of the panel is the live one.
+   */
+  function answeredNote(s) {
+    if (s.state === 'question' || !s.question?.answered) return '';
+    const picked = (s.question.questions || []).map((q) => q.answer).filter(Boolean);
+    const said = picked.length ? `you chose “${picked.join('”, “')}”` : 'it was answered';
+    const when = s.question.at ? ` ${sinceText(Date.parse(s.question.at))}` : '';
+    return `Already answered${when} — ${said}`;
+  }
+
+  /**
+   * `replay` says the panel is (re)drawing this conversation's history, which is the
+   * only time the note above is news. See answeredNote.
+   */
+  function showChip(s, { linger = true, replay = false } = {}) {
     chipText.textContent = chipLine(s);
+    const note = replay ? answeredNote(s) : '';
+    chipNote.textContent = note;
+    chipNote.classList.toggle('cmo-on', Boolean(note));
     chipDot.classList.toggle('cmo-busy', s.state === 'working');
+    chipDot.classList.toggle('cmo-ask', s.state === 'question');
     chip.classList.remove('cmo-gone');
     if (!chip.isConnected) document.body.appendChild(chip);
     if (chipTimer) clearTimeout(chipTimer);
     // A working chip stays: it is the reason to keep waiting, and it is replaced
-    // by the finished one as soon as the turn ends.
-    chipTimer = linger && s.state !== 'working' ? setTimeout(hideChip, CHIP_LINGER_MS) : null;
+    // by the finished one as soon as the turn ends. A question stays for the
+    // stronger version of the same reason — it is the one state that will not
+    // resolve on its own, so a chip that times out takes the only notice of it
+    // away with it.
+    const sticky = s.state === 'working' || s.state === 'question';
+    chipTimer = linger && !sticky ? setTimeout(hideChip, CHIP_LINGER_MS) : null;
   }
 
   function stopStatusPoll() {
@@ -1869,11 +1956,22 @@
 
     const switched = Boolean(prev?.sessionId && next.sessionId && prev.sessionId !== next.sessionId);
     const finished = prev?.state === 'working' && next.state !== 'working';
+    // Being asked something is news of the same order as a turn ending, and a
+    // dismissed chip must come back for it: this is the state where nothing happens
+    // until the person acts.
+    const asked = prev?.state !== 'question' && next.state === 'question';
+    /*
+     * The panel is drawing this conversation's history from scratch — the first
+     * answer of a page, or a switch to a conversation it was not already showing.
+     * Those are exactly the two moments it redraws old question cards as though they
+     * were live. See answeredNote.
+     */
+    const replay = !prev || switched;
     // A visible chip is always kept current; an absent one is only brought back
     // for something new. Otherwise a dismissed chip would return every 15s.
-    if (!silent || switched || finished || chip.isConnected) showChip(next);
+    if (!silent || switched || finished || asked || chip.isConnected) showChip(next, { replay });
 
-    if (next.state === 'working') {
+    if (next.state === 'working' || next.state === 'question') {
       if (!statusPollTimer) statusPollingSince = Date.now();
       stopStatusPoll();
       statusPollTimer = setTimeout(pollStatus, STATUS_POLL_MS);
@@ -2002,6 +2100,9 @@
    * message you are looking at.
    */
   function statusNote(s = status) {
+    // Ahead of "still working", because a question is also a turn in flight and this
+    // is the more specific truth about it: it is in flight and it is stuck on you.
+    if (s?.state === 'question') return 'Claude is waiting for your answer.';
     if (s?.state === 'working') return 'Still working.';
     if (s?.cutOff === 'overflow') return 'Claude stopped: this conversation is too long to continue.';
     if (s?.cutOff) return 'Claude stopped before finishing.';
@@ -2270,6 +2371,95 @@
   }
 
   /**
+   * The question, and — the part this was really written for — whether it is still a
+   * question at all.
+   *
+   * Two failures of the panel meet here, and only one of them is about waiting.
+   *
+   *   **A question waiting reads as a turn in flight.** On disk and to the broker an
+   *   unanswered `AskUserQuestion` is `stop_reason: 'tool_use'` with a live process,
+   *   which is what work in progress looks like — so every surface said "Claude is
+   *   working…" about a conversation that had stopped and was waiting for a person.
+   *   Measured on the transcripts here: a median wait of three minutes, a longest of
+   *   5.9 hours, and three conversations sitting on one unnoticed.
+   *
+   *   **An answered question is drawn again as though it were new.** The panel
+   *   re-renders every question in a conversation when it loads one — on a page load,
+   *   and on a switch to a conversation it is not already showing — and a card carries
+   *   no sign of having been answered, so the same question can be answered twice.
+   *   What a card cannot say, `toolUseResult.answers` in the transcript can: which
+   *   option was taken, in the words it was taken in. That is what this puts on
+   *   screen, because the card itself is inside a webview nothing out here may touch.
+   *
+   * Nodes, never markup, like everything else on this sheet: a question and its option
+   * labels are model output.
+   *
+   * Bounded the same way the rest of this answer is — `question` comes from the tail
+   * window claude-status.js already reads, so a conversation whose last question is
+   * megabytes back reports none and this says nothing. Silence is the right failure
+   * here: the sentence it would otherwise print is a claim about history it has not
+   * read.
+   */
+  function paintAsk(s) {
+    const holder = panel.querySelector('#cmo-ask');
+    if (!holder) return;
+    holder.textContent = '';
+    const q = s.question;
+    if (!q) return;
+
+    // Waiting: show it. The full question, its header and every option label, because
+    // this sheet is often read before the panel has finished drawing the card at all.
+    if (s.state === 'question') {
+      for (const asked of q.questions || []) {
+        const block = document.createElement('div');
+        block.className = 'cmo-ask-block';
+        if (asked.header) {
+          const head = document.createElement('p');
+          head.className = 'cmo-ask-head';
+          head.textContent = asked.multiSelect ? `${asked.header} · pick any` : asked.header;
+          block.appendChild(head);
+        }
+        const text = document.createElement('p');
+        text.className = 'cmo-ask-q';
+        text.textContent = asked.question;
+        block.appendChild(text);
+        if (asked.options?.length) {
+          const list = document.createElement('ul');
+          list.className = 'cmo-ask-opts';
+          for (const label of asked.options) {
+            const item = document.createElement('li');
+            item.textContent = label;
+            list.appendChild(item);
+          }
+          block.appendChild(list);
+        }
+        holder.appendChild(block);
+      }
+      return;
+    }
+
+    const note = document.createElement('p');
+    note.className = 'cmo-hint';
+    if (q.answered) {
+      const picked = (q.questions || []).map((entry) => entry.answer).filter(Boolean);
+      const when = q.at ? sinceText(Date.parse(q.at)) : '';
+      note.textContent =
+        `${picked.length ? `You answered this${when ? ` ${when}` : ''}: “${picked.join('”, “')}”.` : `The last question here was already answered${when ? ` ${when}` : ''}.`}` +
+        ' The panel redraws every question card when it reloads a conversation, so a card on screen is not necessarily waiting for anything — this is how to tell.';
+    } else if (q.pending) {
+      // Unanswered and nothing running it: the process that asked is gone, so the card
+      // in the panel leads nowhere. The way to carry on is to say the answer as an
+      // ordinary message.
+      note.textContent =
+        'This conversation stopped in the middle of asking you something, and nothing is running it now, so answering the card would go nowhere. Send your answer as a message instead.';
+    } else {
+      // Asked, dismissed, and the conversation moved on past it. Nothing to say.
+      return;
+    }
+    holder.appendChild(note);
+  }
+
+  /**
    * The prompt this conversation began with, and a button that copies it.
    *
    * What it is for: the opening prompt is the message most worth sending again — the
@@ -2387,6 +2577,7 @@
     }
 
     const working = s.state === 'working';
+    const asking = s.state === 'question';
     const when = s.last?.at ? new Date(s.last.at) : null;
     const ago = when ? Math.max(0, Math.round((Date.now() - when.getTime()) / 60000)) : null;
     const size = s.bytes ? `${(s.bytes / (1024 * 1024)).toFixed(1)} MB` : null;
@@ -2424,10 +2615,16 @@
 
     openSheet(`
       <p class="cmo-title">${
-        working ? 'Claude is working' : s.cutOff ? 'Claude stopped' : 'Your turn'
+        asking
+          ? 'Claude is waiting for your answer'
+          : working ? 'Claude is working' : s.cutOff ? 'Claude stopped' : 'Your turn'
       }</p>
       <p class="cmo-hint" id="cmo-status-name"></p>
       <p class="cmo-hint" id="cmo-status-detail"></p>
+      <!-- The question, when one is waiting — and when the last one is answered, that
+           it is, which is the only defence out here against answering it twice. See
+           paintAsk. -->
+      <div id="cmo-ask"></div>
       <div class="cmo-said" id="cmo-status-said"></div>
       <div class="cmo-row">
         ${canSpeak ? `<button class="cmo-action" id="cmo-speak">${
@@ -2442,13 +2639,15 @@
         </label>
         <p class="cmo-hint" id="cmo-voice-note"></p>` : ''}
       <p class="cmo-hint">${
-        working
-          ? 'The panel is still loading the history; the end of it has not been written yet.'
-          : s.cutOff === 'overflow'
-            ? 'The last turn could not run: this conversation is too long to continue. Start a new one to carry on.'
-            : s.cutOff
-              ? 'The last turn was cut off before it finished — this is the last thing said before that. Send “continue” and it picks up where it stopped.'
-              : 'This is the last thing Claude said. The panel is still rendering the history above it.'
+        asking
+          ? 'Nothing more happens in this conversation until this is answered. It has to be answered in the panel — tap the question card at the bottom of it. Nothing out here can answer on your behalf.'
+          : working
+            ? 'The panel is still loading the history; the end of it has not been written yet.'
+            : s.cutOff === 'overflow'
+              ? 'The last turn could not run: this conversation is too long to continue. Start a new one to carry on.'
+              : s.cutOff
+                ? 'The last turn was cut off before it finished — this is the last thing said before that. Send “continue” and it picks up where it stopped.'
+                : 'This is the last thing Claude said. The panel is still rendering the history above it.'
       }${size ? ` This conversation is ${size} on disk, which is what the panel is reading.` : ''}</p>
       <p class="cmo-hint" id="cmo-status-follow"></p>
       <!-- The prompt this conversation began with. Empty until it is in hand, and
@@ -2500,6 +2699,7 @@
       .join(' · ');
     panel.querySelector('#cmo-status-close').addEventListener('click', closeSheet);
     panel.querySelector('#cmo-notify')?.addEventListener('click', toggleNotify);
+    paintAsk(s);
     paintFirstPrompt(s.sessionId);
 
     // Ask again, in place. The heartbeat is fifteen seconds and someone reading
@@ -2522,15 +2722,22 @@
     const list = panel.querySelector('#cmo-convos');
     if (list) {
       const busy = others.filter((c) => c.state === 'working').length;
+      // Counted separately and said first: a conversation waiting on an answer is the
+      // one to open, and it is the one that will still be waiting in an hour.
+      const waiting = others.filter((c) => c.state === 'question').length;
       panel.querySelector('#cmo-convo-head').textContent =
-        `${others.length} conversations here${busy ? `, ${busy} working` : ''} — tap one to follow it`;
+        `${others.length} conversations here${waiting ? `, ${waiting} waiting on you` : ''}${
+          busy ? `, ${busy} working` : ''
+        } — tap one to follow it`;
 
       for (const c of others) {
         const row = document.createElement('button');
         row.type = 'button';
         row.className = `cmo-convo${c.current ? ' cmo-current' : ''}`;
         const dot = document.createElement('span');
-        dot.className = `cmo-dot${c.state === 'working' ? ' cmo-busy' : ''}`;
+        dot.className = `cmo-dot${
+          c.state === 'working' ? ' cmo-busy' : c.state === 'question' ? ' cmo-ask' : ''
+        }`;
         const label = document.createElement('span');
         label.className = 'cmo-convo-label';
         // A title and a message are both model output. Never markup.
@@ -2539,8 +2746,11 @@
         meta.className = 'cmo-convo-meta';
         meta.textContent = [
           // "stopped" earns its place in a list: it is the row you would otherwise
-          // keep opening to see whether the answer had landed yet.
-          c.state === 'working' ? 'working' : c.cutOff ? 'stopped' : 'your turn',
+          // keep opening to see whether the answer had landed yet. "waiting on you"
+          // earns it twice over — that row will never move on its own.
+          c.state === 'question'
+            ? 'waiting on you'
+            : c.state === 'working' ? 'working' : c.cutOff ? 'stopped' : 'your turn',
           sinceText(c.at),
           c.live === false ? 'not running' : null,
         ]

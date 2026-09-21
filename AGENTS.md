@@ -286,14 +286,20 @@ chat-service/            The chat backend + PWA client. The security boundary.
                          flight, the tail of the transcript for the message. Plus
                          the head of it, for the prompt the conversation began
                          with — the one message worth sending again, and the one
-                         compaction appears to take away. Depends on nothing in
-                         this service but the transcript path helper and the
-                         synthetic-prompt filter — the chat service is meant to be
-                         retired, and this should move rather than be rewritten.
+                         compaction appears to take away. Three states, not two:
+                         an unanswered `AskUserQuestion` at the tail is
+                         `'question'`, which neither source can see on its own.
+                         Depends on nothing in this service but the transcript
+                         path helper and the synthetic-prompt filter — the chat
+                         service is meant to be retired, and this should move
+                         rather than be rewritten.
   status-test.js         That the two sources stay separated: a broker answer
                          wins, a missing one falls back, and neither may claim a
-                         conversation is idle when that is not known. And that an
-                         opening prompt is never a preamble Claude Code wrote.
+                         conversation is idle when that is not known. That a
+                         question waiting reads as neither working nor finished,
+                         and an answered one still says which option was taken.
+                         And that an opening prompt is never a preamble Claude
+                         Code wrote.
   push.js                Web Push, hand-rolled on node crypto: VAPID (ES256) and
                          RFC 8291 aes128gcm, plus the device list. No dependency
                          on purpose — see its header. Keys live under CLAUDE_HOME
@@ -304,10 +310,17 @@ chat-service/            The chat backend + PWA client. The security boundary.
   turn-watcher.js        What actually decides your phone should buzz: polls the
                          transcripts every 5s for a turn that just ended in a
                          session this app is NOT running, and sends one
-                         notification per conversation.
+                         notification per conversation. Also for a turn that
+                         stopped to ask you something, which has not ended and is
+                         the one thing nothing else will move on.
   turn-watcher-test.js   Mostly about silence — a restart, a rewritten
                          transcript, a mid-turn write and this app's own
-                         conversations must all announce nothing.
+                         conversations must all announce nothing. The exception
+                         is a question, which buzzes once and says what it asked.
+  sw-test.js             pwa/sw.js loaded with `self` stubbed: what tapping a
+                         notification focuses or opens. A service worker has no
+                         console anyone reads, so a wrong answer here looks
+                         exactly like a phone that ignored the tap.
   manifest.js            One web app manifest per project, so a project can have
                          its own home-screen icon and therefore its own window on
                          Android. Differs only in `id`, `start_url`, name.
@@ -784,6 +797,41 @@ because the failure it prevents would make the feature something you turn off:
   so that is what gets previewed), and because that message was usually announced
   already, `cutOff` is part of the digest — otherwise the stop looks like a repeat
   and is swallowed, losing the only notification worth having.
+
+**A turn that stopped to ask you something is a third state, not another kind of
+finish.** `AskUserQuestion` is written to the transcript as an ordinary `tool_use`
+with `stop_reason: 'tool_use'`, and the process really does have a turn in flight — so
+the transcript said "working", the broker agreed, and every surface reported a
+conversation that had stopped and would stay stopped until a person walked back to the
+panel. Measured across the transcripts on this box: 71 answered asks, a median wait of
+three minutes, a longest of 5.9 hours, three sitting unanswered right now. The fact
+neither source has on its own is whether a `tool_result` for that ask ever arrived, and
+that is in the file — so `lastExchange()` decides it, reports `state: 'question'`, and
+`claudeStatus()` lets it beat a live broker's "working" (the second place the
+transcript outranks the broker, after `OVERRIDE_QUIET_MS`). It takes a live process: an
+ask with nothing running it is idle in the ordinary way, because there is nothing left
+to answer *to*. Downstream, all three surfaces say so — the watcher buzzes with the
+question and its option labels, the overlay's chip says "Claude is waiting for your
+answer · \<header\>" with a steady amber dot rather than a blinking one, its sheet
+prints the question, and a list row reads "waiting on you". The chat app is not
+involved: it runs `claude --print`, which is not offered this tool at all, so a
+question only ever belongs to the panel or to tmux.
+
+**An answered question that the panel redraws is the other half of it, and it can only
+be fixed from outside.** Reopening a conversation makes the panel re-render every
+question in it as a fresh card, answered or not, with nothing to distinguish one from a
+live one — so the risk is answering the same question twice, days later. The panel is a
+vendor webview and the overlay is forbidden to reach into it, so the card cannot be
+changed; what can be done is to say, beside it, that the answer is already on disk and
+what it was. `toolUseResult.answers` in the transcript holds the chosen labels verbatim,
+`question.answered` and `question.answer` carry them out on `/api/claude-status`, and the
+overlay shows them *only* on a replay — the first status answer of a page, or a switch to
+another conversation, which are exactly the two moments the panel redraws history.
+Anywhere else it would be a fact repeated at someone who has already read it. Three
+things an unanswered ask can be, and `question.pending` is what tells them apart: the
+one being waited on, one the conversation stopped in the middle of (nothing running it —
+the sheet says to send the answer as an ordinary message), and one that was dismissed
+and walked past, about which the right thing to say is nothing at all.
 
 **Notifications are switched on from either surface, and there is only one of
 them.** The chat app's Settings sheet has a checkbox; the editor overlay's status
