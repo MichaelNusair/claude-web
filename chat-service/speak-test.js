@@ -16,11 +16,19 @@
  * fall back to the browser's own voice, so a refusal that arrives as a hang, or as
  * a 500 with no sentence in it, is a read that goes quiet for no stated reason.
  *
- * `VoiceCache` takes its synthesiser as an argument for exactly this reason, so
- * everything below runs against a fake that counts characters instead of Polly,
- * which charges for them: no credentials, no network, no bill. The Polly call
- * itself is the part that cannot be checked here — `/api/voice-status` is what
- * reports whether it works on the box.
+ * **Which of the two voices reads it.** There are two synthesisers now, because
+ * Polly cannot say a word of Hebrew — it skips the characters rather than reading
+ * them badly, so a Hebrew message sent to the wrong one is read with holes in it and
+ * nothing anywhere says so. The choice is therefore checked the way the refusals are:
+ * the share that triggers it, the override, the 409 on a box with no key, and the
+ * separate budget that keeps a third party's bill from being spent by a loop.
+ *
+ * `VoiceCache` takes its synthesiser as an argument for exactly this reason, and
+ * `chooseVoice` and `speechStatus` take the voice list and the key as arguments too,
+ * so everything below runs against fakes that count characters instead of Polly and
+ * OpenAI, which charge for them: no credentials, no network, no bill. The two
+ * synthesiser calls themselves are the part that cannot be checked here —
+ * `/api/voice-status` is what reports whether they work on the box.
  *
  * Run: node chat-service/speak-test.js
  */
@@ -31,7 +39,12 @@ import {
   messageId,
   prepare,
   speechStatus,
+  chooseVoice,
+  hebrewShare,
+  needsMultilingualVoice,
   FALLBACK_VOICES,
+  OPENAI_VOICES,
+  HEBREW_SHARE,
   FIRST_SEGMENT_CHARS,
   SEGMENT_CHARS,
   SILENT_WAV,
@@ -50,13 +63,18 @@ const ok = (condition, name, detail = '') => {
 };
 const section = (name) => console.log(`\n${name}`);
 
-/** A stand-in for Polly: says what it was asked to, in fake bytes, for free. */
+/**
+ * A stand-in for either synthesiser: says what it was asked to, in fake bytes, for
+ * free. Records the provider as well, because that is the argument the real
+ * `synthesize` dispatches on — a message prepared for OpenAI and then handed to
+ * Polly would be silently wrong rather than an error.
+ */
 const fakeVoice = () => {
   const calls = [];
   return {
     calls,
-    synthesize: async (text, voice, engine) => {
-      calls.push({ text, voice, engine });
+    synthesize: async (text, voice, engine, provider) => {
+      calls.push({ text, voice, engine, provider });
       return Buffer.from(`mp3:${voice}:${text}`);
     },
     get chars() {
@@ -353,20 +371,295 @@ section('What the phone is told:');
   // read to, in the default voice, and told which one it got. Through the module's
   // own `prepare`, since that is where a caller-supplied name is checked; it
   // synthesises nothing, so this costs nothing even against the real cache.
-  const asked = prepare('Read this.', { voice: 'Matthew' });
+  const asked = await prepare('Read this.', { voice: 'Matthew' });
   ok(asked.voice === 'Matthew', 'a voice this deployment offers is the one used', `got ${asked.voice}`);
-  const unknown = prepare('Read this too.', { voice: 'Clippy; DROP TABLE' });
+  const unknown = await prepare('Read this too.', { voice: 'Clippy; DROP TABLE' });
   ok(
     FALLBACK_VOICES.some((v) => v.id === unknown.voice),
     'an unknown voice falls back to a real one instead of being passed through',
     `got ${unknown.voice}`,
   );
-  ok(prepare('And this.', {}).voice === unknown.voice, 'and so does no voice at all');
+  ok((await prepare('And this.', {})).voice === unknown.voice, 'and so does no voice at all');
   ok(FALLBACK_VOICES.some((v) => v.id === 'Ruth'), 'Ruth, the default, is in the fallback list');
   ok(
     FALLBACK_VOICES.every((v) => v.id && v.gender && v.language),
     'every fallback voice has the gender and language the picker shows',
   );
+}
+
+// --------------------------------------------------------------------------
+/*
+ * Hebrew, which Polly cannot say a word of.
+ *
+ * The failure this guards against is inaudible, which is what makes it worth the
+ * checks: Polly does not read Hebrew with an accent, it skips the characters, so a
+ * message sent to the wrong voice is read with holes in it and a listener has no way
+ * to tell that anything was missed. Everything downstream — the choice of provider,
+ * the 409, the sheet's "your own device will read this" — hangs off this one share.
+ *
+ * The fixtures are runs of letters rather than sentences, because that is all the
+ * share counter looks at: which Unicode block a letter is in. They are built from
+ * code points for the reason `speak.js` writes its ranges as escapes — a
+ * right-to-left literal in a left-to-right file displays in an order that is not its
+ * byte order, and an editor that helpfully reorders one has changed a fixture.
+ */
+section('Hebrew, which Polly cannot say:');
+{
+  /** `n` letters from the Hebrew block, starting at aleph. */
+  const heb = (n) => Array.from({ length: n }, (_, i) => String.fromCodePoint(0x05d0 + (i % 27))).join('');
+
+  ok(hebrewShare('') === 0 && hebrewShare(null) === 0, 'nothing has no Hebrew in it, rather than throwing');
+  ok(hebrewShare(MESSAGE) === 0, 'an English summary has none', `got ${hebrewShare(MESSAGE)}`);
+  ok(hebrewShare(heb(12)) === 1, 'Hebrew text is all Hebrew', `got ${hebrewShare(heb(12))}`);
+  ok(
+    !needsMultilingualVoice(MESSAGE) && needsMultilingualVoice(heb(12)),
+    'and that is what decides which synthesiser reads it',
+  );
+
+  // The normal case for this box: a reply written in Hebrew that names files,
+  // constants and numbers in Latin letters. It has to come out as Hebrew.
+  const mixed = `${heb(40)} auth.js ${heb(30)} SPEAK_DAILY_CHARS, 1.5 -> 3.5, 106 ${heb(20)}.`;
+  ok(
+    needsMultilingualVoice(mixed),
+    'a Hebrew reply full of English filenames still needs the Hebrew voice',
+    `share was ${hebrewShare(mixed).toFixed(2)}`,
+  );
+  ok(
+    hebrewShare(`${heb(10)} 1.5 3.5 106 (,.;)`) === 1,
+    'digits and punctuation do not dilute the share, only letters count',
+  );
+
+  // And the other direction: one Hebrew word quoted in an English answer is not a
+  // reason to move the whole message onto a paid voice with an English accent.
+  const quoted = `The string in the config is ${heb(4)}, which is why the header renders right to left. ${MESSAGE}`;
+  ok(
+    !needsMultilingualVoice(quoted),
+    'one Hebrew word quoted in an English reply is read by Polly as before',
+    `share was ${hebrewShare(quoted).toFixed(3)}`,
+  );
+  ok(HEBREW_SHARE > 0 && HEBREW_SHARE < 1, 'the threshold is a share, not a count', `got ${HEBREW_SHARE}`);
+
+  // U+FB1D upwards: the pointed and ligature forms that copied Hebrew carries.
+  ok(hebrewShare(String.fromCodePoint(0xfb2a, 0xfb4b, 0xfb1d)) === 1, 'the presentation forms count as Hebrew too');
+}
+
+// --------------------------------------------------------------------------
+/*
+ * Which voice ends up reading it.
+ *
+ * `chooseVoice` is a pure function over a list of voices for this section's sake: it
+ * is where the Hebrew rule lives, it is the part that can get a message read in
+ * silence if it is wrong, and it would otherwise need a key, an AWS account and a
+ * network to check.
+ */
+section('Which voice ends up reading it:');
+{
+  const polly = FALLBACK_VOICES.map((v) => ({ ...v, provider: 'polly', engine: 'generative' }));
+  const both = [...polly, ...OPENAI_VOICES.map((v) => ({ ...v, engine: 'gpt-4o-mini-tts' }))];
+  const hebrew = Array.from({ length: 20 }, (_, i) => String.fromCodePoint(0x05d0 + i)).join('');
+
+  const chosen = (requested, text, known = both) => chooseVoice(requested, text, known);
+
+  ok(chosen('Matthew', MESSAGE).id === 'Matthew', 'an English message goes to the voice that was asked for');
+  ok(chosen('Matthew', MESSAGE).provider === 'polly', 'on Polly, which costs nothing to have');
+  ok(chosen('', MESSAGE).id === 'Ruth', 'no request means the default voice', `got ${chosen('', MESSAGE).id}`);
+  ok(chosen('Clippy; DROP TABLE', MESSAGE).id === 'Ruth', 'and so does a voice that does not exist');
+
+  // Asking for an OpenAI voice on an English message is allowed — it is the whole
+  // point of offering them in the picker — and it must carry the model as its engine,
+  // because that is what the id is hashed over and what the synthesiser dispatches on.
+  const marin = chosen('marin', MESSAGE);
+  ok(marin.id === 'marin' && marin.provider === 'openai', 'an OpenAI voice asked for by name is used as asked');
+  ok(marin.engine === 'gpt-4o-mini-tts', 'with the model as its engine', `got ${marin.engine}`);
+
+  // The override. A phone that remembers Matthew and is then read a Hebrew message
+  // must not be answered in Matthew, whatever it asked for.
+  const overridden = chosen('Matthew', hebrew);
+  ok(overridden.provider === 'openai', 'Hebrew overrides the voice the phone asked for', `got ${overridden.id}`);
+  ok(overridden.id === 'marin', 'and lands on the configured multilingual voice', `got ${overridden.id}`);
+  ok(chosen('cedar', hebrew).id === 'cedar', 'an OpenAI voice already asked for is left alone');
+  ok(chosen('Matthew', MESSAGE).id === 'Matthew', 'and an English message is not moved off Polly');
+
+  // No key. A refusal, because a refusal is what gets the message read: every client
+  // falls back to `speechSynthesis`, which does speak Hebrew on both phone platforms.
+  let refused = null;
+  try {
+    chooseVoice('Matthew', hebrew, polly);
+  } catch (err) {
+    refused = err;
+  }
+  ok(refused?.status === 409, 'Hebrew with no OpenAI key is refused rather than read with holes in it', `got ${refused?.status}`);
+  ok(/hebrew/i.test(refused?.message || ''), 'and the refusal names Hebrew as the reason', `got: ${refused?.message}`);
+  ok(
+    /own voice|openaiApiKey/.test(refused?.message || ''),
+    'and says both what happens instead and how to fix it',
+    `got: ${refused?.message}`,
+  );
+
+  let empty = null;
+  try {
+    chooseVoice('Ruth', MESSAGE, []);
+  } catch (err) {
+    empty = err;
+  }
+  ok(empty?.status === 503, 'a box with no voices at all says so rather than returning nothing', `got ${empty?.status}`);
+
+  /*
+   * The invariant the ids depend on: a voice id is bare — `marin`, `Ruth` — because a
+   * phone has one in localStorage from before there were two providers, and it is
+   * resolved by name against this list. Two providers claiming one name would make
+   * the remembered value ambiguous.
+   */
+  const ids = both.map((v) => v.id.toLowerCase());
+  ok(new Set(ids).size === ids.length, 'no two voices share a name across the providers', ids.join(', '));
+  ok(
+    OPENAI_VOICES.every((v) => v.id && v.gender && v.language === 'multi' && v.provider === 'openai'),
+    'every OpenAI voice is described the way the picker needs',
+  );
+}
+
+// --------------------------------------------------------------------------
+/*
+ * Two providers, two budgets.
+ *
+ * Separate allowances because they are separately priced and separately risky: Polly
+ * is on the instance role and bills the same account as everything else, while the
+ * OpenAI key is a third party that a runaway read would spend real credit at. An
+ * exhausted OpenAI budget must not take English read-aloud down with it, and an
+ * exhausted Polly one must not be what stops a Hebrew message from being read.
+ */
+section('Two providers, two budgets:');
+{
+  const SHORT = 'Say this out loud.';
+  const OTHER = 'Say this too, please.';
+  const voice = fakeVoice();
+  const cache = new VoiceCache({ synthesize: voice.synthesize, dailyChars: { polly: 1000, openai: 30 } });
+
+  const p = cache.prepare(SHORT, 'Ruth', 'generative', 'polly');
+  const o = cache.prepare(SHORT, 'marin', 'gpt-4o-mini-tts', 'openai');
+  ok(p.id !== o.id, 'the same words in two providers are two different recordings');
+  ok(
+    messageId(SHORT, 'marin', 'gpt-4o-mini-tts', 'openai') !== messageId(SHORT, 'marin', 'gpt-4o-mini-tts', 'polly'),
+    'because the provider is part of the id, so one cannot serve the other',
+  );
+  ok(o.provider === 'openai', 'and the answer says which provider will read it', JSON.stringify(o));
+
+  await cache.audio(p.id, 0);
+  ok(voice.calls[0].provider === 'polly', 'the synthesiser is told which provider to use', `got ${voice.calls[0].provider}`);
+  ok(
+    cache.budget('polly').chars === SHORT.length && cache.budget('openai').chars === 0,
+    'a Polly read is charged to Polly and to nothing else',
+    JSON.stringify([cache.budget('polly'), cache.budget('openai')]),
+  );
+
+  await cache.audio(o.id, 0);
+  ok(voice.calls[1].provider === 'openai', 'and an OpenAI read says OpenAI');
+  ok(
+    cache.budget('openai').chars === SHORT.length && cache.budget('polly').chars === SHORT.length,
+    'each provider counts only its own characters',
+    JSON.stringify([cache.budget('polly'), cache.budget('openai')]),
+  );
+  ok(cache.budget('openai').limit === 30 && cache.budget('polly').limit === 1000, 'and each has its own limit');
+
+  const o2 = cache.prepare(OTHER, 'marin', 'gpt-4o-mini-tts', 'openai');
+  let spent = null;
+  try {
+    await cache.audio(o2.id, 0);
+  } catch (err) {
+    spent = err;
+  }
+  ok(spent?.status === 429, 'reading past the OpenAI budget is refused', `got ${spent?.status}: ${spent?.message}`);
+  ok(
+    /SPEAK_OPENAI_DAILY_CHARS/.test(spent?.message || ''),
+    'and the refusal names the knob for that provider, not the other one',
+    `got: ${spent?.message}`,
+  );
+
+  // The point of separating them.
+  const p2 = cache.prepare(OTHER, 'Ruth', 'generative', 'polly');
+  ok((await cache.audio(p2.id, 0)).audio.length > 0, 'an exhausted OpenAI budget does not stop Polly reading');
+
+  // A provider with no allowance configured gets none, rather than an unlimited one:
+  // a missing number must not be the way a third-party bill runs away.
+  const pollyOnly = new VoiceCache({ synthesize: voice.synthesize, dailyChars: { polly: 1000 } });
+  const none = pollyOnly.prepare(SHORT, 'marin', 'gpt-4o-mini-tts', 'openai');
+  let unbudgeted = null;
+  try {
+    await pollyOnly.audio(none.id, 0);
+  } catch (err) {
+    unbudgeted = err;
+  }
+  ok(unbudgeted?.status === 429, 'a provider with no budget configured reads nothing', `got ${unbudgeted?.status}`);
+
+  // And the old single-number form still means what it always meant, because that is
+  // what a deployment setting SPEAK_DAILY_CHARS is doing.
+  const one = new VoiceCache({ synthesize: voice.synthesize, dailyChars: 200 });
+  ok(
+    one.budget('polly').limit === 200 && one.budget('openai').limit === 200,
+    'one number is still every provider’s allowance',
+  );
+  ok(one.budget().provider === 'polly', 'and asking about no provider in particular means Polly');
+}
+
+// --------------------------------------------------------------------------
+section('What the phone is told about the second voice:');
+{
+  const describe = async () => ({
+    voices: [
+      { id: 'Ruth', gender: 'Female', language: 'en-US' },
+      { id: 'Lupe', gender: 'Female', language: 'es-US' },
+    ],
+    reason: null,
+  });
+
+  const withKey = await speechStatus({ lang: 'en', describe, hasOpenAi: async () => true });
+  ok(
+    withKey.voices.some((v) => v.id === 'marin' && v.provider === 'openai'),
+    'a box with a key offers the OpenAI voices too',
+    withKey.voices.map((v) => v.id).join(', '),
+  );
+  ok(withKey.voices[0].id === 'Ruth', "an English phone still gets its own language first", withKey.voices.map((v) => v.id).join(', '));
+  ok(withKey.hebrew.available === true && withKey.hebrew.voice === 'marin', 'and it says Hebrew can be read, and by which voice', JSON.stringify(withKey.hebrew));
+  ok(
+    withKey.budgets?.polly?.provider === 'polly' && withKey.budgets?.openai?.provider === 'openai',
+    'both budgets are reported, so a sheet can show which voice has room left',
+  );
+  ok(withKey.budget?.provider === 'polly', "and `budget` still means Polly's, for clients that only know that field");
+
+  // A phone set to Hebrew: the voices that can actually read to it come first.
+  const hebPhone = await speechStatus({ lang: 'he-IL', describe, hasOpenAi: async () => true });
+  ok(
+    hebPhone.voices[0].provider === 'openai',
+    'a Hebrew phone is offered the voices that can read Hebrew first',
+    hebPhone.voices.map((v) => `${v.id}/${v.provider}`).join(', '),
+  );
+  ok(hebPhone.voices.some((v) => v.id === 'Ruth'), 'without hiding the English ones');
+
+  // The case this deployment is in until a key is put in the secret.
+  const noKey = await speechStatus({ lang: 'en', describe, hasOpenAi: async () => false });
+  ok(
+    !noKey.voices.some((v) => v.provider === 'openai'),
+    'a box with no key offers no voice that would fail on the tap',
+    noKey.voices.map((v) => v.id).join(', '),
+  );
+  ok(noKey.configured === true, 'and is still configured — English read-aloud works exactly as before');
+  ok(noKey.hebrew.available === false, 'but says Hebrew is not available here');
+  ok(
+    /own voice/i.test(noKey.hebrew.reason || ''),
+    "and that the device's own voice is what reads it instead, rather than nothing",
+    `got: ${noKey.hebrew.reason}`,
+  );
+
+  // The collision the id scheme cannot survive, resolved in favour of the provider a
+  // deployment has without signing up for anything.
+  const clash = await speechStatus({
+    describe: async () => ({ voices: [{ id: 'marin', gender: 'Female', language: 'en-US' }], reason: null }),
+    hasOpenAi: async () => true,
+  });
+  const marins = clash.voices.filter((v) => v.id.toLowerCase() === 'marin');
+  ok(marins.length === 1 && marins[0].provider === 'polly', 'a name claimed by both providers is listed once, as Polly’s', JSON.stringify(marins));
+  const listed = clash.voices.map((v) => v.id.toLowerCase());
+  ok(new Set(listed).size === listed.length, 'so the picker never shows one name twice');
 }
 
 // --------------------------------------------------------------------------
