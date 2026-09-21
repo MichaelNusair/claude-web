@@ -294,6 +294,24 @@ step "Checking the operations surface"
 ) || { echo "admin tests failed — not deploying." >&2; exit 1; }
 
 # ---------------------------------------------------------------------------
+step "Checking what a device is told, and what makes a phone buzz"
+# ---------------------------------------------------------------------------
+# Both of these fail quietly in production, which is why they belong in a gate: the
+# watcher's `tick()` catches its own throw and logs one line, so a broken watcher
+# stops noticing turns and nothing buzzes, while `claude-status.js` only answers the
+# editor's overlay, so a wrong answer is a chip that lies rather than a page that
+# breaks. Neither shows up in the steps above — until 2026-09-21 a tree that had
+# deleted a function turn-watcher.js still called would have shipped from here.
+(
+  cd chat-service
+  node status-test.js
+) || { echo "status tests failed — not deploying." >&2; exit 1; }
+(
+  cd chat-service
+  node turn-watcher-test.js
+) || { echo "turn watcher tests failed — not deploying." >&2; exit 1; }
+
+# ---------------------------------------------------------------------------
 step "Checking the Claude broker"
 # ---------------------------------------------------------------------------
 # The broker sits between the editor's Claude panel and the real CLI, so a bug
