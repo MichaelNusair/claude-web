@@ -172,6 +172,12 @@
       </select>
     </label>
     <p class="hint">Applies to new chats. Existing chats keep the mode they started with.</p>
+    <!-- Hidden until app.js has asked whether this deployment can read aloud at
+         all: a picker with nothing behind it is worse than no picker. -->
+    <label id="voice-row" class="hidden">Read aloud in
+      <select id="select-voice"></select>
+    </label>
+    <p class="hint" id="voice-hint"></p>
     <label class="opt-row">
       <input type="checkbox" id="opt-keep-awake" checked>
       Keep the screen awake while the app is open

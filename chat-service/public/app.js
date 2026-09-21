@@ -74,6 +74,10 @@ const DEFAULTS = {
   model: 'us.anthropic.claude-opus-5',
   permissionMode: 'bypassPermissions',
   effort: 'max',
+  // Empty means "whichever voice fits the message", which the server decides per
+  // message — a Hebrew answer read by a Hebrew voice with nothing set. A named
+  // voice here is an override of that. See paintVoicePicker.
+  voice: '',
 };
 
 function loadSettings() {
@@ -1572,18 +1576,21 @@ function renderHistory(pane, messages, truncated) {
 function makeBubble(kind, text) {
   const el = document.createElement('div');
   el.className = `msg ${kind}`;
-  if (kind === 'claude') el.innerHTML = renderMarkdown(text);
-  else el.textContent = text;
+  if (kind === 'claude') {
+    el.innerHTML = renderMarkdown(text);
+    // The controls for hearing it, and the raw markdown they read from — the
+    // rendered HTML has lost the fences. See decorateSpoken.
+    decorateSpoken(el, text);
+  } else {
+    el.textContent = text;
+  }
   return el;
 }
 
 function addBubble(pane, kind, text) {
   if (!pane.thread) return null;
   const stick = atBottom(pane);
-  const el = document.createElement('div');
-  el.className = `msg ${kind}`;
-  if (kind === 'claude') el.innerHTML = renderMarkdown(text);
-  else el.textContent = text;
+  const el = makeBubble(kind, text);
   pane.thread.appendChild(el);
   scrollDown(pane, stick);
   return el;
@@ -1608,7 +1615,9 @@ function finalizeStream(pane, text) {
   hideTyping(pane);
   if (pane.streamingEl) {
     pane.streamingEl.innerHTML = renderMarkdown(text);
-    pane.streamingEl.dataset.raw = text;
+    // Only now, on the final text: the controls would be rebuilt on every delta
+    // otherwise, and a block button on a half-written fence reads half a block.
+    decorateSpoken(pane.streamingEl, text);
     pane.streamingEl = null;
   } else {
     addBubble(pane, 'claude', text);
@@ -1720,13 +1729,58 @@ function setSub(pane, text) {
   el.classList.toggle('busy', text === 'working…');
 }
 
+/*
+ * A message, split into prose and fenced code in the order it was written.
+ *
+ * One scanner with one result, shared by the renderer and by the read-aloud
+ * controls, because the nth `<pre>` on screen has to be the block the nth button
+ * reads. Two parsers that agree today are not a promise about tomorrow — and the
+ * obvious shortcut here is wrong in a way that looks right: splitting on a fence
+ * regex with a capture group yields [prose, lang, code, '', prose, …], because the
+ * *closing* fence captures too, so stepping in threes reads a language tag as code
+ * from the second block onwards.
+ *
+ * A fence that is never closed is a message still arriving, which is the normal
+ * state of a transcript being watched while it is written: it is code to the end of
+ * what has come so far.
+ */
+const FENCE_OPEN = /^[ \t]{0,3}```/;
+const FENCE_CLOSE = /^[ \t]{0,3}```[ \t]*$/;
+
+function splitFences(text) {
+  const src = String(text ?? '');
+  const lines = src.split('\n');
+  const parts = [];
+  let i = 0;
+  let offset = 0;     // where lines[i] begins in src
+  let prose = 0;      // where the prose being collected begins
+  const advance = () => { offset += lines[i].length + 1; i += 1; };
+  while (i < lines.length) {
+    if (!FENCE_OPEN.test(lines[i])) { advance(); continue; }
+    // The prose ends at the fence line, so the newline that ended the line before it
+    // stays with the prose — this is `pre-wrap` text and those newlines are layout.
+    if (offset > prose) parts.push({ type: 'prose', text: src.slice(prose, offset) });
+    const lang = lines[i].replace(FENCE_OPEN, '').trim().replace(/[^\w+#.-]/g, '').slice(0, 20);
+    advance();
+    const start = offset;
+    while (i < lines.length && !FENCE_CLOSE.test(lines[i])) advance();
+    // `offset - 1` drops the newline that ends the last line of the body; an
+    // unterminated block runs to the end of what has arrived.
+    const end = i < lines.length ? Math.max(start, offset - 1) : src.length;
+    parts.push({ type: 'code', lang, text: src.slice(start, end) });
+    if (i < lines.length) advance();                                // the closing fence
+    prose = offset;
+  }
+  if (prose < src.length) parts.push({ type: 'prose', text: src.slice(prose) });
+  return parts;
+}
+
 /** Tiny markdown subset: fenced code, inline code, bold. Enough for chat. */
 function renderMarkdown(text) {
-  const parts = String(text).split(/```(?:[a-zA-Z0-9_+-]*)\n?/);
-  return parts
-    .map((part, i) => {
-      if (i % 2 === 1) return `<pre><code>${escapeHtml(part)}</code></pre>`;
-      return escapeHtml(part)
+  return splitFences(text)
+    .map((part) => {
+      if (part.type === 'code') return `<pre><code>${escapeHtml(part.text)}</code></pre>`;
+      return escapeHtml(part.text)
         .replace(/`([^`\n]+)`/g, '<code>$1</code>')
         .replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>');
     })
@@ -3262,6 +3316,442 @@ async function pushSync() {
   await pushSubscribe().catch(() => {});
 }
 
+// --- reading aloud ----------------------------------------------------------
+/*
+ * Hearing a message instead of reading it.
+ *
+ * Dictation has been the whole of voice in this app until now, which is half a
+ * conversation: you can talk to Claude from a phone and then have to read the
+ * answer. This is the other half — a button on each of Claude's messages, and one
+ * on each code block inside it.
+ *
+ * Three decisions worth stating, because each of them is the opposite of the
+ * obvious one.
+ *
+ *   **The server does the synthesis, and there is no `speechSynthesis` fallback
+ *   here.** The editor overlay has one, and it earns it: it can be running on a
+ *   deployment with no Polly permission, and a robotic voice reading a summary
+ *   beats silence. This surface is the one asked to read Hebrew and to read code,
+ *   and the local voice can do neither — every browser voice on an English phone
+ *   skips Hebrew characters outright, and code read verbatim is a minute of
+ *   punctuation names. So a control appears only when the server can actually
+ *   read, and never as a button that would disappoint.
+ *
+ *   **Which voice is the server's decision, not this file's.** `chooseVoice` in
+ *   speak.js looks at the text: Hebrew goes to an Azure Hebrew voice (free tier)
+ *   or an OpenAI one, English to Polly. A phone that has never picked a voice
+ *   sends `voice: ''` and gets the right one for the message it is reading, which
+ *   is the behaviour that matters most here — nobody wants to choose a voice per
+ *   language before pressing play.
+ *
+ *   **A code block is sent as code, not as prose.** `kind: 'code'` is what turns
+ *   indentation into "indent two" and `=>` into "arrow" and puts a line number in
+ *   every few lines. Doing that here would mean two surfaces disagreeing about
+ *   what a block sounds like, and a phone with a cached copy of this file
+ *   disagreeing with the server it is talking to.
+ */
+const SPEAK_SILENCE = '/api/speak/silence';
+
+const speech = {
+  /** The server's answer, or null until it has been asked or if it cannot read. */
+  voices: null,
+  /** Its own default voice, which is what an unset preference means. */
+  voice: '',
+  /** The one element, unlocked by a tap and then kept: see unlockSpeech. */
+  audio: null,
+  /** The read in progress: { id, total, kind, fetching }. */
+  read: null,
+  /** Bumped by every start and every stop, so late arrivals can tell. */
+  generation: 0,
+  reading: false,
+  /** The control that started this read, which is the one that says Stop. */
+  control: null,
+};
+
+const speechReady = () => Boolean(speech.voices?.length) && typeof Audio === 'function';
+
+/**
+ * Ask once whether this box can read, and in which voices.
+ *
+ * Failure is silent and total: no controls anywhere, rather than buttons that
+ * explain a 401. Every reason this can fail — a deployment with no Polly
+ * permission, no Azure or OpenAI key, an older server with no such route — has the
+ * same answer on screen, which is nothing where a speaker icon would have been.
+ */
+async function loadVoices() {
+  try {
+    const res = await api('/api/voice-status', { headers: { Accept: 'application/json' } });
+    if (!res.ok) return;
+    const body = await res.json();
+    if (!body?.speech?.configured) return;
+    speech.voices = body.speech.voices || [];
+    speech.voice = body.speech.voice || '';
+    if (!speech.voices.length) {
+      speech.voices = null;
+      return;
+    }
+    paintVoicePicker();
+    // Messages already on screen were rendered before the answer arrived — which is
+    // the normal order, because the transcript is drawn from cache in the first
+    // frame and this is a round trip.
+    for (const el of document.querySelectorAll('.msg.claude')) {
+      if (el.dataset.raw) decorateSpoken(el, el.dataset.raw);
+    }
+  } catch {
+    /* no read-aloud on this device; nothing on screen claims otherwise */
+  }
+}
+
+/** The voice this device asked for, or '' to let the server choose per message. */
+function chosenVoice() {
+  const wanted = state.settings.voice || '';
+  return (speech.voices || []).some((v) => v.id === wanted) ? wanted : '';
+}
+
+/*
+ * iOS plays audio that a gesture asked for, and grants the permission to *an
+ * element* rather than to the page. The audio being read does not exist when the
+ * button is pressed — it is synthesised after a round trip — so the element is
+ * unlocked inside the tap with a silent WAV and then reused for the life of the
+ * page. A new element would be locked again, and the read after it silent.
+ */
+function unlockSpeech() {
+  if (typeof Audio !== 'function') return false;
+  if (!speech.audio) {
+    speech.audio = new Audio();
+    speech.audio.preload = 'auto';
+  }
+  try {
+    speech.audio.onended = null;
+    speech.audio.onerror = null;
+    speech.audio.src = SPEAK_SILENCE;
+    const played = speech.audio.play();
+    // Older browsers return undefined rather than a promise, and a rejection here
+    // means this was not a gesture — which the read that follows will report if it
+    // turns out to matter.
+    if (played?.catch) played.catch(() => {});
+  } catch {
+    /* as above */
+  }
+  return true;
+}
+
+/** Forget the read in progress, keeping the element and its unlock. */
+function stopSpeaking() {
+  speech.generation += 1;
+  speech.read = null;
+  speech.reading = false;
+  speech.control = null;
+  if (speech.audio) {
+    speech.audio.onended = null;
+    speech.audio.onerror = null;
+    try {
+      speech.audio.pause();
+      // Removed rather than set to '': an empty src is a request for the page's own
+      // URL, which some browsers will go and fetch.
+      speech.audio.removeAttribute('src');
+      speech.audio.load?.();
+    } catch {
+      /* the unlock survives either way, which is the part that matters */
+    }
+  }
+  paintReadControls();
+}
+
+/** Every read control says what it does now: its own label, or Stop. */
+function paintReadControls() {
+  for (const btn of document.querySelectorAll('[data-read]')) {
+    const mine = speech.reading && btn === speech.control;
+    btn.textContent = mine ? '■ Stop' : btn.dataset.readLabel || '🔊 Read';
+    btn.classList.toggle('reading', mine);
+  }
+}
+
+/** The sentence the server sent with a refusal, or the status on its own. */
+async function speakRefusal(res) {
+  try {
+    const body = await res.json();
+    if (body?.error) return String(body.error);
+  } catch {
+    /* not JSON: the status is all there is to go on */
+  }
+  return `the server answered ${res.status}`;
+}
+
+/**
+ * One piece of audio as a URL that can be played, fetched once and shared.
+ *
+ * Fetched here and then played from the same URL rather than handed to the element
+ * unseen, because the element cannot report *why* a source failed — it fires
+ * `error` and says nothing — while the server's refusals are sentences worth
+ * repeating. The response is cacheable, so the element's own request for the same
+ * URL is served from the browser cache rather than synthesised again.
+ */
+function speechSegment(index, generation) {
+  const read = speech.read;
+  if (!read || index < 0 || index >= read.total) return null;
+  const already = read.fetching.get(index);
+  if (already) return already;
+  const url = `/api/speak?id=${encodeURIComponent(read.id)}&segment=${index}`;
+  const pending = fetch(url).then(async (res) => {
+    if (!res.ok) throw new Error(await speakRefusal(res));
+    // Drain it, so it lands in the cache the element is about to read from.
+    await res.blob();
+    if (generation !== speech.generation || !speech.read) return null;
+    return url;
+  });
+  read.fetching.set(index, pending);
+  return pending;
+}
+
+/** Play piece `index`, then the one after it, until Stop or the end. */
+async function playSpeech(index, generation) {
+  let url = null;
+  try {
+    url = await speechSegment(index, generation);
+  } catch (err) {
+    if (generation === speech.generation) {
+      stopSpeaking();
+      toast(`Stopped reading: ${err.message}`);
+    }
+    return;
+  }
+  if (generation !== speech.generation || !speech.read || !url) return;
+
+  // One ahead, while this one plays: synthesis takes about a fifth of the time the
+  // audio takes to play, so one is enough to make a message continuous, and two
+  // would pay for audio that Stop is about to discard.
+  if (index + 1 < speech.read.total) speechSegment(index + 1, generation)?.catch(() => {});
+
+  speech.audio.onended = () => {
+    if (generation !== speech.generation) return;
+    if (speech.read && index + 1 < speech.read.total) {
+      playSpeech(index + 1, generation);
+      return;
+    }
+    stopSpeaking();
+  };
+  speech.audio.onerror = () => {
+    if (generation !== speech.generation) return;
+    stopSpeaking();
+    toast('Stopped reading: the audio would not play');
+  };
+  try {
+    speech.audio.src = url;
+    speech.audio.play()?.catch?.((err) => {
+      if (generation !== speech.generation) return;
+      stopSpeaking();
+      toast(`Nothing was read: ${err?.message || 'the browser refused to play it'}`);
+    });
+  } catch (err) {
+    stopSpeaking();
+    toast(`Nothing was read: ${err?.message || 'the browser refused to play it'}`);
+  }
+}
+
+/**
+ * Start reading. Everything up to the first network call happens inside the tap,
+ * because that is the only place iOS will let audio begin.
+ */
+function startSpeaking(text, { kind = 'prose', lang = '', control = null } = {}) {
+  stopSpeaking();
+  if (!speechReady() || !String(text || '').trim()) return;
+  if (!unlockSpeech()) return;
+  // Never over a live microphone: the recognizer would hear this and dictate
+  // Claude's own words back into the composer.
+  if (voice.active) {
+    toast('Not while the microphone is listening');
+    return;
+  }
+  speech.generation += 1;
+  const generation = speech.generation;
+  speech.reading = true;
+  speech.control = control;
+  paintReadControls();
+
+  api('/api/speak/prepare', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text, voice: chosenVoice(), kind, lang }),
+  })
+    .then(async (res) => {
+      if (!res.ok) throw new Error(await speakRefusal(res));
+      return res.json();
+    })
+    .then((prepared) => {
+      if (generation !== speech.generation) return;
+      if (!prepared?.id || !prepared.segments) throw new Error('the server prepared nothing to play');
+      speech.read = { id: prepared.id, total: prepared.segments, kind, fetching: new Map() };
+      playSpeech(0, generation);
+    })
+    .catch((err) => {
+      if (generation !== speech.generation) return;
+      stopSpeaking();
+      toast(`Nothing was read: ${err?.message || 'the server voice is unavailable'}`);
+    });
+}
+
+/**
+ * The fenced blocks of a message, in the order `renderMarkdown` turns them into
+ * `<pre>` elements — so the nth block and the nth `<pre>` are the same block.
+ *
+ * Deliberately the same split as the renderer, from the same source, rather than a
+ * second fence parser that agrees with it today: a block button that reads the
+ * wrong block is worse than no button.
+ */
+function fencedBlocks(text) {
+  const blocks = [];
+  // `pre` counts every block the renderer emits, including the empty one an
+  // unterminated fence leaves behind — it is a `<pre>` on screen either way, and
+  // counting only the readable ones would shift every button after it by one.
+  let pre = -1;
+  for (const part of splitFences(text)) {
+    if (part.type !== 'code') continue;
+    pre += 1;
+    const code = part.text.replace(/\n+$/, '');
+    if (!code.trim()) continue;
+    blocks.push({ lang: part.lang, code, lines: code.split('\n').length, pre });
+  }
+  return blocks;
+}
+
+/**
+ * Give one of Claude's messages the controls for hearing it.
+ *
+ * Called again after every re-render of the same bubble — streaming replaces the
+ * innerHTML on the way to the final text — so it clears its own work first and can
+ * be called as often as the bubble changes. The raw markdown is kept on the element
+ * because that is what gets read: the rendered HTML has lost the fences, and the
+ * server wants the block, not the DOM.
+ */
+function decorateSpoken(el, text) {
+  if (!el) return;
+  el.dataset.raw = text ?? '';
+  for (const old of el.querySelectorAll('.read-row')) old.remove();
+  if (!speechReady()) return;
+
+  const blocks = fencedBlocks(el.dataset.raw);
+  const pres = [...el.querySelectorAll('pre')];
+
+  /* A block's own button goes under the block, where the code it reads is. */
+  for (const block of blocks) {
+    const pre = pres[block.pre];
+    if (!pre) continue;
+    const row = document.createElement('div');
+    row.className = 'read-row code';
+    const label = ['🔊 Read this code', block.lang, `${block.lines} line${block.lines === 1 ? '' : 's'}`]
+      .filter(Boolean)
+      .join(' · ');
+    row.appendChild(readButton(label, () =>
+      startSpeaking(block.code, { kind: 'code', lang: block.lang, control: row.firstChild })));
+    pre.after(row);
+  }
+
+  // And the message's own, at the end of it. Last rather than first: it is the
+  // thing you reach for after reading the start of an answer and deciding to
+  // listen to the rest, and a row of controls above the text pushes the text down.
+  const row = document.createElement('div');
+  row.className = 'read-row';
+  const spoken = speakableText(el.dataset.raw, blocks.length);
+  row.appendChild(readButton('🔊 Read aloud', () =>
+    startSpeaking(spoken, { control: row.firstChild })));
+  el.appendChild(row);
+}
+
+function readButton(label, onTap) {
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = 'read-btn';
+  btn.dataset.read = '1';
+  btn.dataset.readLabel = label;
+  btn.textContent = label;
+  btn.addEventListener('click', () => {
+    // Its own Stop while it is the one reading; a tap on another control switches
+    // to that one rather than stopping, which is what startSpeaking does by
+    // stopping first.
+    if (speech.reading && speech.control === btn) {
+      stopSpeaking();
+      return;
+    }
+    onTap();
+  });
+  return btn;
+}
+
+/**
+ * A message as something worth listening to.
+ *
+ * Far less than the editor overlay's reduction, on purpose: this app renders a
+ * deliberately tiny markdown subset (fenced code, inline code, bold), so those are
+ * the only markers that are ever on screen here and the only ones worth removing.
+ * Code is replaced by the fact that it was there — numbered when there is more than
+ * one, so what a listener hears maps onto the buttons under the blocks.
+ */
+function speakableText(markdown, blockCount = 0) {
+  let out = '';
+  let block = 0;
+  for (const part of splitFences(markdown)) {
+    if (part.type !== 'code') { out += part.text; continue; }
+    if (!part.text.trim()) continue;            // a fence with nothing in it yet
+    block += 1;
+    out += blockCount > 1 ? ` Code block ${block}. ` : ' Code block. ';
+  }
+  return out.replace(/`+([^`]*)`+/g, '$1').replace(/\*\*([^*\n]+)\*\*/g, '$1').trim();
+}
+
+/** The voice picker in Settings, which only exists if the server can read. */
+function paintVoicePicker() {
+  const row = $('#voice-row');
+  const select = $('#select-voice');
+  if (!row || !select) return;
+  if (!speechReady()) {
+    row.classList.add('hidden');
+    return;
+  }
+  row.classList.remove('hidden');
+  select.textContent = '';
+  const add = (value, label) => {
+    const option = document.createElement('option');
+    option.value = value;
+    option.textContent = label;
+    select.appendChild(option);
+  };
+  /*
+   * "Whichever fits the message" first, and it is the default for a reason: the
+   * server picks per message, so a Hebrew answer is read by a Hebrew voice and an
+   * English one by Polly with nothing to set. Choosing a named voice is choosing to
+   * override that, which is worth doing for how a voice sounds and not much else —
+   * so the ones that cannot read Hebrew say so here rather than after the fact.
+   */
+  add('', 'Whichever fits the message (default)');
+  for (const v of speech.voices || []) {
+    const language = String(v.language || '').toLowerCase() === 'multi' ? 'any language' : v.language;
+    add(v.id, `${v.id} · ${language}${v.gender ? ` · ${v.gender}` : ''}`);
+  }
+  select.value = (speech.voices || []).some((v) => v.id === state.settings.voice)
+    ? state.settings.voice
+    : '';
+  paintVoiceHint();
+}
+
+function paintVoiceHint() {
+  const hint = $('#voice-hint');
+  if (!hint) return;
+  const chosen = (speech.voices || []).find((v) => v.id === state.settings.voice);
+  if (!chosen) {
+    hint.textContent =
+      'Hebrew is read by a Hebrew voice, English by an English one, chosen per message on the server. Code blocks get their own button under the block.';
+    return;
+  }
+  const language = String(chosen.language || '').toLowerCase();
+  hint.textContent =
+    chosen.provider === 'azure'
+      ? 'A Hebrew neural voice on Azure’s free tier — nothing is charged past the monthly allowance; it stops until the 1st. Hebrew only, so an English message will be read by it badly or not at all.'
+      : language === 'multi'
+        ? 'One voice for every language, so it reads a message with Hebrew and English in it. Slower to start, and metered by the character.'
+        : 'An English voice. It cannot read Hebrew — Polly has no Hebrew voice at all — so a Hebrew message will come back refused rather than mispronounced.';
+}
+
 // --- settings ---------------------------------------------------------------
 $('#btn-settings').addEventListener('click', () => $('#sheet').classList.remove('hidden'));
 document.querySelectorAll('[data-close-sheet]').forEach((el) =>
@@ -3273,6 +3763,20 @@ $('#select-permission').addEventListener('change', (e) => {
   state.settings.permissionMode = e.target.value;
   saveSettings();
   toast('Applies to new chats');
+});
+
+/*
+ * The voice, when there is one to choose. The row is hidden until
+ * `paintVoicePicker` has an answer, so a deployment that cannot read aloud has no
+ * dead control in its settings.
+ */
+$('#select-voice').addEventListener('change', (e) => {
+  state.settings.voice = e.target.value;
+  saveSettings();
+  // Whatever is playing is in the old voice, and hearing the rest of a message in
+  // that voice after choosing another one reads as the setting not working.
+  stopSpeaking();
+  paintVoiceHint();
 });
 
 $('#select-effort').value = state.settings.effort;
@@ -3553,6 +4057,14 @@ window.__screenForTest = {
 window.__pushForTest = {
   paintPushToggle, pushSync, pushSubscription, pushSubscribe, pushUnsubscribe, pushKeyOf,
 };
+// Reading aloud is server-side synthesis played through one unlocked element, and
+// every interesting part of it — what a block button sends, what a refusal does, the
+// fact that the nth button reads the nth block — is invisible from a desktop browser
+// and inaudible from a test. So the pieces are driven directly.
+window.__speechForTest = {
+  loadVoices, decorateSpoken, fencedBlocks, speakableText, stopSpeaking, paintVoicePicker,
+  speech, renderMarkdown,
+};
 
 // A device that wakes up may have been asleep for hours: iOS suspends timers
 // and freezes sockets when the app is backgrounded, and the close event often
@@ -3609,6 +4121,15 @@ document.addEventListener('visibilitychange', () => {
   renderTabs();
   // Load the list behind the chat so going back is instant.
   refreshList();
+  /*
+   * Ask whether this box can read aloud, before anything is tapped.
+   *
+   * It has to be known in advance, not asked for on the tap: iOS will not let audio
+   * begin after an await, so a read that had to check first would be a read that
+   * never started. Nothing on screen waits for the answer — the controls appear on
+   * the messages already rendered when it arrives.
+   */
+  loadVoices();
   if (active) activatePane(active);
   pollLive();
   setInterval(pollLive, LIVE_POLL_MS);

@@ -270,6 +270,24 @@ html, body {
 .msg pre code { background: none; padding: 0; }
 .msg strong { font-weight: 600; }
 
+/*
+ * Hearing a message. One control per Claude bubble, and one under each code block
+ * inside it — quiet by default, because a thread is for reading and these are for
+ * the times it is not. `white-space: normal` because `.msg` is `pre-wrap`, which
+ * would otherwise turn the newlines around these rows into blank lines.
+ */
+.read-row { display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 0 0; white-space: normal; }
+.read-row.code { margin: -2px 0 10px; }
+.read-btn {
+  background: rgba(255,255,255,.07); color: var(--text-dim);
+  border: 1px solid var(--border); border-radius: 999px;
+  padding: 4px 11px; font-size: 12px; font-family: inherit;
+  cursor: pointer; -webkit-tap-highlight-color: transparent;
+}
+.read-btn:active { background: rgba(255,255,255,.14); }
+/* The one that is reading, which is also the only Stop there is. */
+.read-btn.reading { background: var(--accent); color: #fff; border-color: transparent; }
+
 /* Tool cards — collapsed by default so the thread stays readable */
 .tool {
   align-self: flex-start; max-width: 92%;

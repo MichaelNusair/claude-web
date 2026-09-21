@@ -225,6 +225,21 @@ step "Checking several chats at once"
 ) || { echo "multi-chat tests failed — not deploying." >&2; exit 1; }
 
 # ---------------------------------------------------------------------------
+step "Checking that a message can be heard"
+# ---------------------------------------------------------------------------
+# Read-aloud in the chat app is entirely invisible from a desktop browser and
+# inaudible from a test, so this drives it directly: that a code block is read by
+# the server rather than a browser voice (which reads code as a minute of
+# punctuation names), that the nth button reads the nth block, that a deployment
+# with no voice configured offers no controls at all rather than buttons that
+# explain a 401, and that an unset voice leaves the choice per message to the
+# server — which is what reads a Hebrew answer in Hebrew.
+(
+  cd chat-service
+  node read-test.js
+) || { echo "read-aloud tests failed — not deploying." >&2; exit 1; }
+
+# ---------------------------------------------------------------------------
 step "Checking the editor overlay"
 # ---------------------------------------------------------------------------
 # Nothing but nginx loads this file, so a load-time error removes the mic, the
