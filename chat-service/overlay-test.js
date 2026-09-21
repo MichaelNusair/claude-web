@@ -1204,6 +1204,26 @@ const drain = async (limit = 5000) => {
 ok('the status sheet offers no way to hear the message it is showing', speakBtn());
 ok('the Read aloud button does not say what it does', speakBtn()?.textContent === 'Read aloud');
 
+/*
+ * The code block, on a phone with no server voice.
+ *
+ * A block is turned into words in chat-service/speak.js and nowhere else, so this
+ * device cannot read one however it is asked — the browser's own voice would spell
+ * out the punctuation, which is the thing the feature exists to avoid. A button
+ * that cannot work must not be offered, and a message whose code was skipped
+ * without explanation is the failure this replaces.
+ */
+ok(
+  'a block read button was offered on a device that has no voice able to read code — ' +
+    'the reduction is on the server, and the browser would spell out the punctuation',
+  !doc.querySelector('[data-cmo-block]'),
+);
+ok(
+  'a phone with no server voice is not told why the code block in the message is not ' +
+    'offered, so the read that says "Code block" looks like all it can ever do',
+  /server voice/.test(doc.getElementById('cmo-code-reads')?.textContent || ''),
+);
+
 tapSpeak();
 ok(
   'nothing was queued inside the tap — speech that starts after an await is refused ' +
@@ -1777,10 +1797,19 @@ voiceReply = {
   configured: true,
   engine: 'generative',
   voice: 'Ruth',
+  /*
+   * Shaped like the real answer, which now has three kinds of voice in it: Polly's,
+   * which are per-language and cannot say a word of Hebrew; Azure's Hebrew pair; and
+   * the multilingual OpenAI ones, whose `language` is deliberately not a locale.
+   * `Lupe` is the one that should be filtered out of a picker on an English phone,
+   * and the other two are the ones that must not be.
+   */
   voices: [
-    { id: 'Ruth', gender: 'Female', language: 'en-US' },
-    { id: 'Matthew', gender: 'Male', language: 'en-US' },
-    { id: 'Lupe', gender: 'Female', language: 'es-US' },
+    { id: 'Ruth', gender: 'Female', language: 'en-US', provider: 'polly' },
+    { id: 'Matthew', gender: 'Male', language: 'en-US', provider: 'polly' },
+    { id: 'Lupe', gender: 'Female', language: 'es-US', provider: 'polly' },
+    { id: 'Hila', gender: 'Female', language: 'he-IL', provider: 'azure' },
+    { id: 'marin', gender: 'Female', language: 'multi', provider: 'openai' },
   ],
   budget: { day: '2026-09-18', chars: 0, limit: 300000 },
   firstSegmentChars: 160,
@@ -1828,11 +1857,65 @@ ok(
   `the picker does not start on the server's own default: ${voiceSelect()?.value}`,
   voiceSelect()?.value === 'Ruth',
 );
+/*
+ * The exception to the filter above, and the reason this deployment needed one.
+ *
+ * Polly has no Hebrew voice at all — forty languages and `he-IL` is not one of them
+ * — so on a phone set to English the only voices that can read a Hebrew message are
+ * the two whose language does not match the phone. Filtering by `navigator.language`
+ * hid exactly those, which left a picker full of voices, none of which could say the
+ * message it was sent, and no hint that another one existed.
+ */
+ok(
+  `a Hebrew voice is hidden on an English phone, which is every voice that could read ` +
+    `a Hebrew message: ${options.join(', ')}`,
+  options.includes('Hila'),
+);
+ok(
+  'the multilingual voice is hidden too — it is the only one that can read a message ' +
+    'with Hebrew and English in it, whatever the phone is set to',
+  options.includes('marin'),
+);
+ok(
+  `'multi' was shown as if it were a language code: ` +
+    `${JSON.stringify([...(voiceSelect()?.options ?? [])].find((o) => o.value === 'marin')?.textContent)}`,
+  /any language/.test(
+    [...(voiceSelect()?.options ?? [])].find((o) => o.value === 'marin')?.textContent || '',
+  ),
+);
 ok(
   'the sheet does not say what the server voice costs, which is the one thing about ' +
     'it that is not obvious from hearing it',
   /seven cents/.test(doc.getElementById('cmo-voice-note')?.textContent || ''),
 );
+ok(
+  'the note about Polly does not admit it cannot read Hebrew, which is the reason ' +
+    'there is more than one server voice here',
+  /No Hebrew/.test(doc.getElementById('cmo-voice-note')?.textContent || ''),
+);
+// What each of the other two means is different in the two ways that matter — what
+// it can read, and what it costs — so the note has to be asked of the voice rather
+// than assume the one that used to be the only one.
+voiceSelect().value = 'Hila';
+voiceSelect().dispatchEvent(new w.Event('change'));
+ok(
+  `choosing the Hebrew voice still describes Polly's bill: ` +
+    `${JSON.stringify(doc.getElementById('cmo-voice-note')?.textContent)}`,
+  /free tier/.test(doc.getElementById('cmo-voice-note')?.textContent || '') &&
+    !/seven cents/.test(doc.getElementById('cmo-voice-note')?.textContent || ''),
+);
+voiceSelect().value = 'marin';
+voiceSelect().dispatchEvent(new w.Event('change'));
+ok(
+  'choosing the multilingual voice does not say that it is the one for a message in ' +
+    'two languages, or that it is metered',
+  /every language/.test(doc.getElementById('cmo-voice-note')?.textContent || '') &&
+    /metered/.test(doc.getElementById('cmo-voice-note')?.textContent || ''),
+);
+// Back to the default, which is what the section below reads with.
+voiceSelect().value = 'Ruth';
+voiceSelect().dispatchEvent(new w.Event('change'));
+w.localStorage.removeItem('cmo-voice');
 
 // -------------------------------------------------------------- one tap, one read
 utterances.length = 0;
@@ -2044,6 +2127,217 @@ ok(
 ok(
   'the arriving message was not announced as one that just landed',
   /^Claude finished\./.test(prepareCalls[0]?.text || ''),
+);
+barBtn.dispatchEvent(new w.MouseEvent('click', { bubbles: true }));
+
+// ------------------------------------------------- reading a code block as code
+/*
+ * The per-block read button.
+ *
+ * "Code block." is the right thing to say while reading a summary aloud, and the
+ * wrong thing to be stuck with: sometimes the block is the answer. So each fenced
+ * block gets a button, and pressing it sends that block to the server as
+ * `kind: 'code'` — the words a listener hears are decided in speak.js, so both
+ * surfaces hear the same thing and the reduction can change without reshipping
+ * this file to a phone that has cached it.
+ *
+ * Two blocks on purpose: one fenced with backticks and tagged, one fenced with
+ * tildes and untagged. The numbering a listener hears has to match the numbering on
+ * the buttons, which is the only thing connecting what was skipped to the button
+ * that reads it.
+ */
+const codeMessage = [
+  '## Two changes',
+  '',
+  'The guard, first:',
+  '',
+  '```js',
+  'const speaking = false; // 3 < 4 && "quoted"',
+  'if (speaking) stopSpeech();',
+  '```',
+  '',
+  'Then the limit the recognizer refuses past:',
+  '',
+  '~~~',
+  'max_seconds = 55',
+  '~~~',
+  '',
+  'Both are deployed.',
+].join('\n');
+
+w.localStorage.setItem('cmo-voice', 'Matthew');
+statusReply = {
+  ...statusReply,
+  last: { role: 'assistant', text: codeMessage, at: new Date().toISOString() },
+};
+await tapStatus();
+
+const blockBtns = () => [...doc.querySelectorAll('[data-cmo-block]')];
+const tapBlock = (i) =>
+  blockBtns()[i]?.dispatchEvent(new w.MouseEvent('click', { bubbles: true }));
+
+ok(
+  `the fenced blocks did not each get a button: ${blockBtns().length} for two blocks — ` +
+    'a tilde fence is a fence, and an untagged one is the commonest kind',
+  blockBtns().length === 2,
+);
+ok(
+  `the button does not say which block it reads, in which language, or how much of ` +
+    `it there is: ${JSON.stringify(blockBtns()[0]?.textContent)}`,
+  /block 1/i.test(blockBtns()[0]?.textContent || '') &&
+    /\bjs\b/.test(blockBtns()[0]?.textContent || '') &&
+    /\b2 lines\b/.test(blockBtns()[0]?.textContent || ''),
+);
+ok(
+  `the second button is not the second block, or counts a line as lines: ` +
+    `${JSON.stringify(blockBtns()[1]?.textContent)}`,
+  /block 2/i.test(blockBtns()[1]?.textContent || '') &&
+    /\b1 line\b/.test(blockBtns()[1]?.textContent || ''),
+);
+
+// What the read of the message itself says about the blocks it skipped.
+prepareCalls.length = 0;
+utterances.length = 0;
+tapSpeak();
+await settle();
+ok(
+  `the read of the message does not number the blocks it skipped, so "Code block" ` +
+    `twice leaves no way to tell which button reads which: ` +
+    `${JSON.stringify(prepareCalls[0]?.text)}`,
+  /Code block 1\./.test(prepareCalls[0]?.text || '') &&
+    /Code block 2\./.test(prepareCalls[0]?.text || ''),
+);
+ok(
+  'the code was read out as part of the message after all',
+  !(prepareCalls[0]?.text || '').includes('&&') &&
+    !(prepareCalls[0]?.text || '').includes('max_seconds'),
+);
+ok(
+  'the tilde-fenced block was read out as prose — the old strip only knew about ' +
+    'backticks, so a tilde fence was spoken character by character',
+  !(prepareCalls[0]?.text || '').includes('~~~'),
+);
+barBtn.dispatchEvent(new w.MouseEvent('click', { bubbles: true }));
+
+// And what pressing a block button sends.
+prepareCalls.length = 0;
+utterances.length = 0;
+tapBlock(0);
+await settle();
+ok(
+  `pressing a block button did not ask the server for it: ${prepareCalls.length} calls`,
+  prepareCalls.length === 1,
+);
+ok(
+  `the block was sent as prose, so the server reduced nothing and the voice reads ` +
+    `the punctuation: ${JSON.stringify(prepareCalls[0]?.kind)}`,
+  prepareCalls[0]?.kind === 'code',
+);
+ok(
+  `the language on the fence was not passed on, so the server cannot say what it is ` +
+    `reading: ${JSON.stringify(prepareCalls[0]?.lang)}`,
+  prepareCalls[0]?.lang === 'js',
+);
+ok(
+  'the block was reduced before being sent — the operators are exactly what the ' +
+    'server needs in order to say them as words',
+  (prepareCalls[0]?.text || '').includes('&&') &&
+    (prepareCalls[0]?.text || '').includes('const speaking'),
+);
+ok(
+  'the fence went with it, so the first thing read is three backticks',
+  !(prepareCalls[0]?.text || '').includes('```') &&
+    !(prepareCalls[0]?.text || '').includes('Two changes'),
+);
+ok(
+  'the browser voice read the raw code as well, which is the punctuation spelled out',
+  utterances.length === 0,
+);
+ok(
+  `the button that is reading does not offer Stop: ${JSON.stringify(blockBtns()[0]?.textContent)}`,
+  blockBtns()[0]?.textContent === 'Stop',
+);
+ok(
+  'the other block button says Stop too, so both look like they are reading',
+  /block 2/i.test(blockBtns()[1]?.textContent || ''),
+);
+
+// Its own button is Stop; a different one switches instead of stopping.
+tapBlock(0);
+ok('tapping the block that is reading did not stop it', !barBtn.classList.contains('cmo-speaking'));
+ok(
+  `the button did not go back to its own label after stopping: ` +
+    `${JSON.stringify(blockBtns()[0]?.textContent)}`,
+  /block 1/i.test(blockBtns()[0]?.textContent || ''),
+);
+
+prepareCalls.length = 0;
+tapBlock(0);
+await settle();
+tapBlock(1);
+await settle();
+ok(
+  `tapping the other block did not read it: ${prepareCalls.map((c) => c.text).join(' | ')}`,
+  prepareCalls.length === 2 && (prepareCalls[1]?.text || '').includes('max_seconds'),
+);
+ok(
+  `an untagged fence invented a language: ${JSON.stringify(prepareCalls[1]?.lang)}`,
+  prepareCalls[1]?.lang === '',
+);
+barBtn.dispatchEvent(new w.MouseEvent('click', { bubbles: true }));
+
+/*
+ * A refused code read is a refusal, not a handover.
+ *
+ * The prose read falls back to the browser's voice, and that is right for prose.
+ * For code it would read out every bracket for a minute, so the answer is silence
+ * and a sentence saying where the block still is.
+ */
+prepareStatus = 429;
+utterances.length = 0;
+tapBlock(0);
+await settle();
+ok(
+  'a refused code read fell back to the browser voice, which reads code out one ' +
+    'character at a time — the thing this feature exists to avoid',
+  utterances.length === 0,
+);
+ok(
+  `nothing said why the block was not read: ` +
+    `${JSON.stringify(doc.getElementById('cmo-status-detail')?.textContent)}`,
+  /not read/.test(doc.getElementById('cmo-status-detail')?.textContent || ''),
+);
+ok('a refused code read left the bar showing Stop', !barBtn.classList.contains('cmo-speaking'));
+prepareStatus = 0;
+
+/*
+ * A device set to its own voice still sees the buttons, and is told why one cannot
+ * work, rather than being quietly overridden or quietly given nothing.
+ */
+await tapStatus();
+voiceSelect().value = 'browser';
+voiceSelect().dispatchEvent(new w.Event('change'));
+ok(
+  'the block buttons vanished when the browser voice was chosen, which explains ' +
+    'nothing to someone who wants to hear the code',
+  blockBtns().length === 2,
+);
+prepareCalls.length = 0;
+utterances.length = 0;
+tapBlock(0);
+await settle();
+ok(
+  'a device set to its own voice had its choice overridden, or spelled the code out',
+  prepareCalls.length === 0 && utterances.length === 0,
+);
+ok(
+  `nothing explains why the block was not read on a device set to its own voice: ` +
+    `${JSON.stringify(doc.getElementById('cmo-status-detail')?.textContent)}`,
+  /server/.test(doc.getElementById('cmo-status-detail')?.textContent || ''),
+);
+ok(
+  'choosing the browser voice does not admit it cannot read a code block',
+  /code block/i.test(doc.getElementById('cmo-voice-note')?.textContent || ''),
 );
 barBtn.dispatchEvent(new w.MouseEvent('click', { bubbles: true }));
 

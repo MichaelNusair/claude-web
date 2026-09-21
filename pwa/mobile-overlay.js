@@ -53,7 +53,7 @@
    *
    * Bump it when this file changes in a way anyone would look for.
    */
-  const OVERLAY_BUILD = '2026-09-21.3';
+  const OVERLAY_BUILD = '2026-09-21.4';
 
   // -------------------------------------------- survive a browser refresh
   /*
@@ -2681,6 +2681,10 @@
           <select id="cmo-voice" aria-label="Which voice reads the message"></select>
         </label>
         <p class="cmo-hint" id="cmo-voice-note"></p>` : ''}
+      <!-- One button per fenced block in the message, filled in below: the labels
+           name a language that came out of the message, and nothing from outside
+           this file is ever built into a string of HTML here. -->
+      <div id="cmo-code-reads"></div>
       <p class="cmo-hint">${
         asking
           ? 'Nothing more happens in this conversation until this is answered. It has to be answered in the panel — tap the question card at the bottom of it. Nothing out here can answer on your behalf.'
@@ -2855,6 +2859,59 @@
     }
 
     /*
+     * A button for each code block, because "Code block." is not always the answer.
+     *
+     * The read of the message skips the code and says it was there; this is how you
+     * ask for the part that was skipped. Numbered to match what the read says, and
+     * labelled with the language and the length, which is what tells two blocks in
+     * one message apart by ear.
+     *
+     * Rendered even when this device is set to its own voice — `speakCode` explains
+     * why a block cannot be read that way, and a button that is missing explains
+     * nothing. When there is no server voice at all there is nothing to explain in a
+     * button either, so that case is a sentence.
+     */
+    const codeWrap = panel.querySelector('#cmo-code-reads');
+    if (codeWrap) {
+      const blocks = codeBlocks(said).filter((block) => block.code.trim());
+      if (blocks.length && !serverVoiceReady()) {
+        const note = document.createElement('p');
+        note.className = 'cmo-hint';
+        note.textContent =
+          blocks.length === 1
+            ? 'The code block above is read by the server voice, which this device does not have.'
+            : `The ${blocks.length} code blocks above are read by the server voice, which this device does not have.`;
+        codeWrap.appendChild(note);
+      } else if (blocks.length) {
+        codeWrap.className = 'cmo-row';
+        for (const block of blocks) {
+          const button = document.createElement('button');
+          button.className = 'cmo-action cmo-alt';
+          const parts = [
+            blocks.length > 1 ? `Read block ${block.index + 1}` : 'Read the code',
+            block.lang,
+            `${block.lines} line${block.lines === 1 ? '' : 's'}`,
+          ].filter(Boolean);
+          button.dataset.cmoBlock = String(block.index);
+          button.dataset.cmoLabel = parts.join(' · ');
+          button.textContent = button.dataset.cmoLabel;
+          button.addEventListener('click', () => {
+            // Its own Stop while it is the one reading, like the message button —
+            // and a tap on a different block switches to that block instead of
+            // stopping, which is what `speakCode` does by stopping first.
+            if (speaking && readingBlock === block.index) {
+              stopSpeech();
+              return;
+            }
+            const why = speakCode(block);
+            if (why) sayWhy(why);
+          });
+          codeWrap.appendChild(button);
+        }
+      }
+    }
+
+    /*
      * Which voice reads it.
      *
      * Options as nodes, not as interpolated markup: the names come from the AWS
@@ -2876,9 +2933,27 @@
       };
       const lang = (navigator.language || 'en').slice(0, 2).toLowerCase();
       const all = serverSpeech.voices || [];
-      const mine = all.filter((v) => String(v.language || '').toLowerCase().startsWith(lang));
-      for (const voice of (mine.length ? mine : all)) {
-        add(voice.id, `${voice.id} · ${voice.language}${voice.gender ? ` · ${voice.gender}` : ''}`);
+      const languageOf = (v) => String(v.language || '').toLowerCase();
+      const isMine = (v) => languageOf(v).startsWith(lang);
+      /*
+       * Plus every voice that can read a language this phone is not set to.
+       *
+       * The filter above is about a picker nobody wants to scroll — but the message
+       * is not always in the phone's language, and on this deployment that is the
+       * normal case rather than the exception: Claude answers in Hebrew on a phone
+       * set to English, and Polly has no Hebrew voice at all. Hiding the Hebrew and
+       * the multilingual voices is how such a phone ends up with a picker full of
+       * voices, none of which can say the message it was sent.
+       */
+      const alsoOffer = (v) => languageOf(v) === 'multi' || languageOf(v).startsWith('he');
+      const mine = all.filter(isMine);
+      const others = all.filter((v) => !isMine(v) && alsoOffer(v));
+      const offered = mine.length || others.length ? [...mine, ...others] : all;
+      for (const voice of offered) {
+        // 'multi' is not a language code and should not be shown as one: these are
+        // one voice reading whatever script it is handed.
+        const spoken = languageOf(voice) === 'multi' ? 'any language' : voice.language;
+        add(voice.id, `${voice.id} · ${spoken}${voice.gender ? ` · ${voice.gender}` : ''}`);
       }
       if (speechAvailable()) add('browser', 'This browser’s own voice');
 
@@ -2888,13 +2963,28 @@
       voiceSelect.value = voicePref() || serverSpeech.voice || '';
       if (!voiceSelect.value) voiceSelect.value = serverSpeech.voice || '';
 
+      /*
+       * What choosing this voice means, in the terms that differ between them:
+       * whether it can read Hebrew, and what it costs. Asked of the voice's
+       * `provider` rather than assuming Polly, which is what this said when Polly
+       * was the only server voice there was.
+       */
       const paintVoiceNote = () => {
         const noteEl = panel.querySelector('#cmo-voice-note');
         if (!noteEl) return;
+        if (voiceSelect.value === 'browser') {
+          noteEl.textContent =
+            'Instant, free, and it sounds like a satnav. Works with no AWS permission and no network. Cannot read a code block — that is done on the server.';
+          return;
+        }
+        const chosen = (serverSpeech.voices || []).find((v) => v.id === voiceSelect.value);
+        const provider = chosen?.provider || 'polly';
         noteEl.textContent =
-          voiceSelect.value === 'browser'
-            ? 'Instant, free, and it sounds like a satnav. Works with no AWS permission and no network.'
-            : `Synthesised on the server by Polly’s generative engine — about two seconds before the first word, then continuous. A full-length message costs about seven cents.`;
+          provider === 'azure'
+            ? 'A Hebrew neural voice, on Azure’s free tier — half a million characters a month, and nothing is charged past that: it stops until the 1st. Hebrew only.'
+            : provider === 'openai'
+              ? 'One voice for every language, so it reads a message with both Hebrew and English in it. Slower to start than the others, and metered by the character.'
+              : 'Synthesised on the server by Polly’s generative engine — about two seconds before the first word, then continuous. A full-length message costs about seven cents. No Hebrew.';
       };
 
       voiceSelect.addEventListener('change', () => {
@@ -3245,6 +3335,15 @@
 
   let speechChunks = [];
   let speaking = false;
+  /*
+   * Which code block is being read, or -1 for none and for the message itself.
+   *
+   * Kept out here beside `speaking` because `paintSpeech` needs it, and that runs
+   * during the first paint of the bar — a declaration further down would be in its
+   * temporal dead zone at that point. It is the same question `speaking` answers,
+   * asked about a button that there are several of.
+   */
+  let readingBlock = -1;
 
   const speechAvailable = () =>
     typeof window.speechSynthesis !== 'undefined' &&
@@ -3371,6 +3470,73 @@
   }
 
   /**
+   * The fenced code blocks in a message, in the order they appear.
+   *
+   * Two callers, and they need the same answer: the read button offered for each
+   * block, and `speakable`, which has to say that a block was there without
+   * reading it. One scanner rather than a regex each, so the numbers a listener
+   * hears ("Code block 2") and the numbers on the buttons cannot disagree.
+   *
+   * Line-anchored, because that is what a fence is — three backticks in the middle
+   * of a sentence are prose about backticks. An unterminated block is kept and
+   * runs to the end: that is a message still being written, which is a normal
+   * thing to find in a transcript being read while it grows.
+   */
+  function codeBlocks(markdown) {
+    const source = String(markdown == null ? '' : markdown);
+    const blocks = [];
+    let open = null;
+    let offset = 0;
+    for (const line of source.split('\n')) {
+      // The newline `split` removed, which the last line does not have.
+      const next = Math.min(offset + line.length + 1, source.length);
+      const fence = /^\s{0,3}(```+|~~~+)(.*)$/.exec(line);
+      if (open) {
+        // A closing fence is the same character as the one that opened the block,
+        // at least as long, and has nothing after it. Everything else is content —
+        // including ``` inside a ~~~ block, which is how a markdown example is
+        // written.
+        const closes =
+          fence &&
+          fence[1][0] === open.marker[0] &&
+          fence[1].length >= open.marker.length &&
+          !fence[2].trim();
+        if (closes) {
+          open.end = next;
+          blocks.push(open);
+          open = null;
+        } else {
+          open.body.push(line);
+        }
+      } else if (fence) {
+        open = {
+          marker: fence[1],
+          // The info string's first word is the language; the rest is whatever the
+          // renderer wanted (`js title="x"`). Narrowed to the characters a tag is
+          // made of, because this ends up in a button label and in a request body.
+          lang: (fence[2].trim().split(/\s+/)[0] || '').replace(/[^\w+#.-]/g, '').slice(0, 20),
+          body: [],
+          start: offset,
+          end: source.length,
+        };
+      }
+      offset = next;
+    }
+    if (open) blocks.push(open);
+    return blocks.map((block, index) => {
+      const code = block.body.join('\n');
+      return {
+        index,
+        lang: block.lang,
+        code,
+        lines: code.trim() ? code.replace(/\n+$/, '').split('\n').length : 0,
+        start: block.start,
+        end: block.end,
+      };
+    });
+  }
+
+  /**
    * Markdown as something worth listening to.
    *
    * A final message is written to be *read*: bold, bullets, backticks, file
@@ -3390,12 +3556,24 @@
   function speakable(markdown) {
     let text = String(markdown == null ? '' : markdown);
 
-    // Code is not listenable and it is on screen anyway; say that it was there.
-    // The unterminated case is a message that ended mid-block, which is a normal
-    // thing to find in a transcript being read while it is still being written.
-    text = text.replace(/```[\s\S]*?```/g, ' Code block. ');
-    text = text.replace(/~~~[\s\S]*?~~~/g, ' Code block. ');
-    text = text.replace(/```[\s\S]*$/g, ' Code block. ');
+    /*
+     * Code is not prose and it is on screen anyway, so the read says that a block
+     * was there and moves on. Each block has its own button for hearing it read
+     * properly — see `speakCode` — which is why they are numbered once there is
+     * more than one: "Code block 2" is the only thing that tells a listener which
+     * of the buttons reads the part that was skipped. One block needs no number.
+     */
+    const blocks = codeBlocks(text);
+    if (blocks.length) {
+      let out = '';
+      let at = 0;
+      for (const block of blocks) {
+        out += text.slice(at, block.start);
+        out += blocks.length > 1 ? ` Code block ${block.index + 1}. ` : ' Code block. ';
+        at = block.end;
+      }
+      text = out + text.slice(at);
+    }
 
     // Images say nothing out loud. Links keep their label and lose their target:
     // the label is the sentence, the URL is unspeakable.
@@ -3615,10 +3793,23 @@
     );
     const sheetBtn = panel.querySelector('#cmo-speak');
     if (sheetBtn) sheetBtn.textContent = speaking ? 'Stop' : 'Read aloud';
+    /*
+     * The block buttons say Stop too, and only the one that is reading.
+     *
+     * Its own label is kept on the element rather than rebuilt here: it names a
+     * language that came out of the message, and re-deriving it in two places is
+     * how the two of them drift apart.
+     */
+    for (const btn of panel.querySelectorAll('[data-cmo-block]')) {
+      const mine = speaking && String(readingBlock) === btn.dataset.cmoBlock;
+      btn.textContent = mine ? 'Stop' : btn.dataset.cmoLabel || 'Read';
+      btn.classList.toggle('cmo-alt', !mine);
+    }
   }
 
   function stopSpeech() {
     speechChunks = [];
+    readingBlock = -1;
     if (speaking) speaking = false;
     if (speechAvailable()) {
       try {
@@ -3784,7 +3975,10 @@
   function readTrouble(index, generation, why) {
     if (generation !== readGeneration) return;
     const text = read?.text || '';
-    if (index === 0 && text) {
+    // Never for a code read: the browser's voice would read the block character by
+    // character, because turning code into words happens on the server and nowhere
+    // else. Silence with a reason beats two minutes of punctuation names.
+    if (index === 0 && text && read?.kind !== 'code') {
       fallBackToBrowser(text, why);
       return;
     }
@@ -3815,7 +4009,7 @@
    * element is unlocked inside the tap, and everything that has to wait for the
    * network happens after this has already returned.
    */
-  function speakOnServer(text) {
+  function speakOnServer(text, { kind = 'prose', lang = '' } = {}) {
     if (!unlockAudio()) return false;
     readGeneration += 1;
     const generation = readGeneration;
@@ -3825,7 +4019,11 @@
     fetch('/api/speak/prepare', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text, voice: chosenVoice() }),
+      // `kind: 'code'` hands over one fenced block verbatim and asks the server to
+      // turn it into words. What a listener hears is decided there rather than here
+      // so that both surfaces hear the same thing, and so the reduction can change
+      // without shipping a new overlay to a phone that has cached this file.
+      body: JSON.stringify({ text, voice: chosenVoice(), kind, lang }),
     })
       .then(async (res) => {
         if (!res.ok) throw new Error(await refusalReason(res));
@@ -3839,13 +4037,23 @@
           total: prepared.segments,
           voice: prepared.voice,
           text,
+          kind,
           fetching: new Map(),
         };
         playSegment(0, generation);
       })
       .catch((err) => {
         if (generation !== readGeneration) return;
-        fallBackToBrowser(text, err?.message || 'the server voice is unavailable');
+        const why = err?.message || 'the server voice is unavailable';
+        // Same reason as in `readTrouble`: there is no local way to read code, so a
+        // refused code read is a refusal, not a handover to a voice that would
+        // spell it out.
+        if (kind === 'code') {
+          stopSpeech();
+          sayWhy(`That block was not read: ${why}. It is on screen above.`);
+          return;
+        }
+        fallBackToBrowser(text, why);
       });
     return true;
   }
@@ -3929,6 +4137,41 @@
     // on a deployment with no Polly permission at all.
     if (!wantsBrowserVoice() && serverVoiceReady()) return speakOnServer(text);
     return speakInBrowser(text);
+  }
+
+  /**
+   * Read one fenced block as code, rather than as the words "Code block".
+   *
+   * Server-only, and not as a shortcut: a block becomes listenable by being turned
+   * into spoken words — indentation as "indent two", `=>` as "arrow", a line number
+   * every few lines — and that happens in `chat-service/speak.js`. The browser's
+   * own voice would read the punctuation out one character at a time, which is the
+   * thing this feature exists to avoid, so when there is no server voice the answer
+   * is a reason and not a worse read.
+   *
+   * Returns '' when something will be read, and otherwise the sentence to show.
+   * Must be called inside the tap, like everything else in this section.
+   */
+  function speakCode(block) {
+    stopSpeech();
+    if (!block?.code?.trim()) return 'That block is empty — there is nothing in it to read.';
+    if (document.getElementById('cmo-mic')?.classList.contains('cmo-rec')) {
+      return 'Not while the microphone is live — it would hear the code being read and dictate it back.';
+    }
+    if (!serverVoiceReady()) {
+      return 'Code is read by the server voice, and this device has none: it is not signed in to the chat service, or this deployment cannot synthesise.';
+    }
+    // A device set to its own voice is told, rather than quietly overridden. The
+    // choice was made for the message; this is the one read it cannot serve.
+    if (wantsBrowserVoice()) {
+      return 'Code is read on the server, and this device is set to its own voice. Pick a server voice above to hear a block.';
+    }
+    if (!speakOnServer(block.code, { kind: 'code', lang: block.lang })) {
+      return 'This browser would not let the audio start. Tap Read aloud once, then try the block again.';
+    }
+    readingBlock = block.index;
+    paintSpeech();
+    return '';
   }
 
   // -------------------------------------------------------------- wiring
