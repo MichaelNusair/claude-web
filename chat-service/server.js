@@ -26,7 +26,7 @@ import {
   resetSpeech,
   SILENT_WAV,
 } from './speak.js';
-import { claudeStatus } from './claude-status.js';
+import { claudeStatus, firstPromptFor } from './claude-status.js';
 import {
   manifestForProject,
   chatManifest,
@@ -638,6 +638,43 @@ const server = http.createServer(async (req, res) => {
         'Cache-Control': 'no-store',
       });
       res.end(JSON.stringify(status));
+      return;
+    }
+
+    /*
+     * The prompt a conversation began with, to be sent again.
+     *
+     * A separate route rather than another field on the answer above, because the
+     * two have opposite lifetimes: that one is polled every four seconds while a
+     * turn is in flight and is a different answer each time, while this one cannot
+     * change for as long as the conversation exists. So a caller asks once per
+     * conversation and keeps it — see claude-status.js for why it is read out of the
+     * transcript rather than cached here.
+     */
+    if (pathname === '/api/first-prompt' && req.method === 'GET') {
+      const cwd = url.searchParams.get('cwd');
+      const wanted = url.searchParams.get('sessionId');
+      if (!cwd || !wanted) {
+        json(res, 400, { error: 'cwd and sessionId are required' });
+        return;
+      }
+      let answer;
+      try {
+        // Both arguments become part of a filename; firstPromptFor checks their
+        // shape and rejects anything else, as claudeStatus does.
+        answer = await firstPromptFor(cwd, wanted);
+      } catch (err) {
+        json(res, 400, { error: err.message });
+        return;
+      }
+      res.writeHead(200, {
+        'Content-Type': 'application/json; charset=utf-8',
+        // Immutable, and still not cached: this is the text of a private
+        // conversation, and the one caller keeps it in memory for as long as the
+        // page lives. A disk cache would outlive the page on a shared phone.
+        'Cache-Control': 'no-store',
+      });
+      res.end(JSON.stringify(answer));
       return;
     }
 

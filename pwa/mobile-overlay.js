@@ -53,7 +53,7 @@
    *
    * Bump it when this file changes in a way anyone would look for.
    */
-  const OVERLAY_BUILD = '2026-09-18.7';
+  const OVERLAY_BUILD = '2026-09-21.1';
 
   // -------------------------------------------- survive a browser refresh
   /*
@@ -347,6 +347,27 @@
     border: 1px solid #34342f; padding: 4px 8px; text-align: left; white-space: nowrap;
   }
   .cmo-said th { color: #fff; font-weight: 600; background: #1f1f1d; }
+  /* A heading for a section part-way down a sheet, where .cmo-title is the sheet's
+     own heading and carries the spacing for the top of it. */
+  .cmo-section {
+    font-size: 13px; text-transform: uppercase; letter-spacing: .06em;
+    color: #a3a099; margin: 16px 0 0;
+  }
+  /*
+   * The prompt this conversation began with, shown as what it is: text somebody
+   * typed. Deliberately not .cmo-said, which renders markdown — this is not a
+   * message to read but a message to copy, so every character of it stays as it was
+   * written, newlines included. Capped and scrollable because an opening prompt is
+   * sometimes a page long and the sheet has other things below it.
+   */
+  .cmo-first {
+    margin: 6px 0 0; padding: 12px; border-radius: 12px;
+    background: #272725; color: #d7d4cc;
+    font: 13.5px/1.5 inherit; white-space: pre-wrap; overflow-wrap: anywhere;
+    max-height: 26vh; overflow-y: auto;
+    /* Long-press to select is the fallback when the clipboard is refused. */
+    -webkit-user-select: text; user-select: text;
+  }
   /*
    * The other conversations in this project. Rows rather than a select, because
    * each one carries three things — what it is, what it is doing, and how long ago
@@ -588,6 +609,24 @@
       return data.changed && data.text ? String(data.text) : '';
     } catch {
       return '';
+    }
+  }
+
+  /**
+   * Put a selection around an element's text, so the platform's own Copy can take
+   * it. The textarea in the dictation sheet has `select()` for this; a block of
+   * text that is not an input needs a range.
+   */
+  function selectText(el) {
+    try {
+      const range = document.createRange();
+      range.selectNodeContents(el);
+      const selection = window.getSelection();
+      selection.removeAllRanges();
+      selection.addRange(range);
+      return true;
+    } catch {
+      return false; // a detached node, or no selection API
     }
   }
 
@@ -1662,6 +1701,53 @@
     }
   }
 
+  /*
+   * The prompt a conversation began with: asked once, then kept for the life of the
+   * page.
+   *
+   * Immutable, which is the whole reason it is a second request rather than another
+   * field on the status answer — that one is polled every four seconds while a turn
+   * runs, and re-sending a paragraph that cannot have changed on every poll would be
+   * the same page of text a hundred times.
+   *
+   * Three states, and they have to stay apart:
+   *   a value     — asked, and this is the prompt
+   *   null        — asked, and this conversation has no typed opening (another
+   *                 session's message opened it, say)
+   *   not present — never asked, or the ask failed. A failure is silent and
+   *                 retried the next time the sheet opens, like every other fetch
+   *                 out here: the editor gets no banner because the chat service's
+   *                 session lapsed.
+   */
+  const firstPrompts = new Map();
+  const firstPromptAsks = new Map();
+
+  function askFirstPrompt(sessionId) {
+    if (firstPrompts.has(sessionId)) return Promise.resolve(firstPrompts.get(sessionId));
+    const pending = firstPromptAsks.get(sessionId);
+    if (pending) return pending;
+
+    const cwd = folder();
+    const ask = (async () => {
+      try {
+        const res = await fetch(
+          `/api/first-prompt?cwd=${encodeURIComponent(cwd)}&sessionId=${encodeURIComponent(sessionId)}`,
+        );
+        if (!res.ok) return undefined;
+        const data = await res.json();
+        const value = data?.text ? { text: String(data.text), at: data.at || null } : null;
+        firstPrompts.set(sessionId, value);
+        return value;
+      } catch {
+        return undefined;
+      } finally {
+        firstPromptAsks.delete(sessionId);
+      }
+    })();
+    firstPromptAsks.set(sessionId, ask);
+    return ask;
+  }
+
   function hideChip() {
     if (chipTimer) clearTimeout(chipTimer);
     chipTimer = null;
@@ -2183,6 +2269,99 @@
     return out;
   }
 
+  /**
+   * The prompt this conversation began with, and a button that copies it.
+   *
+   * What it is for: the opening prompt is the message most worth sending again — the
+   * brief, the standing instructions, the paragraph that took five minutes to write
+   * — and it is the one a long conversation buries. Once a conversation has been
+   * compacted, the CLI's own history no longer holds it, and scrolling the panel back
+   * to the top of a 12MB transcript is not a thing anyone does on a phone. The
+   * transcript still has it, a kilobyte from the start of the file; this is that read,
+   * put where the rest of "what is going on in this conversation" already lives.
+   *
+   * Drawn asynchronously, unlike everything else on this sheet, because it is a
+   * second request. Nothing appears until it arrives, and nothing appears at all if
+   * it never does: a lapsed chat-service session or an older deployment with no such
+   * route leaves the sheet exactly as it was, which is the rule every fetch out here
+   * follows.
+   */
+  function paintFirstPrompt(sessionId) {
+    const block = panel.querySelector('#cmo-first-block');
+    if (!block || !sessionId) return;
+
+    if (!firstPrompts.has(sessionId)) {
+      askFirstPrompt(sessionId).then((value) => {
+        if (value === undefined) return; // the ask failed; say nothing
+        /*
+         * The sheet may have been closed, replaced by another one, or moved to a
+         * different conversation while this was in flight. Drawing then would put
+         * one conversation's opening prompt under another conversation's answer,
+         * which is worse than showing nothing.
+         */
+        if (!statusSheetOpen() || status?.sessionId !== sessionId) return;
+        paintFirstPrompt(sessionId);
+      });
+      return;
+    }
+
+    const found = firstPrompts.get(sessionId);
+    block.textContent = '';
+
+    if (!found) {
+      const note = document.createElement('p');
+      note.className = 'cmo-hint';
+      note.textContent =
+        'This conversation has no opening prompt of yours — something other than a typed message started it.';
+      block.appendChild(note);
+      return;
+    }
+
+    const head = document.createElement('p');
+    head.className = 'cmo-section';
+    const sent = sinceText(Date.parse(found.at));
+    head.textContent = sent ? `How this started · ${sent}` : 'How this started';
+    block.appendChild(head);
+
+    // textContent, and a plain block rather than renderMarkdown: this is text a
+    // person typed, on its way back to the clipboard, so it is shown exactly as it
+    // was written — backticks, asterisks, newlines and all.
+    const text = document.createElement('div');
+    text.className = 'cmo-first';
+    text.textContent = found.text;
+    block.appendChild(text);
+
+    const row = document.createElement('div');
+    row.className = 'cmo-row';
+    const copy = document.createElement('button');
+    copy.className = 'cmo-action cmo-alt';
+    copy.id = 'cmo-first-copy';
+    copy.textContent = 'Copy & close';
+    copy.setAttribute('aria-label', 'Copy the prompt this conversation started with');
+    row.appendChild(copy);
+    block.appendChild(row);
+
+    const note = document.createElement('p');
+    note.className = 'cmo-status';
+    note.id = 'cmo-first-status';
+    block.appendChild(note);
+
+    copy.addEventListener('click', async () => {
+      // The text is already in hand, so the clipboard write is the first thing the
+      // tap does — iOS refuses one issued after an `await`, which is the same rule
+      // the dictation sheet's Copy follows.
+      if (!(await copyText(found.text))) {
+        selectText(text);
+        note.textContent = 'Press Copy on the selection.';
+        return;
+      }
+      // Closing is part of the job: the input this is going to be pasted into is
+      // behind this sheet.
+      note.textContent = 'Copied — long-press Claude’s input and paste.';
+      closeSheetLater(900);
+    });
+  }
+
   /** The whole of what Claude last said, for when one line was not enough. */
   function openStatus({ auto = false } = {}) {
     /*
@@ -2272,6 +2451,9 @@
               : 'This is the last thing Claude said. The panel is still rendering the history above it.'
       }${size ? ` This conversation is ${size} on disk, which is what the panel is reading.` : ''}</p>
       <p class="cmo-hint" id="cmo-status-follow"></p>
+      <!-- The prompt this conversation began with. Empty until it is in hand, and
+           empty for good if the ask fails — see paintFirstPrompt. -->
+      <div id="cmo-first-block"></div>
       ${notify}
       ${others.length > 1 ? `
         <p class="cmo-hint" id="cmo-convo-head"></p>
@@ -2318,6 +2500,7 @@
       .join(' · ');
     panel.querySelector('#cmo-status-close').addEventListener('click', closeSheet);
     panel.querySelector('#cmo-notify')?.addEventListener('click', toggleNotify);
+    paintFirstPrompt(s.sessionId);
 
     // Ask again, in place. The heartbeat is fifteen seconds and someone reading
     // this sheet has a more specific question than that.

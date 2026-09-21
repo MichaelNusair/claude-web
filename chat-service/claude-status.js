@@ -21,6 +21,13 @@
  *                            message out of 8.7MB, because it reads backwards from
  *                            the end instead of forwards from the start.
  *
+ * A third question, asked from the same file and answered the same way round:
+ *
+ *   how did this start?  ->  the head of the transcript. The prompt a conversation
+ *                            began with is the one thing in it that never changes,
+ *                            and it is the hardest to get back to — see
+ *                            `firstPrompt`.
+ *
  * Deliberately free of chat-service internals beyond the transcript path helper.
  * The chat service is the only authenticated HTTP surface on the box, so the route
  * lives there, but the surface is meant to be retired — and when it is, this file
@@ -29,7 +36,17 @@
 import net from 'net';
 import { open, readdir, stat } from 'fs/promises';
 import { join } from 'path';
-import { CLAUDE_HOME, PROJECTS_ROOT, mangleCwd } from './session-manager.js';
+// isSyntheticUserText is the one piece of chat-service that is really about
+// transcripts rather than about the chat: the CLI writes skill loaders, hook
+// output and compaction preambles through the same `user` channel as things a
+// person typed. Imported rather than copied — two lists of those patterns would
+// drift, and the cost of the drift is showing someone a "prompt" they never sent.
+import {
+  CLAUDE_HOME,
+  PROJECTS_ROOT,
+  mangleCwd,
+  isSyntheticUserText,
+} from './session-manager.js';
 
 const BROKER_SOCKET =
   process.env.CLAUDE_BROKER_SOCKET || '/run/claude-broker/broker.sock';
@@ -45,6 +62,19 @@ const BROKER_SOCKET =
  * to never read a whole transcript.
  */
 const TAIL_WINDOWS = [256 * 1024, 4 * 1024 * 1024];
+
+/*
+ * How much of the *start* of a transcript to read, to find the prompt it began with.
+ *
+ * Measured on the 92 transcripts on this box: the opening prompt sits a median of
+ * 994 bytes in, and 87 of them are inside the first 64KB. The five that are not are
+ * why the first window is 256KB and why there is a second one at all — a screenshot
+ * pasted into the opening message is 350KB of base64 ahead of the text, and one
+ * conversation's first human prompt is 997KB and 284 entries in, behind a resume
+ * preamble. Bounded either way: a transcript here reaches 12MB and this never
+ * reads one.
+ */
+const HEAD_WINDOWS = [256 * 1024, 4 * 1024 * 1024];
 
 /*
  * One window, and a small one, for the other conversations in the project.
@@ -140,6 +170,27 @@ async function readTail(file, bytes) {
     const buffer = Buffer.alloc(length);
     await handle.read(buffer, 0, length, Math.max(0, size - length));
     return { text: buffer.toString('utf8'), size, mtimeMs, complete: length === size };
+  } finally {
+    await handle.close();
+  }
+}
+
+/**
+ * Read the first `bytes` of a file.
+ *
+ * The mirror image of `readTail`, and it relies on the same property: the one line
+ * that may be a fragment — here the last, cut off at the far edge of the window —
+ * cannot parse as JSON, so it drops out of a line-by-line read on its own. That
+ * covers a multi-byte character split by the window too.
+ */
+async function readHead(file, bytes) {
+  const handle = await open(file, 'r');
+  try {
+    const { size } = await handle.stat();
+    const length = Math.min(size, bytes);
+    const buffer = Buffer.alloc(length);
+    await handle.read(buffer, 0, length, 0);
+    return { text: buffer.toString('utf8'), size, complete: length === size };
   } finally {
     await handle.close();
   }
@@ -297,6 +348,106 @@ export async function lastExchange(file, windows = TAIL_WINDOWS) {
   // "Unknown" only when the windows really said nothing. A state read from one of
   // them is knowledge, and reporting it as ignorance sends a device to ask again.
   return { state: state || 'unknown', last: null, title, cutOff, ...meta };
+}
+
+/**
+ * The prompt a conversation began with.
+ *
+ * Why this is worth a route of its own: it is the message you most often want to
+ * send again — the brief, the standing instructions, the paragraph you spent five
+ * minutes writing — and it is the one message a long conversation puts furthest out
+ * of reach. Compaction is what makes it feel gone: from the CLI's side the history
+ * has been summarised away, and the chat app only renders the last 400 messages of
+ * a transcript. What is easy to miss is that nothing actually deleted it. Compaction
+ * *appends* to the same transcript — 8 compact summaries in one file on this box —
+ * so the opening prompt is still sitting a kilobyte from the start of the file, in
+ * full, for every conversation that already exists.
+ *
+ * That is also the argument against caching it anywhere: a cache written from today
+ * onwards would be empty for exactly the conversations this is for, and it would be
+ * a second copy of something immutable that is already on disk. So this reads.
+ *
+ * Telling a typed prompt from an injected one, in that order of preference:
+ *
+ *   `origin.kind === 'human'`  — what the CLI now stamps on a prompt a person
+ *     typed. Present on 57 of the 93 transcripts here and on everything written
+ *     since; a `peer` or `system` origin is another agent or the harness talking,
+ *     and is skipped outright.
+ *   the synthetic-text filter — for the 35 older transcripts with no `origin` at
+ *     all, where all there is to go on is what the text looks like.
+ *
+ * Sidechains are skipped whatever they claim: a subagent's prompt is written into
+ * the same file as a `user` entry, and it is not something the user sent.
+ */
+export async function firstPrompt(file, windows = HEAD_WINDOWS) {
+  for (const bytes of windows) {
+    let head;
+    try {
+      head = await readHead(file, bytes);
+    } catch {
+      return null; // transcript vanished, or was never written
+    }
+
+    for (const line of head.text.split('\n')) {
+      if (!line.trim()) continue;
+      let entry;
+      try {
+        entry = JSON.parse(line);
+      } catch {
+        continue; // a bookkeeping entry is not JSON's problem; the tail fragment is
+      }
+      if (entry.type !== 'user' || entry.isSidechain) continue;
+
+      const kind = entry.origin?.kind;
+      if (kind && kind !== 'human') continue;
+
+      const content = entry.message?.content;
+      const blocks = typeof content === 'string'
+        ? [content]
+        : (Array.isArray(content) ? content : [])
+          .filter((block) => block?.type === 'text')
+          .map((block) => block.text);
+      // Blocks in order, not just the first: a prompt sent from the editor arrives
+      // with an `<ide_selection>` or a `<system-reminder>` block ahead of the words.
+      const text = blocks.find(
+        (value) => typeof value === 'string' && value.trim() && !isSyntheticUserText(value),
+      );
+      if (!text) continue;
+
+      return { text: text.trim(), at: entry.timestamp || null };
+    }
+
+    if (head.complete) break; // the whole file has been read; there is no prompt in it
+  }
+  return null;
+}
+
+/**
+ * The same answer, addressed the way a request addresses it.
+ *
+ * The path hygiene is `claudeStatus`'s, for the same reason: `cwd` arrives from a
+ * browser and ends up in a filesystem path. A null `text` is a real answer — a
+ * conversation opened by another session's message, or one with nothing but
+ * machinery in its first megabyte — and is not the same as a route that failed.
+ */
+export async function firstPromptFor(cwd, sessionId) {
+  if (!String(cwd || '').startsWith(PROJECTS_ROOT)) {
+    throw new Error('cwd must be inside the projects root');
+  }
+  if (!/^[A-Za-z0-9_-]{1,64}$/.test(String(sessionId || ''))) {
+    throw new Error('sessionId is not a session id');
+  }
+
+  const file = join(CLAUDE_HOME, 'projects', await mangleCwd(cwd), `${sessionId}.jsonl`);
+  const found = await firstPrompt(file);
+  return {
+    cwd,
+    sessionId,
+    text: found?.text || null,
+    at: found?.at || null,
+    // How long it is, so a client can say so without measuring what it was given.
+    chars: found?.text ? found.text.length : 0,
+  };
 }
 
 /** Every conversation in a project, newest first. One `stat` each, no reads. */

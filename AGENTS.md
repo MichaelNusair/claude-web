@@ -283,13 +283,17 @@ chat-service/            The chat backend + PWA client. The security boundary.
                          EDITOR's panel, in ~40ms, so a device need not wait out
                          the panel's own history load to find out. Two sources,
                          deliberately unequal: the broker for whether a turn is in
-                         flight, the tail of the transcript for the message.
-                         Depends on nothing in this service but the transcript
-                         path helper — the chat service is meant to be retired,
-                         and this should move rather than be rewritten.
+                         flight, the tail of the transcript for the message. Plus
+                         the head of it, for the prompt the conversation began
+                         with — the one message worth sending again, and the one
+                         compaction appears to take away. Depends on nothing in
+                         this service but the transcript path helper and the
+                         synthetic-prompt filter — the chat service is meant to be
+                         retired, and this should move rather than be rewritten.
   status-test.js         That the two sources stay separated: a broker answer
                          wins, a missing one falls back, and neither may claim a
-                         conversation is idle when that is not known.
+                         conversation is idle when that is not known. And that an
+                         opening prompt is never a preamble Claude Code wrote.
   push.js                Web Push, hand-rolled on node crypto: VAPID (ES256) and
                          RFC 8291 aes128gcm, plus the device list. No dependency
                          on purpose — see its header. Keys live under CLAUDE_HOME
@@ -817,6 +821,36 @@ that stays quiet — and unbounded speech is fenced by the same rule: only while
 sheet is open, only when the *text* changed, never on a change of conversation.
 This is independent of push and must stay that way; the sheet works with
 notifications refused, and notifications work with the sheet never opened.
+
+**The prompt a conversation began with is on the same sheet, copyable.** It is the
+message most worth sending again — the brief, the standing instructions — and the one
+a long conversation puts furthest out of reach: once it has been compacted the CLI's
+own history no longer holds it, the chat app renders only the last 400 messages of a
+transcript, and nobody scrolls a 12MB conversation back to the top on a phone. What
+is easy to miss is that nothing deleted it. **Compaction appends** — 8 compact
+summaries in one file on this box — so the opening prompt is still sitting a kilobyte
+from the start of the transcript, in full, for every conversation that already
+exists. `firstPrompt()` in `claude-status.js` reads it out of a bounded *head* window,
+the mirror image of the tail read beside it: 256KB first, widening to 4MB for the five
+transcripts of 92 here where a screenshot pasted into the opening message puts the
+words 350KB in. Three things about it are deliberate.
+
+- **Nothing caches it.** A cache written from today onwards would be empty for
+  exactly the old conversations someone goes looking in, and it would be a second
+  copy of something immutable that is already on disk.
+- **It is `/api/first-prompt`, not another field on `/api/claude-status`.** The two
+  have opposite lifetimes: that answer is polled every four seconds while a turn runs
+  and differs each time, while this one cannot change for as long as the conversation
+  exists. So the overlay asks once per conversation and keeps it for the life of the
+  page — `overlay-test.js` asserts that a redraw does not re-ask.
+- **A typed prompt is told from an injected one by `origin.kind === 'human'`**, which
+  the CLI now stamps on prompts a person sent (57 of 93 transcripts here, and
+  everything written since). A `peer` or `system` origin is another agent or the
+  harness talking and is skipped, as are sidechain entries, which belong to
+  subagents. Transcripts older than that field fall back to
+  `isSyntheticUserText()` — imported from `session-manager.js` rather than copied,
+  because two lists of those patterns would drift and the cost of the drift is
+  showing someone a "prompt" they never sent.
 
 ## A window per project, on a phone
 

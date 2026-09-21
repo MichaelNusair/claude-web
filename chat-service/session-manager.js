@@ -80,7 +80,9 @@ const SYNTHETIC_USER_PATTERNS = [
   /^\s*$/,
 ];
 
-function isSyntheticUserText(text) {
+// Exported for claude-status.js, which asks the same question of the *first* user
+// entry in a transcript rather than of every one: what did a person actually type.
+export function isSyntheticUserText(text) {
   const trimmed = text.trim();
   return SYNTHETIC_USER_PATTERNS.some((re) => re.test(trimmed));
 }

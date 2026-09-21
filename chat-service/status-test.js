@@ -38,7 +38,7 @@ process.env.PROJECTS_ROOT = PROJECTS;
 process.env.CLAUDE_HOME = CLAUDE_HOME;
 process.env.CLAUDE_BROKER_SOCKET = SOCKET;
 
-const { claudeStatus } = await import('./claude-status.js');
+const { claudeStatus, firstPrompt, firstPromptFor } = await import('./claude-status.js');
 
 let pass = 0;
 let fail = 0;
@@ -411,7 +411,197 @@ ok(status.source === 'transcript', 'no broker at all falls back to the transcrip
 ok(status.state === 'working',
   'and reports what the file shows rather than claiming a conversation is idle');
 
-section('A cwd from a browser cannot name a path outside the projects root:');
+section('The prompt a conversation began with, out of the head of the transcript:');
+/*
+ * Read from the front, for the one message in a conversation that never changes and
+ * is hardest to get back to. Compaction is what makes it feel gone — the CLI's own
+ * history no longer holds it — but compaction *appends*, so it is still sitting a
+ * kilobyte from the start of the file. Everything below is a shape seen on the real
+ * transcripts on this box, because the failure this guards against is not an
+ * exception: it is quietly answering with a preamble Claude Code wrote, and calling
+ * it something the user typed.
+ */
+const OPENING = path.join(PROJECT_DIR, 'd4e5f6a7-3333-4000-8000-000000000000.jsonl');
+const SENT_AT = '2026-09-20T09:00:00.000Z';
+/** A `user` entry as the CLI writes one: an origin, and content in blocks. */
+const prompt = (blocks, over = {}) =>
+  JSON.stringify({
+    type: 'user',
+    timestamp: SENT_AT,
+    origin: { kind: 'human' },
+    promptSource: 'sdk',
+    message: {
+      role: 'user',
+      content: (Array.isArray(blocks) ? blocks : [blocks]).map((b) =>
+        typeof b === 'string' ? { type: 'text', text: b } : b,
+      ),
+    },
+    ...over,
+  });
+// Real transcripts open with two of these, which is why "the first line" is not the
+// question and why the read has to parse forwards rather than look at line 1.
+const queueOp = JSON.stringify({ type: 'queue-operation', operation: 'enqueue' });
+
+fs.writeFileSync(
+  OPENING,
+  `${[
+    queueOp,
+    queueOp,
+    prompt('Reuse the first prompt of a conversation, copyable from the status sheet.'),
+    assistant('on it'),
+    prompt('and now deploy it'),
+  ].join('\n')}\n`,
+);
+let opening = await firstPrompt(OPENING);
+ok(
+  opening?.text === 'Reuse the first prompt of a conversation, copyable from the status sheet.',
+  'the opening prompt is read past the bookkeeping entries ahead of it, and later prompts do not win',
+);
+ok(opening?.at === SENT_AT, 'with when it was sent, so a sheet can say how long ago that was');
+
+/*
+ * The case the whole feature is for. A compacted conversation carries Claude Code's
+ * own continuation preamble as a `user` entry — indistinguishable from a typed
+ * message except by its text — and there are 8 of those in one file on this box.
+ * Answering with one of them would hand someone a summary of their conversation
+ * where they asked for the sentence they started it with.
+ */
+fs.writeFileSync(
+  OPENING,
+  `${[
+    queueOp,
+    prompt('The original brief, written once and worth sending again.'),
+    assistant('done'),
+    JSON.stringify({ type: 'compact-boundary', isCompactSummary: true }),
+    prompt('This session is being continued from a previous conversation. The conversation is summarised below:'),
+    assistant('carrying on'),
+  ].join('\n')}\n`,
+);
+ok(
+  (await firstPrompt(OPENING))?.text === 'The original brief, written once and worth sending again.',
+  'a compacted conversation still answers with the prompt it began with, not the compaction preamble',
+);
+
+/*
+ * A prompt sent from the editor arrives with the harness's blocks ahead of the
+ * words — a `<system-reminder>`, or the IDE's current selection — inside the *same*
+ * entry. So the blocks are read in order rather than only the first one; taking
+ * block zero reports a system reminder as the user's opening message.
+ */
+fs.writeFileSync(
+  OPENING,
+  `${[
+    prompt(['<system-reminder>Codebase instructions follow.</system-reminder>', 'What I actually asked for.']),
+  ].join('\n')}\n`,
+);
+ok(
+  (await firstPrompt(OPENING))?.text === 'What I actually asked for.',
+  'the harness blocks in front of a prompt are stepped over, not reported as the prompt',
+);
+
+// Another agent's message, or the harness's own, comes through the same `user`
+// channel and says so in `origin.kind`. It is not something this user typed.
+fs.writeFileSync(
+  OPENING,
+  `${[
+    prompt('Another Claude session sent a message: deploy is blocked on your tree.', {
+      origin: { kind: 'peer', from: 'uds:/tmp/cc-socks/1.sock' },
+      promptSource: 'system',
+    }),
+    prompt('Then what I said about it.'),
+  ].join('\n')}\n`,
+);
+ok(
+  (await firstPrompt(OPENING))?.text === 'Then what I said about it.',
+  'a message from another session is not offered as the prompt this user began with',
+);
+
+// A subagent's prompt is written into the same transcript as a `user` entry, and it
+// is the orchestrator talking, not the person.
+fs.writeFileSync(
+  OPENING,
+  `${[
+    prompt('Search the repository for every call site.', { isSidechain: true, origin: undefined }),
+    prompt('The thing I typed.'),
+  ].join('\n')}\n`,
+);
+ok(
+  (await firstPrompt(OPENING))?.text === 'The thing I typed.',
+  'a sidechain prompt belongs to a subagent, so it is not the opening prompt either',
+);
+
+/*
+ * 35 of the 93 transcripts on this box were written before the CLI stamped an
+ * origin on anything, and they are exactly the old conversations someone would go
+ * looking for an opening prompt in. With no origin to read, what the text looks
+ * like is all there is.
+ */
+fs.writeFileSync(
+  OPENING,
+  `${[
+    JSON.stringify({
+      type: 'user',
+      timestamp: SENT_AT,
+      message: { role: 'user', content: '<command-name>/init</command-name>' },
+    }),
+    JSON.stringify({
+      type: 'user',
+      timestamp: SENT_AT,
+      message: { role: 'user', content: 'Caveat: The messages below were generated while running /init.' },
+    }),
+    JSON.stringify({
+      type: 'user',
+      timestamp: SENT_AT,
+      message: { role: 'user', content: 'An old conversation, from before origins were written.' },
+    }),
+  ].join('\n')}\n`,
+);
+ok(
+  (await firstPrompt(OPENING))?.text === 'An old conversation, from before origins were written.',
+  'a transcript with no origins on it falls back to recognising the injected text, and still answers',
+);
+
+/*
+ * A screenshot pasted into the opening message is 350KB of base64 in front of the
+ * words, measured on this box — and one conversation's first typed prompt is 997KB
+ * and 284 entries in. So the read widens rather than reporting a conversation as
+ * having no opening prompt, and it is still bounded.
+ */
+fs.writeFileSync(
+  OPENING,
+  `${[
+    prompt([
+      { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'A'.repeat(350 * 1024) } },
+      'why does this screen look like that',
+    ]),
+  ].join('\n')}\n`,
+);
+ok(
+  (await firstPrompt(OPENING))?.text === 'why does this screen look like that',
+  'a pasted screenshot in front of the words does not hide them: the read widens',
+);
+
+// And a transcript holding nothing a person typed is a real answer, not a failure.
+fs.writeFileSync(OPENING, `${[queueOp, assistant('resumed with no new prompt')].join('\n')}\n`);
+ok((await firstPrompt(OPENING)) === null, 'a transcript with no typed prompt in it answers nothing, and does not throw');
+
+/*
+ * The same bound the rest of this file lives by. The panel takes seconds to reload a
+ * large conversation; a route that read 12MB from the front to find line 3 would be
+ * a second copy of that wait rather than a way out of it.
+ */
+fs.writeFileSync(OPENING, `${prompt('the prompt that started twelve megabytes')}\n`);
+for (let i = 0; i < 190; i += 1) fs.appendFileSync(OPENING, filler);
+const headStarted = Date.now();
+opening = await firstPrompt(OPENING);
+const headTook = Date.now() - headStarted;
+ok(
+  opening?.text === 'the prompt that started twelve megabytes',
+  `it answers correctly on ${(fs.statSync(OPENING).size / 1048576).toFixed(1)}MB`,
+);
+ok(headTook < 1500, `and answers in ${headTook}ms, without reading the file it is at the front of`);
+
+section('A cwd or a session id from a browser cannot name a path outside the projects root:');
 let refused = false;
 try {
   await claudeStatus('/etc');
@@ -419,6 +609,35 @@ try {
   refused = true;
 }
 ok(refused, 'a cwd outside the projects root is refused');
+
+refused = false;
+try {
+  await firstPromptFor('/etc', 'a1b2c3d4-0000-4000-8000-000000000000');
+} catch {
+  refused = true;
+}
+ok(refused, 'and so is one on the way to an opening prompt');
+
+refused = false;
+try {
+  await firstPromptFor(CWD, '../../../../etc/passwd');
+} catch {
+  refused = true;
+}
+ok(refused, 'a session id shaped like a path traversal is refused rather than joined onto one');
+
+const addressed = await firstPromptFor(CWD, 'd4e5f6a7-3333-4000-8000-000000000000');
+ok(
+  addressed.text === 'the prompt that started twelve megabytes' &&
+    addressed.sessionId === 'd4e5f6a7-3333-4000-8000-000000000000' &&
+    addressed.chars === addressed.text.length,
+  'the addressed form answers with the prompt, the conversation it came from, and its length',
+);
+const missing = await firstPromptFor(CWD, 'e5f6a7b8-4444-4000-8000-000000000000');
+ok(
+  missing.text === null && missing.chars === 0,
+  'a conversation with no transcript at all answers nothing rather than failing',
+);
 
 fs.rmSync(TMP, { recursive: true, force: true });
 console.log(`\n${pass}/${pass + fail} checks passed`);

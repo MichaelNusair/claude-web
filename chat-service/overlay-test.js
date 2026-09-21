@@ -154,6 +154,18 @@ let statusReply = null;
 const statusCalls = [];
 
 /*
+ * What the opening-prompt route answers, and which conversations it was asked about.
+ *
+ * `null` is every way of not being able to answer — a lapsed chat-service session, a
+ * deployment older than the route — and it is the state the rest of this file runs
+ * in, because the sheet has to be exactly what it was before this existed when the
+ * ask fails. The log is the other half of the point: the answer cannot change for
+ * the life of a conversation, so asking twice for one is a bug, not an inefficiency.
+ */
+let firstPromptReply = null;
+const firstPromptCalls = [];
+
+/*
  * The server voice, which is off until the section that tests it.
  *
  * `null` is a deployment that cannot synthesise — no Polly permission, an older
@@ -233,6 +245,18 @@ w.fetch = (url, options = {}) => {
     // a sentence worth repeating — and to warm the cache the element then reads the
     // same URL from. The bytes never pass through the overlay.
     return Promise.resolve({ ok: true, status: 200, blob: () => Promise.resolve({ segment }) });
+  }
+  if (target.includes('/api/first-prompt')) {
+    const asked = new w.URL(target, 'https://claude.example.com').searchParams;
+    firstPromptCalls.push({ cwd: asked.get('cwd'), sessionId: asked.get('sessionId') });
+    if (!firstPromptReply) {
+      return Promise.resolve({ ok: false, status: 401, json: () => Promise.resolve({}) });
+    }
+    return Promise.resolve({
+      ok: true,
+      status: 200,
+      json: () => Promise.resolve(firstPromptReply(asked.get('sessionId'))),
+    });
   }
   if (target.includes('/api/claude-status')) {
     statusCalls.push(target);
@@ -2439,6 +2463,138 @@ ok(
   'an indented diagram lost its leading spaces, so anything drawn in text collapses',
   /Layout:\n {2}a -> b\n {2}b -> c/.test(plain?.textContent ?? ''),
 );
+
+// --------------------------------------------- the prompt it started with
+/*
+ * The opening prompt, on the sheet and on the clipboard.
+ *
+ * What it is for: the message most worth sending again is the one a conversation
+ * began with, and it is the one a long conversation buries — once it has been
+ * compacted the CLI's own history no longer holds it, and nobody scrolls a 12MB
+ * transcript back to the top on a phone. The transcript still has it at the front of
+ * the file, so the sheet that already answers "what is going on in this
+ * conversation" is where it belongs.
+ *
+ * Three properties are worth more than the rendering here. It must be the text that
+ * was typed, character for character, because it is going straight back into Claude's
+ * input. It must be asked for once per conversation and not on every poll, because
+ * the sheet redraws itself every few seconds while it follows a turn. And a failed
+ * ask must leave the sheet exactly as it was — this thing floats over someone's
+ * editor, and the editor and the chat API are gated separately.
+ */
+doc.getElementById('cmo-status-close')?.dispatchEvent(new w.MouseEvent('click', { bubbles: true }));
+await settle(30);
+
+// Newlines, markdown characters and a backtick, because this is shown as typed
+// rather than rendered — and copied as typed, which is the part that matters.
+const opening = 'Reuse the **first** prompt I sent.\n\nIt is the one worth `sending` again.';
+firstPromptReply = (sessionId) => ({
+  cwd: '/workspace/projects/demo',
+  sessionId,
+  text: sessionId === 'abc123' ? opening : `whatever ${sessionId} began with`,
+  at: new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString(),
+  chars: opening.length,
+});
+firstPromptCalls.length = 0;
+statusReply = { ...answer('Shipped it.'), sessionId: 'abc123' };
+await tapStatus();
+await settle(30);
+
+const firstEl = () => doc.getElementById('cmo-first-block')?.querySelector('.cmo-first');
+ok('the sheet does not show the prompt the conversation started with', firstEl());
+ok(
+  `the opening prompt was not shown as it was typed: ${JSON.stringify(firstEl()?.textContent)}`,
+  firstEl()?.textContent === opening,
+);
+ok(
+  'the opening prompt was rendered as markdown — it is a thing to copy, not a message to read',
+  !firstEl()?.querySelector('strong') && !firstEl()?.querySelector('code'),
+);
+ok(
+  'the sheet does not say when the conversation started, which is how you tell two of them apart',
+  /3 h ago/.test(doc.querySelector('#cmo-first-block .cmo-section')?.textContent ?? ''),
+);
+ok(
+  `the route was asked about the wrong conversation: ${JSON.stringify(firstPromptCalls)}`,
+  firstPromptCalls.length === 1 &&
+    firstPromptCalls[0].sessionId === 'abc123' &&
+    firstPromptCalls[0].cwd === '/workspace/projects/demo',
+);
+
+// The redraw the sheet does on its own, every few seconds while it follows a turn.
+// Re-asking here would re-send a paragraph that cannot have changed, over and over.
+statusReply = { ...answer('Shipped it, and started the deploy.'), sessionId: 'abc123' };
+await settle(6000);
+ok(
+  `the opening prompt was asked for again on a redraw: ${firstPromptCalls.length} asks`,
+  firstPromptCalls.length === 1,
+);
+ok('the opening prompt vanished when the sheet redrew itself', firstEl()?.textContent === opening);
+
+copied.length = 0;
+// Optional, so a missing button is reported as the failure below rather than
+// crashing the run and taking the rest of the failures with it.
+doc.getElementById('cmo-first-copy')?.dispatchEvent(new w.MouseEvent('click', { bubbles: true }));
+await settle(30);
+ok(
+  `Copy put something other than the opening prompt on the clipboard: ${JSON.stringify(copied)}`,
+  copied.length === 1 && copied[0] === opening,
+);
+ok(
+  'Copy said nothing about what to do with what it copied',
+  /paste/i.test(doc.getElementById('cmo-first-status')?.textContent ?? ''),
+);
+// The input it is going to be pasted into is behind this sheet, so the copy closes
+// it — the same handover the dictation sheet does.
+await settle(1200);
+ok('Copy left the sheet over the editor it is about to be pasted into', !sheet.classList.contains('cmo-open'));
+
+// Another conversation is another prompt, and is asked for on its own.
+statusReply = { ...answer('The other one finished too.'), sessionId: 'def456' };
+await tapStatus();
+await settle(30);
+ok(
+  `switching conversations did not ask about the new one: ${JSON.stringify(firstPromptCalls)}`,
+  firstPromptCalls.length === 2 && firstPromptCalls[1].sessionId === 'def456',
+);
+ok(
+  `the sheet kept the previous conversation's opening prompt: ${JSON.stringify(firstEl()?.textContent)}`,
+  firstEl()?.textContent === 'whatever def456 began with',
+);
+
+/*
+ * A conversation nobody typed the start of — one opened by another session's
+ * message. Saying so is the point: an empty space where the prompt goes reads as a
+ * feature that is broken.
+ */
+firstPromptReply = (sessionId) => ({ cwd: '/workspace/projects/demo', sessionId, text: null, at: null, chars: 0 });
+statusReply = { ...answer('Answered a peer.'), sessionId: 'peer789' };
+await tapStatus();
+await settle(30);
+ok(
+  'a conversation with no typed opening leaves a blank space where the prompt goes',
+  /no opening prompt/i.test(doc.getElementById('cmo-first-block')?.textContent ?? ''),
+);
+
+/*
+ * And the failure that must be invisible: the chat service refuses this route while
+ * code-server is perfectly happy, which is what a lapsed session looks like out
+ * here. Nothing about the sheet may change.
+ */
+firstPromptReply = null;
+statusReply = { ...answer('Still readable.'), sessionId: 'lapsed999' };
+await tapStatus();
+await settle(30);
+ok(
+  'a refused opening-prompt ask put something on the sheet anyway',
+  (doc.getElementById('cmo-first-block')?.textContent ?? '') === '',
+);
+ok(
+  'a refused opening-prompt ask took the rest of the sheet with it',
+  /Still readable\./.test(doc.getElementById('cmo-status-said')?.textContent ?? ''),
+);
+doc.getElementById('cmo-status-close')?.dispatchEvent(new w.MouseEvent('click', { bubbles: true }));
+await settle(30);
 
 // ------------------------------------------------------------------- results
 if (failures.length) {

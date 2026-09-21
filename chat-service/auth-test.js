@@ -175,6 +175,9 @@ const guarded = [
   // an unauthenticated hit would be both a read of private conversations and an
   // inventory of every live one.
   ['GET', '/api/claude-status?cwd=/tmp'],
+  // Hands back the opening prompt of a conversation verbatim, which is a read of
+  // someone's private transcript however short the answer is.
+  ['GET', '/api/first-prompt?cwd=/tmp&sessionId=x'],
   ['GET', '/api/models'],
   ['GET', '/api/voice-status'],
   ['POST', '/api/transcribe'],
