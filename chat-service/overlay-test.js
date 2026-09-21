@@ -3250,6 +3250,938 @@ await settle(30);
   );
 }
 
+// ------------------------------------------ talking a message over out loud
+/*
+ * A spoken conversation about the message on the sheet — the editor's half of what
+ * chat-service/talk-test.js checks in the chat app.
+ *
+ * Everything above is the overlay reading *to* you. This is the overlay letting you
+ * answer back: a WebRTC session to OpenAI, opened with a credential this box mints and
+ * spends nowhere near it, about one message and nothing else. Four things about it can
+ * go wrong quietly, and they are what this section is for.
+ *
+ *   **It must not be able to reach Claude.** That is the promise the sheet makes in
+ *   words, and on this surface the ways to break it are specific: this overlay drives
+ *   the panel by dispatching keyboard chords and by writing to the clipboard. So a
+ *   conversation is held open here while transcripts arrive, and the test asserts that
+ *   not one chord is pressed, nothing is copied, and every request this page makes is
+ *   one of the three read-only status routes it was already making.
+ *
+ *   **The microphone must not survive it.** Hang up, Close, a tap beside the sheet,
+ *   another sheet drawn over it, a dropped line, the timer, every refusal, and the
+ *   workbench reloading itself — eight ways out, and each one is checked for every
+ *   track being stopped. A MediaStream that is merely dropped leaves the recording
+ *   indicator lit and the phone listening.
+ *
+ *   **The gesture.** getUserMedia is refused on iOS outside a tap, and the microphone
+ *   is asked for before the credential is minted — a session reserved against the day's
+ *   count and then abandoned is one spent for nothing.
+ *
+ *   **The credential.** It is a bearer token for a metered third-party service. It may
+ *   not be stored, printed, or put on the page.
+ */
+{
+  /** The routes this page is allowed to touch on our own box while a line is open. */
+  const ALLOWED = ['/api/claude-status', '/api/voice-status', '/api/first-prompt', '/api/realtime/token'];
+  const SECRET = 'ek_this_is_the_credential';
+  // Shaped like the thing this feature exists for: a Hebrew answer with a fenced block
+  // in it, which is both of the two reasons the read-aloud work happened.
+  const MESSAGE = [
+    'סידרתי את זה — הבעיה הייתה בבדיקה עצמה.',
+    '',
+    '```js',
+    'const speaking = false; // 3 < 4',
+    '```',
+    '',
+    'אפשר לדבר על זה.',
+  ].join('\n');
+  const OPENING = 'תקרא לי את ההודעה הזאת בעברית.';
+
+  /**
+   * A fresh overlay with a microphone, a peer connection and an OpenAI that answers.
+   *
+   * Its own document, like the notification section above: what is being tested is
+   * partly what the page does on load, and this window's fakes have to be in place
+   * before `w.eval` rather than swapped in afterwards.
+   */
+  function bootTalk(options = {}) {
+    const state = {
+      realtime: {
+        configured: true,
+        model: 'gpt-realtime-mini',
+        voice: 'marin',
+        maxMinutes: 10,
+        budget: { sessions: 1, limit: 40 },
+        ...(options.realtime || {}),
+      },
+      speech: options.speech || null,
+      mintStatus: 0,
+      sdpStatus: 0,
+      micDenied: false,
+      holdSdp: false,
+      releaseSdp: null,
+      said: MESSAGE,
+      ...options.state,
+    };
+    if (options.realtime === null) state.realtime = null;
+
+    const logs = [];
+    const quiet = new VirtualConsole();
+    quiet.on('jsdomError', () => {});
+    for (const level of ['error', 'warn', 'log', 'info', 'debug']) {
+      quiet.on(level, (m) => {
+        logs.push(String(m));
+        if (level === 'error') fail(`console error in the talk boot: ${m}`);
+      });
+    }
+    const dom2 = new JSDOM('<!doctype html><html><head></head><body></body></html>', {
+      runScripts: 'outside-only',
+      url: 'https://claude.example.com/p/demo/?folder=%2Fworkspace%2Fprojects%2Fdemo',
+      virtualConsole: quiet,
+    });
+    const win = dom2.window;
+    win.addEventListener('error', (e) => fail(`uncaught in the talk boot: ${e.message}`));
+
+    /** Every request this page made, in order, whoever it was to. */
+    const calls = [];
+    /** Which of the microphone and the credential was asked for first. */
+    const order = [];
+    const peers = [];
+    const mics = [];
+    const audios = [];
+    /** Every chord this overlay pressed — the only way it can reach Claude. */
+    const chords = [];
+    const copied = [];
+
+    win.fetch = (url, init = {}) => {
+      const target = String(url);
+      calls.push({ url: target, init });
+      if (target.startsWith('https://api.openai.com/')) {
+        if (state.sdpStatus) {
+          return Promise.resolve({ ok: false, status: state.sdpStatus, text: () => Promise.resolve('') });
+        }
+        const answer = { ok: true, status: 200, text: () => Promise.resolve('v=0 answer from OpenAI') };
+        if (state.holdSdp) {
+          return new Promise((resolve) => {
+            state.releaseSdp = () => resolve(answer);
+          });
+        }
+        return Promise.resolve(answer);
+      }
+      if (target.includes('/api/realtime/token')) {
+        order.push('mint');
+        if (state.mintStatus) {
+          return Promise.resolve({
+            ok: false,
+            status: state.mintStatus,
+            json: () => Promise.resolve({ error: 'that is 40 conversations today, which is the limit' }),
+          });
+        }
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve({
+            value: SECRET,
+            expiresAt: new Date(Date.now() + 120000).toISOString(),
+            model: 'gpt-realtime-mini',
+            voice: 'marin',
+            sessionId: 'rt_abc',
+            maxMinutes: state.maxMinutes ?? 10,
+            budget: { sessions: 1, limit: 40 },
+          }),
+        });
+      }
+      if (target.includes('/api/voice-status')) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve({
+            configured: false,
+            speech: state.speech,
+            realtime: state.realtime,
+          }),
+        });
+      }
+      if (target.includes('/api/first-prompt')) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve({ text: OPENING, at: new Date().toISOString() }),
+        });
+      }
+      if (target.includes('/api/claude-status')) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve({
+            cwd: '/workspace/projects/demo',
+            sessionId: 'S-talk',
+            state: 'idle',
+            clients: 0,
+            conversations: [],
+            last: state.said
+              ? { role: 'assistant', text: state.said, at: new Date().toISOString() }
+              : null,
+          }),
+        });
+      }
+      return Promise.resolve({ ok: false, status: 404, json: () => Promise.resolve({}) });
+    };
+
+    /*
+     * A microphone whose tracks can be asked whether they were stopped, which is the
+     * only question this section asks of it more than once.
+     */
+    if (options.mediaDevices !== false) {
+      Object.defineProperty(win.navigator, 'mediaDevices', {
+        configurable: true,
+        value: {
+          getUserMedia: (constraints) => {
+            order.push('mic');
+            if (state.micDenied) {
+              const err = new Error('Permission denied');
+              err.name = 'NotAllowedError';
+              return Promise.reject(err);
+            }
+            const track = {
+              kind: 'audio',
+              stopped: 0,
+              stop() {
+                this.stopped += 1;
+              },
+            };
+            const stream = { constraints, tracks: [track], getTracks: () => [track] };
+            mics.push(stream);
+            return Promise.resolve(stream);
+          },
+        },
+      });
+    }
+
+    if (options.webrtc !== false) {
+      win.RTCPeerConnection = class FakePeer {
+        constructor() {
+          peers.push(this);
+          this.added = [];
+          this.channels = [];
+          this.local = null;
+          this.remote = null;
+          this.closed = 0;
+          this.connectionState = 'new';
+          this.ontrack = null;
+          this.onconnectionstatechange = null;
+        }
+        addTrack(track, stream) {
+          this.added.push({ track, stream });
+        }
+        createDataChannel(label) {
+          const channel = {
+            label,
+            onmessage: null,
+            closed: 0,
+            close() {
+              this.closed += 1;
+            },
+          };
+          this.channels.push(channel);
+          return channel;
+        }
+        createOffer() {
+          return Promise.resolve({ type: 'offer', sdp: 'v=0 offer from the phone' });
+        }
+        setLocalDescription(description) {
+          this.local = description;
+          return Promise.resolve();
+        }
+        setRemoteDescription(description) {
+          this.remote = description;
+          return Promise.resolve();
+        }
+        close() {
+          this.closed += 1;
+          this.connectionState = 'closed';
+        }
+        /* --- what the far end does, from the test's side --- */
+        connect() {
+          this.connectionState = 'connected';
+          this.onconnectionstatechange?.();
+        }
+        drop() {
+          this.connectionState = 'failed';
+          this.onconnectionstatechange?.();
+        }
+        arrive(stream) {
+          this.ontrack?.({ streams: [stream] });
+        }
+        say(message) {
+          this.channels[0]?.onmessage?.({ data: JSON.stringify(message) });
+        }
+      };
+    }
+
+    win.Audio = class FakeAudio {
+      constructor() {
+        audios.push(this);
+        this.srcs = [];
+        this.srcObject = null;
+        this.autoplay = false;
+        this.playsInline = false;
+        this.attributes = {};
+      }
+      set src(value) {
+        this.srcs.push(String(value));
+      }
+      get src() {
+        return this.srcs[this.srcs.length - 1] || '';
+      }
+      setAttribute(name, value) {
+        this.attributes[name] = value;
+      }
+      removeAttribute() {}
+      load() {}
+      pause() {}
+      play() {
+        return Promise.resolve();
+      }
+    };
+
+    Object.defineProperty(win.navigator, 'clipboard', {
+      configurable: true,
+      value: { writeText: (text) => { copied.push(String(text)); return Promise.resolve(); } },
+    });
+
+    try {
+      win.eval(overlayJs);
+    } catch (err) {
+      fail(`mobile-overlay.js threw in the talk boot — ${err.message}`);
+    }
+
+    const doc2 = win.document;
+    // After `eval`, so this listener sees what the overlay dispatches rather than being
+    // the thing it dispatches to. The chord is how the panel is driven from out here.
+    doc2.addEventListener('keydown', (e) => chords.push(e.key), true);
+
+    const tap = (id) =>
+      doc2.getElementById(id)?.dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
+
+    return {
+      win,
+      doc: doc2,
+      state,
+      calls,
+      order,
+      peers,
+      mics,
+      audios,
+      chords,
+      copied,
+      logs,
+      tap,
+      /** Open the status sheet, and wait for the opening prompt to land on it. */
+      openStatus: async () => {
+        tap('cmo-status');
+        await settle(40);
+      },
+      /** Which requests went to our own box, as paths. */
+      ours: () =>
+        calls
+          .map((c) => c.url)
+          .filter((u) => !u.startsWith('https://api.openai.com/'))
+          .map((u) => u.split('?')[0]),
+      mint: () => calls.find((c) => c.url.includes('/api/realtime/token')),
+      sdp: () => calls.find((c) => c.url.startsWith('https://api.openai.com/')),
+      state2: state,
+      text: (id) => doc2.getElementById(id)?.textContent ?? '',
+      /** Every microphone track this page ever opened, whichever call it belonged to. */
+      tracks: () => mics.flatMap((m) => m.tracks),
+      allStopped: () => mics.length > 0 && mics.flatMap((m) => m.tracks).every((t) => t.stopped > 0),
+    };
+  }
+
+  // --------------------------------------------------- is the control there at all
+  const b = bootTalk();
+  await settle(60);
+  await b.openStatus();
+
+  ok(
+    'the status sheet offers no way to talk the message over, on a box that can hold ' +
+      'one — the whole feature is unreachable from the editor',
+    b.doc.getElementById('cmo-talk'),
+  );
+  ok(
+    'the Read aloud button appeared on a box with no speech voice, which is a control ' +
+      'that can only explain itself after the tap',
+    !b.doc.getElementById('cmo-speak'),
+  );
+
+  {
+    // No key on the box: the server says so, and the sheet must say nothing at all.
+    const nokey = bootTalk({ realtime: { configured: false, reason: 'no OpenAI key' } });
+    await settle(60);
+    await nokey.openStatus();
+    ok(
+      'a box with no OpenAI key still offered Talk it over — one tap, a mint, a 403, ' +
+        'and a microphone opened for nothing',
+      !nokey.doc.getElementById('cmo-talk'),
+    );
+    ok(
+      'the sheet did not draw at all on a box with no realtime voice',
+      /S-talk|סידרתי/.test(nokey.text('cmo-status-said')),
+    );
+  }
+  {
+    // A browser that cannot hold a session. Some webviews cannot, and a button that
+    // takes the tap and then does nothing is the shape this file keeps refusing.
+    const old = bootTalk({ webrtc: false });
+    await settle(60);
+    await old.openStatus();
+    ok(
+      'a browser with no RTCPeerConnection was offered Talk it over anyway',
+      !old.doc.getElementById('cmo-talk'),
+    );
+  }
+  {
+    const nomic = bootTalk({ mediaDevices: false });
+    await settle(60);
+    await nomic.openStatus();
+    ok(
+      'a browser with no getUserMedia was offered Talk it over anyway',
+      !nomic.doc.getElementById('cmo-talk'),
+    );
+  }
+  {
+    // Both capabilities at once, which is the deployment this was written for: the two
+    // buttons are separate because the two answers are separate.
+    const both = bootTalk({
+      speech: { configured: true, voice: 'Ruth', voices: [{ id: 'Ruth', language: 'en-US', provider: 'polly' }] },
+    });
+    await settle(60);
+    await both.openStatus();
+    ok(
+      'a box with both a voice and a key lost one of the two buttons',
+      both.doc.getElementById('cmo-talk') && both.doc.getElementById('cmo-speak'),
+    );
+  }
+  {
+    // Nothing said yet. There is no message to talk about, so there is no button —
+    // the same rule Read aloud follows two hundred lines above.
+    const quiet2 = bootTalk({ state: { said: '' } });
+    await settle(60);
+    await quiet2.openStatus();
+    ok(
+      'a conversation with nothing said in it offered a conversation about nothing',
+      !quiet2.doc.getElementById('cmo-talk'),
+    );
+  }
+
+  // ------------------------------------------------------- starting one
+  b.tap('cmo-talk');
+  await settle(60);
+
+  ok(
+    `the microphone and the credential were asked for in the order ${JSON.stringify(b.order)} — ` +
+      'the credential first means a session reserved against the day and then thrown ' +
+      'away when the microphone is refused',
+    b.order.join(',') === 'mic,mint',
+  );
+  const asked = b.mics[0]?.constraints?.audio;
+  ok(
+    `the microphone was asked for as ${JSON.stringify(b.mics[0]?.constraints)} — echo ` +
+      'cancellation is not a nicety on a phone held at arm’s length while the far end ' +
+      'is talking through the speaker',
+    asked && asked.echoCancellation === true && asked.noiseSuppression === true,
+  );
+
+  const minted = JSON.parse(b.mint()?.init?.body || '{}');
+  ok(
+    `the message was not sent as it was written: ${JSON.stringify(minted.text)?.slice(0, 80)}`,
+    minted.text === MESSAGE,
+  );
+  ok(
+    'the fences were stripped out of the message before it was sent — the code in it is ' +
+      'most of what there is to talk about',
+    minted.text.includes('```js'),
+  );
+  ok(
+    `the prompt sent with it was ${JSON.stringify(minted.prompt)} — the conversation's ` +
+      'opening prompt is the only context this surface has, and the sheet already has it',
+    minted.prompt === OPENING,
+  );
+  ok(
+    `the client chose something that costs money: ${JSON.stringify(Object.keys(minted))} — ` +
+      'the model, the voice, the length and the instructions are the server’s to decide',
+    Object.keys(minted).sort().join(',') === 'prompt,text',
+  );
+
+  const sdpCall = b.sdp();
+  ok(
+    `the offer went to ${sdpCall?.url} — it has to go straight to OpenAI, because a relay ` +
+      'through this box is the latency this feature exists to avoid',
+    sdpCall?.url?.startsWith('https://api.openai.com/v1/realtime/calls?model='),
+  );
+  ok(
+    'the model was not named in the SDP call, which is how OpenAI is told what to answer as',
+    sdpCall?.url?.includes('model=gpt-realtime-mini'),
+  );
+  ok(
+    'the minted credential was not the bearer on the SDP call',
+    sdpCall?.init?.headers?.Authorization === `Bearer ${SECRET}`,
+  );
+  ok(
+    `the offer was sent as ${JSON.stringify(sdpCall?.init?.headers?.['Content-Type'])}`,
+    sdpCall?.init?.headers?.['Content-Type'] === 'application/sdp' &&
+      sdpCall?.init?.body === 'v=0 offer from the phone',
+  );
+
+  const peer = b.peers[0];
+  ok('no peer connection was made at all', peer);
+  ok(
+    'the microphone track was not added to the connection, so the far end hears silence',
+    peer?.added.length === 1 && peer.added[0].track === b.mics[0].tracks[0],
+  );
+  ok(
+    'the oai-events channel was not opened, so nothing can be shown of what was said',
+    peer?.channels[0]?.label === 'oai-events',
+  );
+  ok(
+    'the answer from OpenAI was never applied to the connection',
+    peer?.remote?.type === 'answer' && peer.remote.sdp === 'v=0 answer from OpenAI',
+  );
+
+  ok(
+    `the sheet does not say what this is not: ${JSON.stringify(b.text('cmo-panel').slice(0, 120))}`,
+    /cannot run anything/.test(b.text('cmo-panel')) &&
+      /tell Claude what you said/.test(b.text('cmo-panel')),
+  );
+  ok(
+    `the sheet does not say what it is doing: ${JSON.stringify(b.text('cmo-talk-state'))}`,
+    /listening/i.test(b.text('cmo-talk-state')),
+  );
+  ok(
+    `the sheet does not say what this costs or when it ends: ${JSON.stringify(b.text('cmo-talk-note'))}`,
+    /marin/.test(b.text('cmo-talk-note')) &&
+      /1 of 40/.test(b.text('cmo-talk-note')) &&
+      /10 minutes/.test(b.text('cmo-talk-note')),
+  );
+  ok(
+    `the clock is not running: ${JSON.stringify(b.text('cmo-talk-clock'))}`,
+    /^0:0\d/.test(b.text('cmo-talk-clock')),
+  );
+
+  // The far end's audio, which is a stream and must never become a URL: code-server's
+  // own Content-Security-Policy says `media-src 'self'`, and this page is inside it.
+  peer.arrive({ id: 'far-end' });
+  await settle(20);
+  const far = b.audios.find((a) => a.srcObject);
+  ok('the far end’s audio was never attached to an element', far);
+  ok(
+    `the stream was turned into a URL (${JSON.stringify(far?.srcs)}), which code-server’s ` +
+      'media-src refuses',
+    far?.srcs.length === 0,
+  );
+  ok(
+    'the audio element was not set to play inline, so iOS takes over the screen with the call',
+    far?.autoplay === true && far?.playsInline === true && far?.attributes?.playsinline === '',
+  );
+
+  // -------------------------------------- not one word of it reaches this box
+  const before = b.calls.length;
+  peer.say({ type: 'response.output_audio_transcript.delta', delta: 'The test was' });
+  peer.say({ type: 'response.output_audio_transcript.delta', delta: ' the broken part.' });
+  peer.say({
+    type: 'response.output_audio_transcript.done',
+    transcript: 'The test was the broken part.',
+  });
+  peer.say({ type: 'conversation.item.input_audio_transcription.delta', delta: 'push that' });
+  peer.say({
+    type: 'conversation.item.input_audio_transcription.completed',
+    transcript: 'push that for me',
+  });
+  await settle(40);
+
+  ok(
+    `a live conversation made ${b.calls.length - before} request(s) to somewhere: ` +
+      `${JSON.stringify(b.calls.slice(before).map((c) => c.url))} — nothing said in it may ` +
+      'be carried anywhere, least of all to the box running Claude',
+    b.calls.length === before,
+  );
+  ok(
+    `this page pressed ${JSON.stringify(b.chords)} while a conversation was open — a chord ` +
+      'is how this overlay drives the panel, so one pressed here is a voice channel ' +
+      'typing into Claude',
+    b.chords.length === 0,
+  );
+  ok(
+    `something was copied during the conversation: ${JSON.stringify(b.copied)} — the ` +
+      'clipboard is the other way text gets from here into Claude',
+    b.copied.length === 0,
+  );
+  ok(
+    `a request went somewhere it should not: ${JSON.stringify(b.ours())}`,
+    // `includes` as well as `every`: an empty list satisfies `every`, and an empty list
+    // is also what a broken harness produces.
+    b.ours().includes('/api/realtime/token') && b.ours().every((path) => ALLOWED.includes(path)),
+  );
+
+  // ------------------------------------------------------------ the transcript
+  const lines = () => [...b.doc.querySelectorAll('#cmo-talk-log .cmo-talk-line')];
+  ok(
+    `the transcript shows ${lines().length} lines rather than two`,
+    lines().length === 2,
+  );
+  ok(
+    `the deltas were not joined into one line: ${JSON.stringify(lines()[0]?.textContent)}`,
+    /The test was the broken part\.$/.test(lines()[0]?.textContent ?? ''),
+  );
+  ok(
+    'the finished line is still dimmed as a half-heard one',
+    !lines()[0]?.classList.contains('cmo-partial'),
+  );
+  ok(
+    `the two halves are not told apart: ${JSON.stringify(lines().map((el) => el.querySelector('.cmo-who')?.textContent))}`,
+    lines()[0]?.querySelector('.cmo-who')?.textContent === 'the voice' &&
+      lines()[1]?.querySelector('.cmo-who')?.textContent === 'you',
+  );
+  ok(
+    `what it heard was not replaced by the final transcript: ${JSON.stringify(lines()[1]?.textContent)}`,
+    /push that for me$/.test(lines()[1]?.textContent ?? ''),
+  );
+
+  // A partial one, which has to look unfinished: a half-heard sentence shown as final is
+  // how you end up certain it said something it did not.
+  peer.say({ type: 'response.audio_transcript.delta', delta: 'I cannot do that' });
+  await settle(20);
+  ok(
+    'the older spelling of the transcript event was ignored, so a session on the previous ' +
+      'API version shows an empty transcript',
+    lines().length === 3,
+  );
+  ok(
+    'a line still being said is not dimmed',
+    lines()[2]?.classList.contains('cmo-partial'),
+  );
+
+  // Markup in a transcript, which is text a model heard over a network — the least
+  // trusted string on this surface.
+  peer.say({
+    type: 'response.audio_transcript.done',
+    transcript: 'try <img src=x onerror="alert(1)"> instead',
+  });
+  await settle(20);
+  ok(
+    'a transcript was built as markup rather than as text',
+    !b.doc.querySelector('#cmo-talk-log img') &&
+      /<img src=x/.test(lines()[2]?.textContent ?? ''),
+  );
+
+  peer.say({ type: 'error', error: { message: 'the session expired' } });
+  await settle(20);
+  ok(
+    `an error from the far end was swallowed: ${JSON.stringify(b.text('cmo-talk-state'))}`,
+    /the session expired/.test(b.text('cmo-talk-state')),
+  );
+
+  // ------------------------------------------------ the credential goes nowhere
+  const stored = JSON.stringify(b.win.localStorage);
+  ok(
+    'the minted credential was written to localStorage, where the next page to load can ' +
+      'read it — and every other script on this origin with it',
+    // The store is asserted non-empty first: this overlay writes its load history there,
+    // so an empty one means the dump is not being read and the check below is free.
+    stored.length > 2 && !stored.includes('ek_'),
+  );
+  ok(
+    'the credential is on the page',
+    !b.doc.body.textContent.includes(SECRET) && !b.doc.body.innerHTML.includes(SECRET),
+  );
+  ok(
+    `the credential was printed: ${JSON.stringify(b.logs.filter((l) => l.includes('ek_')))}`,
+    !b.logs.some((l) => l.includes('ek_')),
+  );
+
+  // ------------------------------------------------------------- hanging up
+  b.tap('cmo-talk-end');
+  await settle(20);
+  ok('Hang up did not close the connection', peer.closed > 0);
+  ok('Hang up did not close the event channel', peer.channels[0].closed > 0);
+  ok(
+    'Hang up left the microphone live — the recording indicator stays lit and the phone ' +
+      'is still listening',
+    b.allStopped(),
+  );
+  ok(
+    `the sheet does not say the line has gone: ${JSON.stringify(b.text('cmo-talk-state'))}`,
+    /hung up/i.test(b.text('cmo-talk-state')),
+  );
+  ok(
+    'the transcript went with the line, and it is the only record there was',
+    lines().length === 3,
+  );
+  ok(
+    'the clock is still counting after the line was closed',
+    b.text('cmo-talk-clock') === '',
+  );
+  // Twice is what a thumb does to a button that has already worked once.
+  b.tap('cmo-talk-end');
+  await settle(20);
+  ok(
+    'hanging up a second time changed the answer, when there was nothing left to end',
+    /hung up/i.test(b.text('cmo-talk-state')) && b.allStopped(),
+  );
+
+  /*
+   * The bar, while a line is open.
+   *
+   * The sheet is dismissed by tapping beside it, so this button is the only control
+   * that outlives it — and on a phone it is the one that will be found. It has to hang
+   * up rather than open the status sheet, and it has to look like a Stop.
+   */
+  await b.openStatus();
+  b.tap('cmo-talk');
+  await settle(60);
+  const second = b.peers[1];
+  ok('a second conversation could not be started after the first was hung up', second);
+  const bar = b.doc.querySelector('#cmo-fab #cmo-status');
+  ok(
+    `the bar does not offer a way to end the call: ${JSON.stringify(bar?.getAttribute('aria-label'))}`,
+    /hang up/i.test(bar?.getAttribute('aria-label') ?? '') &&
+      bar?.classList.contains('cmo-speaking'),
+  );
+  b.tap('cmo-status');
+  await settle(40);
+  ok('the bar did not end the call', second?.closed > 0);
+  /*
+   * And it ended it *as* the tap, rather than by opening something else that happens to
+   * hang up on its way in. The difference is what is on screen afterwards: the
+   * transcript you were reading, or a fresh status sheet drawn over it — which is a
+   * second thing the tap did that nobody asked for, and a fetch with it.
+   */
+  ok(
+    'the bar drew the status sheet over the call instead of simply ending it, taking the ' +
+      'transcript with it',
+    b.doc.getElementById('cmo-talk-state') && !b.doc.getElementById('cmo-status-said'),
+  );
+  ok('the bar hung up without stopping the microphone', b.allStopped());
+  ok(
+    `the bar still says there is a call to end: ${JSON.stringify(bar?.getAttribute('aria-label'))}`,
+    !/hang up/i.test(bar?.getAttribute('aria-label') ?? '') &&
+      !bar?.classList.contains('cmo-speaking'),
+  );
+
+  /*
+   * Closing the sheet, and every other sheet drawn over it.
+   *
+   * A hidden sheet over a live session is a pocket call: there is no green bar across
+   * the top of a webview to find it by, and the sheet that holds the clock has gone.
+   */
+  await b.openStatus();
+  b.tap('cmo-talk');
+  await settle(60);
+  const third = b.peers[2];
+  ok(
+    'no conversation could be started for the Close case — the one before it is probably still live, which is itself the failure',
+    third,
+  );
+  b.tap('cmo-talk-close');
+  await settle(20);
+  ok('Close left the line open behind a dismissed sheet', third?.closed > 0);
+  ok('Close left the microphone live', b.allStopped());
+  ok(
+    'Close left the sheet on screen',
+    !b.doc.getElementById('cmo-sheet').classList.contains('cmo-open'),
+  );
+
+  await b.openStatus();
+  b.tap('cmo-talk');
+  await settle(60);
+  const fourth = b.peers[3];
+  ok(
+    'no conversation could be started for the a tap beside the sheet case — the one before it is probably still live, which is itself the failure',
+    fourth,
+  );
+  // A tap beside the sheet, which is how a sheet is usually dismissed on a phone.
+  b.doc.getElementById('cmo-sheet').dispatchEvent(new b.win.MouseEvent('click', { bubbles: true }));
+  await settle(20);
+  ok('a tap beside the sheet left the line open', fourth?.closed > 0);
+  ok('a tap beside the sheet left the microphone live', b.allStopped());
+
+  await b.openStatus();
+  b.tap('cmo-talk');
+  await settle(60);
+  const fifth = b.peers[4];
+  ok(
+    'no conversation could be started for the another sheet case — the one before it is probably still live, which is itself the failure',
+    fifth,
+  );
+  // Another sheet, drawn over the one holding the only Hang up button there is.
+  b.tap('cmo-layout');
+  await settle(20);
+  ok('a sheet drawn over the call left it running behind that sheet', fifth?.closed > 0);
+  ok('a sheet drawn over the call left the microphone live', b.allStopped());
+  b.tap('cmo-layout-close');
+  await settle(20);
+
+  // A dropped line, which is what a phone leaving a lift does.
+  await b.openStatus();
+  b.tap('cmo-talk');
+  await settle(60);
+  const sixth = b.peers[5];
+  ok(
+    'no conversation could be started for the a dropped line case — the one before it is probably still live, which is itself the failure',
+    sixth,
+  );
+  sixth?.drop();
+  await settle(20);
+  ok(
+    'a dropped line was not closed on this end — the session is still open as far as ' +
+      'OpenAI is concerned, and the minutes are still being counted',
+    sixth?.closed > 0,
+  );
+  ok('a dropped line left the microphone live', b.allStopped());
+  ok(
+    `a dropped line was not reported: ${JSON.stringify(b.text('cmo-talk-state'))}`,
+    /dropped/i.test(b.text('cmo-talk-state')),
+  );
+
+  // The workbench reloading itself, which happens on this surface every time the phone
+  // is switched away from and back. Nothing left alive could end the call afterwards.
+  await b.openStatus();
+  b.tap('cmo-talk');
+  await settle(60);
+  const seventh = b.peers[6];
+  ok(
+    'no conversation could be started for the the page going away case — the one before it is probably still live, which is itself the failure',
+    seventh,
+  );
+  b.win.dispatchEvent(new b.win.Event('pagehide'));
+  await settle(20);
+  ok('the page going away left a WebRTC session and a microphone behind it', seventh?.closed > 0);
+  ok('the page going away left the microphone live', b.allStopped());
+
+  // --------------------------------------------------------------- refusals
+  {
+    // The microphone, refused by the person. Nothing may be minted: a session reserved
+    // against the day's count and then abandoned is one spent on nothing.
+    const denied = bootTalk({ state: { micDenied: true } });
+    await settle(60);
+    await denied.openStatus();
+    denied.tap('cmo-talk');
+    await settle(60);
+    ok(
+      `a refused microphone still minted a credential: ${JSON.stringify(denied.order)}`,
+      denied.order.join(',') === 'mic',
+    );
+    ok('a refused microphone still opened a connection', denied.peers.length === 0);
+    ok(
+      `a refused microphone was not explained: ${JSON.stringify(denied.text('cmo-talk-state'))}`,
+      /microphone was not allowed/.test(denied.text('cmo-talk-state')),
+    );
+  }
+  {
+    // The day's allowance, which is the guard that keeps this from being a bill.
+    const spent = bootTalk({ state: { mintStatus: 429 } });
+    await settle(60);
+    await spent.openStatus();
+    spent.tap('cmo-talk');
+    await settle(60);
+    ok(
+      `the server's own sentence was replaced with a generic one: ${JSON.stringify(
+        spent.text('cmo-talk-state'),
+      )}`,
+      /40 conversations today/.test(spent.text('cmo-talk-state')),
+    );
+    ok('a refused mint left the microphone live', spent.allStopped());
+    ok('a refused mint still opened a connection', spent.peers.length === 0);
+  }
+  {
+    // OpenAI refusing the offer: an expired credential, a model that is not enabled.
+    const refused = bootTalk({ state: { sdpStatus: 403 } });
+    await settle(60);
+    await refused.openStatus();
+    refused.tap('cmo-talk');
+    await settle(60);
+    ok(
+      `an SDP refusal was not reported: ${JSON.stringify(refused.text('cmo-talk-state'))}`,
+      /403/.test(refused.text('cmo-talk-state')),
+    );
+    ok('an SDP refusal left the microphone live', refused.allStopped());
+    ok('an SDP refusal left the connection open', refused.peers[0]?.closed > 0);
+  }
+  {
+    /*
+     * Hanging up while the offer is still in flight.
+     *
+     * The credential has two minutes on it and the answer is about to arrive, so this is
+     * the one moment where a line can be opened seconds after it was ended — the
+     * generation check in `connectTalk` is the only thing that stops it.
+     */
+    const impatient = bootTalk({ state: { holdSdp: true } });
+    await settle(60);
+    await impatient.openStatus();
+    impatient.tap('cmo-talk');
+    await settle(60);
+    const held = impatient.peers[0];
+    ok('the connection was not made before the offer was sent', held);
+    impatient.tap('cmo-talk-end');
+    await settle(20);
+    impatient.state.releaseSdp?.();
+    await settle(40);
+    ok(
+      'an answer that arrived after Hang up was applied anyway, which opens a line ' +
+        'nobody is on',
+      held?.remote === null,
+    );
+    ok('hanging up mid-connect left the microphone live', impatient.allStopped());
+    ok(
+      `the sheet says the line is up after it was hung up mid-connect: ${JSON.stringify(
+        impatient.text('cmo-talk-state'),
+      )}`,
+      /hung up/i.test(impatient.text('cmo-talk-state')),
+    );
+  }
+  {
+    // Dictation, which is the other thing on this phone that wants the microphone — and
+    // which would type this conversation into Claude's composer, the one thing the sheet
+    // promises cannot happen.
+    const dictating = bootTalk();
+    await settle(60);
+    await dictating.openStatus();
+    dictating.doc.getElementById('cmo-mic').classList.add('cmo-rec');
+    dictating.tap('cmo-talk');
+    await settle(60);
+    ok(
+      `a conversation started over live dictation: ${JSON.stringify(dictating.order)}`,
+      dictating.order.length === 0 && dictating.peers.length === 0,
+    );
+    ok(
+      `the refusal was not explained on the sheet: ${JSON.stringify(
+        dictating.text('cmo-status-detail'),
+      )}`,
+      /microphone is live/.test(dictating.text('cmo-status-detail')),
+    );
+  }
+  {
+    /*
+     * The line closing by itself, which is the guard that matters most: a phone in a
+     * pocket with a paid microphone open is exactly what this must not become. The
+     * server's own limit is ten minutes; this one is handed a second of it.
+     */
+    const brief = bootTalk({ state: { maxMinutes: 1 / 60 } });
+    await settle(60);
+    await brief.openStatus();
+    brief.tap('cmo-talk');
+    await settle(60);
+    ok('no line to close', brief.peers[0]);
+    await settle(2300);
+    ok('the line did not close itself after its minutes ran out', brief.peers[0].closed > 0);
+    ok('a line closed by the clock left the microphone live', brief.allStopped());
+    ok(
+      `the sheet does not say why it ended: ${JSON.stringify(brief.text('cmo-talk-state'))}`,
+      /closed/i.test(brief.text('cmo-talk-state')),
+    );
+  }
+}
+
 // ------------------------------------------------------------------- results
 if (failures.length) {
   console.error(`\noverlay test: ${failures.length} failure(s) of ${checks} checks\n`);

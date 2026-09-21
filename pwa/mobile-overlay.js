@@ -53,7 +53,7 @@
    *
    * Bump it when this file changes in a way anyone would look for.
    */
-  const OVERLAY_BUILD = '2026-09-21.4';
+  const OVERLAY_BUILD = '2026-09-21.5';
 
   // -------------------------------------------- survive a browser refresh
   /*
@@ -399,6 +399,31 @@
     -webkit-user-select: text; user-select: text;
   }
   /*
+   * What the spoken conversation is not — the one line on that sheet that must not be
+   * skimmed, so it is not a .cmo-hint. A voice that cannot act is indistinguishable by
+   * ear from one that can, and the difference matters the moment somebody says "push
+   * that".
+   */
+  .cmo-warn {
+    margin: 0 0 10px; padding: 10px 12px; border-radius: 12px;
+    background: #2b211c; border: 1px solid #5a3a2a; color: #e8cfc2;
+    font-size: 12.5px; line-height: 1.45;
+  }
+  /* What was said, both halves of it. Scrollable and kept at the bottom: the newest
+     line is the one being spoken. */
+  .cmo-talk-log { margin: 8px 0 0; max-height: 34vh; overflow-y: auto; }
+  .cmo-talk-line {
+    margin: 0 0 6px; font-size: 13.5px; line-height: 1.45;
+    white-space: pre-wrap; overflow-wrap: anywhere;
+  }
+  /* Dimmed while it is still being heard: a half-heard sentence shown as final is how
+     you end up certain it said something it did not. */
+  .cmo-talk-line.cmo-partial { color: #a3a099; }
+  .cmo-talk-line .cmo-who {
+    display: inline-block; margin-right: 6px; color: #d97757;
+    font-size: 11px; text-transform: uppercase; letter-spacing: .06em;
+  }
+  /*
    * The other conversations in this project. Rows rather than a select, because
    * each one carries three things — what it is, what it is doing, and how long ago
    * — and because a thumb has to hit it on a phone.
@@ -475,7 +500,17 @@
    */
   let sheetGeneration = 0;
 
-  function openSheet(html) {
+  /**
+   * Put a sheet on screen.
+   *
+   * `keepTalking` is for the one sheet that is itself a live spoken conversation:
+   * every other sheet drawn over this panel hangs up first. That is not tidiness. The
+   * talk sheet holds the clock and the Hang up button, so a sheet drawn over it would
+   * leave a paid microphone open behind a panel with no visible end to it — and the
+   * sheet is dismissed by tapping beside it, which is not a deliberate act.
+   */
+  function openSheet(html, { keepTalking = false } = {}) {
+    if (!keepTalking) endTalk();
     sheetGeneration += 1;
     panel.innerHTML = html;
     sheet.classList.add('cmo-open');
@@ -483,6 +518,10 @@
   function closeSheet() {
     sheet.classList.remove('cmo-open');
     stopRecognition();
+    // Closing hangs up. Every other way out of a spoken conversation is in the talk
+    // section; this is the one that belongs to the sheet, and it covers the tap beside
+    // it as well as the Close button.
+    endTalk();
     // Dismissing the status sheet is how you stop it following the conversation
     // and reading out what arrives; see followStatusSheet.
     stopSheetPoll();
@@ -2630,6 +2669,14 @@
     // control in it reads as something being broken.
     const canSpeak = Boolean(said) && (speechAvailable() || serverVoiceReady());
     /*
+     * Talking it over is a separate capability from being read to, and offered
+     * separately: reading needs a voice on this box, talking needs an OpenAI key and a
+     * browser that can hold a WebRTC session. A deployment can have either without the
+     * other, so neither button stands in for the other's absence — and when there is
+     * nothing behind it there is no button, for the same reason as above.
+     */
+    const canTalk = Boolean(said) && talkReady();
+    /*
      * A tap is the only chance to make the audio element playable — see
      * `unlockAudio`. Doing it here, rather than only on the Read aloud button,
      * is what lets the sheet read out a message that arrives while it is open:
@@ -2673,6 +2720,7 @@
         ${canSpeak ? `<button class="cmo-action" id="cmo-speak">${
           speaking ? 'Stop' : 'Read aloud'
         }</button>` : ''}
+        ${canTalk ? '<button class="cmo-action cmo-alt" id="cmo-talk">\u{1F4AC} Talk it over</button>' : ''}
         <button class="cmo-action cmo-alt" id="cmo-status-refresh">Refresh</button>
         <button class="cmo-action cmo-alt" id="cmo-status-close">Close</button>
       </div>
@@ -2857,6 +2905,26 @@
         }
       });
     }
+
+    /*
+     * Talk it over — a spoken conversation about this message, with something that
+     * cannot act on it. See the talk section below for what it is and is not.
+     *
+     * Started straight out of the tap, like the read and for a harder reason: iOS
+     * refuses a `getUserMedia` that no gesture asked for, and there is no second
+     * chance at it. What it is handed is the message as it was written — fences and
+     * all, because the code in it is often the thing being asked about — and the prompt
+     * this conversation began with, if this page already has it.
+     *
+     * That prompt is not the turn before this message, and cannot be: /api/claude-status
+     * answers with the last assistant message and, separately, the conversation's
+     * opening prompt, with nothing in between. The opening prompt is the honest answer
+     * to "what is this about" on this surface, and an empty one is treated by the server
+     * as not provided rather than guessed at.
+     */
+    panel.querySelector('#cmo-talk')?.addEventListener('click', () => {
+      startTalk(said, firstPrompts.get(s.sessionId)?.text || '');
+    });
 
     /*
      * A button for each code block, because "Code block." is not always the answer.
@@ -3368,12 +3436,32 @@
     serverSpeech.voices.length > 0 &&
     typeof window.Audio === 'function';
 
+  /*
+   * What the same route said about a spoken conversation: whether this box has an
+   * OpenAI key at all, which model and voice it would use, and how much of the day's
+   * allowance is left. Null means it cannot hold one — no key, an older deployment, a
+   * lapsed chat-service session — and that is a sheet with no such button on it rather
+   * than a button that explains itself after the tap.
+   */
+  let serverTalk = null;
+  /*
+   * Whether this page has ever had an answer from /api/voice-status.
+   *
+   * Not the same question as `serverSpeech`: a box can answer "no voice, and here is a
+   * spoken conversation" or the other way round, and both are answers. The bar's tap
+   * re-asks only when nothing has answered yet — which is the normal way round on this
+   * surface, since the editor has its own password and the chat service has another.
+   */
+  let voicesAnswered = false;
+
   async function loadSpeechVoices() {
     try {
       const res = await fetch('/api/voice-status', { headers: { Accept: 'application/json' } });
       if (!res.ok) return;
       const body = await res.json();
+      voicesAnswered = true;
       serverSpeech = body?.speech?.configured ? body.speech : null;
+      serverTalk = body?.realtime?.configured ? body.realtime : null;
     } catch {
       /* no server voice available; speechSynthesis is the answer and needs no fetch */
     }
@@ -4174,6 +4262,437 @@
     return '';
   }
 
+  // ------------------------------------------ talking a message over out loud
+  /*
+   * A spoken conversation about the message on the sheet, with something that cannot
+   * act on it.
+   *
+   * Read aloud answers "say this to me". This answers the thing you want a second
+   * later — wait, go back to the part about the timeout — out loud, on a phone,
+   * without typing and without waiting for a turn. Three properties, all deliberate:
+   *
+   *   **It cannot reach Claude.** The session is minted with no tools and an
+   *   instruction saying as much (chat-service/realtime.js), and there is nothing on
+   *   this side that could carry what was said into the panel: no chord is pressed, no
+   *   text is written, nothing is sent to this box at all once the line is up. That is
+   *   the point rather than a limitation — a voice channel is the last place a command
+   *   should be issued from, because a misheard sentence there is a force-push nobody
+   *   typed and nobody saw. The sheet says so above the transcript, where it cannot be
+   *   missed.
+   *
+   *   **The audio does not pass through this box.** The browser holds a two-minute
+   *   credential and opens WebRTC straight to OpenAI. Latency is the whole feature, and
+   *   a relay on an instance that is also running a compiler is latency.
+   *
+   *   **It ends by itself.** It is metered by the minute, so the server counts sessions
+   *   against the day and this end hangs up on its own timer — and every way out of it
+   *   stops the microphone, because the failure mode of a voice call is a pocket that
+   *   is still connected.
+   */
+  const talk = {
+    pc: null,           // RTCPeerConnection, and the answer to "is one up?"
+    channel: null,      // the `oai-events` channel, which carries both transcripts
+    mic: null,          // the MediaStream, kept so its tracks can actually be stopped
+    audio: null,        // the element playing the far end, made once and reused
+    started: 0,
+    timer: null,
+    /*
+     * Which conversation is the current one. Every handler and everything after an
+     * await checks it, for the same reason the read does: a credential minted or an
+     * answer arriving after Hang up must not open a line nobody asked for.
+     */
+    generation: 0,
+    lines: [],          // { who: 'you' | 'voice', text, partial }
+  };
+
+  /*
+   * Everything this needs, asked of the box and of the browser separately.
+   *
+   * The key is the box's answer and WebRTC is the browser's, and they fail differently:
+   * a deployment with no OpenAI key cannot offer this at all, while a webview without
+   * RTCPeerConnection or getUserMedia would take the tap and then do nothing. Either
+   * way there is no button, because an inert control on this sheet reads as something
+   * being broken.
+   */
+  const talkReady = () =>
+    Boolean(serverTalk?.configured) &&
+    typeof window.RTCPeerConnection === 'function' &&
+    typeof window.Audio === 'function' &&
+    typeof navigator.mediaDevices?.getUserMedia === 'function';
+
+  /** Is a conversation up, or on its way up? */
+  const talking = () => Boolean(talk.pc);
+
+  /** Stop a stream. The stream is not the microphone; its tracks are. */
+  function stopTracks(stream) {
+    for (const track of stream?.getTracks?.() || []) {
+      try {
+        track.stop();
+      } catch {
+        /* already stopped, which is the state being asked for */
+      }
+    }
+  }
+
+  /**
+   * Start one, from inside the tap.
+   *
+   * `text` is the message as it was written, fences and all. `prompt` is what was asked
+   * to produce it, or '' when this page has no answer to that — the server treats an
+   * empty one as not provided rather than inventing context for it.
+   */
+  async function startTalk(text, prompt = '') {
+    if (talking()) {
+      endTalk();
+      return;
+    }
+    if (!talkReady() || !String(text || '').trim()) return;
+    /*
+     * Never over a live microphone, and for a harder reason than the read has: there is
+     * one microphone on this phone, and the recognizer would dictate this conversation
+     * into Claude's composer — which is the one thing this feature promises cannot
+     * happen.
+     */
+    if (document.getElementById('cmo-mic')?.classList.contains('cmo-rec')) {
+      sayWhy('Not while the microphone is live — dictation and a spoken conversation cannot share it.');
+      return;
+    }
+    stopSpeech();   // one voice at a time, and this one answers back
+
+    const generation = ++talk.generation;
+    talk.lines = [];
+    openTalkSheet();
+    paintTalkState('Asking for a line…');
+    paintTalkTranscript();
+    paintTalkBar();
+
+    try {
+      /*
+       * The microphone first, before the credential.
+       *
+       * It is the one step a person rather than a server can refuse, and asking for it
+       * first is what makes a refusal free: the server reserves a session against the
+       * day's count before it calls OpenAI, deliberately, so one minted and then
+       * abandoned has been spent.
+       */
+      const mic = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      });
+      if (generation !== talk.generation) {
+        stopTracks(mic);
+        return;
+      }
+      talk.mic = mic;
+
+      const res = await fetch('/api/realtime/token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text, prompt }),
+      });
+      if (!res.ok) throw new Error(await refusalReason(res));
+      const minted = await res.json();
+      if (generation !== talk.generation) return;
+      if (!minted?.value) throw new Error('the server minted nothing to connect with');
+
+      await connectTalk(minted, generation);
+    } catch (err) {
+      if (generation !== talk.generation) return;
+      // Hang up first: whatever failed, the microphone may already be live, and the
+      // sentence below is the only thing that will be on screen afterwards.
+      endTalk();
+      paintTalkState(
+        `Not connected: ${
+          err?.name === 'NotAllowedError'
+            ? 'the microphone was not allowed'
+            : err?.message || 'the connection failed'
+        }`,
+      );
+    }
+  }
+
+  /**
+   * Open the session with the minted credential.
+   *
+   * Nothing about it is configured from here — the model, the voice, the turn
+   * detection, the instructions and the absence of tools are all baked into the
+   * credential on the server, so a tampered overlay gets a session shaped exactly the
+   * same way. This end sends an offer and plays what comes back.
+   */
+  async function connectTalk(minted, generation) {
+    const pc = new window.RTCPeerConnection();
+    talk.pc = pc;
+    // From here on there is something to hang up, so the bar says so — before the SDP
+    // round trip rather than after it, because that is where a connection stalls.
+    paintTalkBar();
+
+    /*
+     * One element for the life of the page, like the read's, and for the same reason:
+     * on iOS the permission to make a sound belongs to an element.
+     *
+     * A stream rather than a file, so it is never given a `src` and code-server's
+     * `media-src 'self'` has nothing to refuse — `srcObject` is not a URL. `playsInline`
+     * on the property and the attribute both: the attribute is what older WebKit reads,
+     * and without it iOS takes over the whole screen with an audio call.
+     */
+    if (!talk.audio) {
+      talk.audio = new window.Audio();
+      talk.audio.autoplay = true;
+      talk.audio.playsInline = true;
+      talk.audio.setAttribute?.('playsinline', '');
+    }
+    pc.ontrack = (event) => {
+      if (generation !== talk.generation) return;
+      talk.audio.srcObject = event.streams?.[0] || null;
+      talk.audio.play?.()?.catch?.(() => {
+        // The tap that started this is the gesture, so this is nearly impossible — and
+        // a connected session in silence is worth a sentence either way.
+        paintTalkState('Connected, but this browser will not play the audio');
+      });
+    };
+    pc.onconnectionstatechange = () => {
+      if (generation !== talk.generation) return;
+      if (pc.connectionState === 'connected') paintTalkState('Listening');
+      if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
+        endTalk();
+        paintTalkState('The line dropped');
+      }
+    };
+
+    for (const track of talk.mic.getTracks()) pc.addTrack(track, talk.mic);
+
+    // The event channel carries both halves of the transcript, which is what makes this
+    // auditable at all: you can read what it heard you say.
+    const channel = pc.createDataChannel('oai-events');
+    talk.channel = channel;
+    channel.onmessage = (event) => onTalkEvent(event, generation);
+
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    const answer = await fetch(
+      `https://api.openai.com/v1/realtime/calls?model=${encodeURIComponent(minted.model || '')}`,
+      {
+        method: 'POST',
+        body: offer.sdp,
+        headers: { Authorization: `Bearer ${minted.value}`, 'Content-Type': 'application/sdp' },
+      },
+    );
+    if (!answer.ok) throw new Error(`OpenAI refused the connection (${answer.status})`);
+    const sdp = await answer.text();
+    // Hung up while that was in flight: the credential has minutes left on it and
+    // applying this would open the line anyway, seconds after it was ended.
+    if (generation !== talk.generation) return;
+    await pc.setRemoteDescription({ type: 'answer', sdp });
+
+    talk.started = Date.now();
+    const minutes = Number(minted.maxMinutes) || 10;
+    talk.timer = setInterval(() => {
+      paintTalkClock();
+      if (Date.now() - talk.started >= minutes * 60000) {
+        endTalk();
+        paintTalkState(`The line closed after ${minutes} minutes`);
+      }
+    }, 1000);
+
+    paintTalkState('Listening');
+    paintTalkClock();
+    /*
+     * What it costs and when it stops, on the sheet while it runs. This is the one
+     * thing on this surface that spends money by the minute, and the day's count is
+     * kept by the server rather than here — so it is reported rather than assumed.
+     */
+    const spent = minted.budget;
+    const note = panel.querySelector('#cmo-talk-note');
+    if (note) {
+      note.textContent = [
+        `${minted.voice || 'a voice'} on ${minted.model || 'OpenAI'}, billed by the minute.`,
+        spent ? `${spent.sessions} of ${spent.limit} conversations today.` : '',
+        `The line closes by itself after ${minutes} minutes.`,
+      ]
+        .filter(Boolean)
+        .join(' ');
+    }
+  }
+
+  /**
+   * What the far end says about itself: the transcripts, and the errors.
+   *
+   * The deltas as well as the completed events, so a sentence appears while it is being
+   * said — dimmed until it is final, because a half-heard line shown as finished is how
+   * you end up certain it said something it did not.
+   */
+  function onTalkEvent(event, generation) {
+    if (generation !== talk.generation) return;
+    let msg;
+    try {
+      msg = JSON.parse(event.data);
+    } catch {
+      return;   // not ours to understand
+    }
+    const type = String(msg?.type || '');
+
+    // What it is saying. The event was renamed between API versions and both spellings
+    // are still in the wild, so this matches the shape rather than one name.
+    if (/^response\.(output_)?audio_transcript\.delta$/.test(type)) {
+      addTalkText('voice', msg.delta || '', true);
+      return;
+    }
+    if (/^response\.(output_)?audio_transcript\.done$/.test(type)) {
+      finishTalkLine('voice', msg.transcript);
+      return;
+    }
+    // And what it heard you say, which is the half worth having on screen.
+    if (type === 'conversation.item.input_audio_transcription.delta') {
+      addTalkText('you', msg.delta || '', true);
+      return;
+    }
+    if (type === 'conversation.item.input_audio_transcription.completed') {
+      finishTalkLine('you', msg.transcript);
+      return;
+    }
+    if (type === 'error') {
+      paintTalkState(`Trouble: ${msg.error?.message || 'the far end reported an error'}`);
+    }
+  }
+
+  /** Add to the open line for `who`, starting one if the last line was the other's. */
+  function addTalkText(who, text, partial) {
+    if (!text) return;
+    const last = talk.lines[talk.lines.length - 1];
+    if (last && last.who === who && last.partial) last.text += text;
+    else talk.lines.push({ who, text, partial });
+    paintTalkTranscript();
+  }
+
+  /** Close the open line, preferring the final transcript over the deltas. */
+  function finishTalkLine(who, transcript) {
+    const last = talk.lines[talk.lines.length - 1];
+    const final = String(transcript || '').trim();
+    if (last && last.who === who && last.partial) {
+      if (final) last.text = final;
+      last.partial = false;
+    } else if (final) {
+      talk.lines.push({ who, text: final, partial: false });
+    }
+    paintTalkTranscript();
+  }
+
+  /**
+   * Hang up.
+   *
+   * Called by the button, by the bar, by Close, by a tap beside the sheet, by any sheet
+   * drawn over this one, by a dropped line, by the timer, by every refusal and by the
+   * page going away — which is the whole point: there is no path out of a conversation
+   * that leaves the microphone open. Safe to call when there is nothing to end, because
+   * most of those callers cannot know whether there is.
+   */
+  function endTalk() {
+    talk.generation += 1;
+    if (talk.timer) clearInterval(talk.timer);
+    talk.timer = null;
+    try {
+      talk.channel?.close?.();
+    } catch {
+      /* already gone */
+    }
+    try {
+      talk.pc?.close?.();
+    } catch {
+      /* already gone */
+    }
+    // The tracks, not the stream: a MediaStream dropped without stopping its tracks
+    // leaves the recording indicator lit and the microphone live.
+    stopTracks(talk.mic);
+    // Kept, not replaced — the element holds this page's permission to make a sound.
+    if (talk.audio) talk.audio.srcObject = null;
+    talk.pc = null;
+    talk.channel = null;
+    talk.mic = null;
+    talk.started = 0;
+    paintTalkState('Hung up');
+    paintTalkClock();
+    paintTalkBar();
+  }
+
+  /*
+   * The sheet, which is the whole of this feature's screen: what it is not, what it is
+   * doing, how long it has been doing it, what was said, and two ways to end it.
+   *
+   * One string of static HTML with nothing from outside this file in it — the rule on
+   * this surface — and everything else written through textContent afterwards. A
+   * transcript is the furthest thing from trusted text there is: it is what a voice
+   * model heard somebody say, on the other side of a network.
+   */
+  function openTalkSheet() {
+    openSheet(
+      `<p class="cmo-title">Talking it over</p>
+      <p class="cmo-warn">A side channel, and not Claude. It can hear you and talk about
+      this message — explain it, read the code out loud, translate it — and that is all
+      it can do: it cannot run anything, change a file, or tell Claude what you said.
+      Nothing said here reaches the conversation.</p>
+      <p class="cmo-status" id="cmo-talk-state"></p>
+      <p class="cmo-hint" id="cmo-talk-clock"></p>
+      <div class="cmo-talk-log" id="cmo-talk-log"></div>
+      <div class="cmo-row">
+        <button class="cmo-action" id="cmo-talk-end">Hang up</button>
+        <button class="cmo-action cmo-alt" id="cmo-talk-close">Close</button>
+      </div>
+      <p class="cmo-hint" id="cmo-talk-note"></p>`,
+      { keepTalking: true },
+    );
+    // Hang up and stay: the transcript is worth reading after the line has gone.
+    panel.querySelector('#cmo-talk-end').addEventListener('click', () => endTalk());
+    panel.querySelector('#cmo-talk-close').addEventListener('click', closeSheet);
+  }
+
+  function paintTalkState(text) {
+    const el = panel.querySelector('#cmo-talk-state');
+    if (el) el.textContent = text;
+  }
+
+  function paintTalkClock() {
+    const el = panel.querySelector('#cmo-talk-clock');
+    if (!el) return;
+    if (!talk.started) {
+      el.textContent = '';
+      return;
+    }
+    const secs = Math.floor((Date.now() - talk.started) / 1000);
+    el.textContent = `${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, '0')} on this line`;
+  }
+
+  function paintTalkTranscript() {
+    const box = panel.querySelector('#cmo-talk-log');
+    if (!box) return;
+    box.textContent = '';
+    for (const line of talk.lines) {
+      const el = document.createElement('p');
+      el.className = `cmo-talk-line${line.partial ? ' cmo-partial' : ''}`;
+      const who = document.createElement('span');
+      who.className = 'cmo-who';
+      who.textContent = line.who === 'you' ? 'you' : 'the voice';
+      el.append(who, document.createTextNode(line.text));
+      box.appendChild(el);
+    }
+    box.scrollTop = box.scrollHeight;
+  }
+
+  /**
+   * Reflect a live line on the bar, which is the one control that outlives the sheet.
+   *
+   * Deliberately the same look as reading aloud — a filled square where the status dot
+   * usually is — because it means the same thing to a thumb: this is how you make it
+   * stop. The two cannot both be true; `startTalk` stops the read before it begins.
+   */
+  function paintTalkBar() {
+    const live = talking();
+    statusBtn.classList.toggle('cmo-speaking', live || speaking);
+    statusBtn.innerHTML = live || speaking ? '&#9632;' : '&#9673;';
+    statusBtn.setAttribute(
+      'aria-label',
+      live ? 'Hang up the spoken conversation' : speaking ? 'Stop reading aloud' : 'Is Claude working?',
+    );
+  }
+
   // -------------------------------------------------------------- wiring
   document.getElementById('cmo-mic').addEventListener('click', () => {
     if (recognition) {
@@ -4199,6 +4718,18 @@
       stopSpeech();
       return;
     }
+    /*
+     * And while a spoken conversation is up, it is Hang up.
+     *
+     * Same reason, one step worse: the sheet can be dismissed with the line still open,
+     * and this bar is then the only control on screen that knows about it. A phone with
+     * a live microphone and no visible way to end the call is the worst thing this
+     * feature could leave behind.
+     */
+    if (talking()) {
+      endTalk();
+      return;
+    }
     // Before the await, not after it: this is the gesture, and by the time the
     // status has been fetched iOS no longer counts anything as one. See
     // `unlockAudio` — the sheet's own read, and the auto-read, both depend on it.
@@ -4215,7 +4746,7 @@
      * reloaded. The ask is cheap and the server caches its own answer, including
      * the failure.
      */
-    if (!serverSpeech) await loadSpeechVoices();
+    if (!voicesAnswered) await loadSpeechVoices();
     openStatus();
   });
   chip.addEventListener('click', () => {
@@ -4259,6 +4790,13 @@
    * it either keeps speaking or is resumed by the OS.
    */
   window.addEventListener('pagehide', stopSpeech);
+  /*
+   * And hang up. Not merely tidiness: the workbench reloads itself on this surface
+   * routinely — every bfcache restore — and a WebRTC session whose page has gone has
+   * nothing left that could end it, while the microphone stays open and the minutes
+   * keep being billed.
+   */
+  window.addEventListener('pagehide', endTalk);
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState !== 'visible') writeDictation();
   });
