@@ -26,6 +26,7 @@ import {
   resetSpeech,
   SILENT_WAV,
 } from './speak.js';
+import { mintSession, realtimeStatus } from './realtime.js';
 import { claudeStatus, firstPromptFor } from './claude-status.js';
 import {
   manifestForProject,
@@ -483,7 +484,56 @@ const server = http.createServer(async (req, res) => {
       json(res, 200, {
         ...(await voiceStatus()),
         speech: await speechStatus({ lang: url.searchParams.get('lang') || 'en' }),
+        // And whether this box can hold a spoken conversation about a message,
+        // which is a separate question from whether it can read one out: the same
+        // key, a different model, and its own daily count. A client that only asked
+        // about `speech` would offer a button that answers 503.
+        realtime: await realtimeStatus(),
       });
+      return;
+    }
+
+    /*
+     * Start a spoken conversation about one finished message.
+     *
+     * This mints a two-minute credential for the browser to open a WebRTC session
+     * with OpenAI *directly* — the audio never passes through this box, because a
+     * relay on an instance that is also running a compiler is latency, and latency
+     * is the whole feature. See realtime.js for why the conversation is deliberately
+     * unable to reach Claude, and for what bounds the cost.
+     *
+     * Behind the session gate like every other /api/ route: `OPEN_PATHS` in auth.js
+     * is an allowlist, so this is authenticated by not being on it. That matters more
+     * here than elsewhere — the response body is a credential for a paid third-party
+     * service — hence `no-store` as well, so it is not written to a disk cache on a
+     * shared phone.
+     *
+     * The client chooses nothing that costs money: the model, the session's length,
+     * the instructions and the absence of tools are all decided in realtime.js. What
+     * it sends is the message to talk about, the prompt that produced it, and a voice
+     * name — and the voice is checked against a list rather than passed through.
+     */
+    if (pathname === '/api/realtime/token' && req.method === 'POST') {
+      const body = JSON.parse((await readBody(req, 64 * 1024)).toString() || '{}');
+      try {
+        const minted = await mintSession({
+          text: body.text,
+          prompt: body.prompt,
+          voice: body.voice,
+          lang: body.lang,
+        });
+        const payload = JSON.stringify(minted);
+        res.writeHead(200, {
+          'Content-Type': 'application/json; charset=utf-8',
+          'Content-Length': Buffer.byteLength(payload),
+          'Cache-Control': 'no-store',
+        });
+        res.end(payload);
+      } catch (err) {
+        if (err?.name !== 'RealtimeError') throw err;
+        if (err.status === 403 || err.status >= 500) console.warn('realtime:', err.message);
+        json(res, err.status, { error: err.message });
+      }
       return;
     }
 

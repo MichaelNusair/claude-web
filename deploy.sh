@@ -241,6 +241,20 @@ step "Checking the voice that reads messages aloud"
 ) || { echo "voice tests failed — not deploying." >&2; exit 1; }
 
 # ---------------------------------------------------------------------------
+step "Checking the spoken conversation"
+# ---------------------------------------------------------------------------
+# This one mints a credential for a browser to talk to OpenAI directly, and the
+# conversation it opens deliberately cannot reach Claude — no tools, no import that
+# could. Most of what this checks is that boundary, because the failure it prevents
+# is a voice with no transcript saying "done, I pushed it" when nothing was pushed.
+# The rest is the money: the daily count is spent before the call and handed back if
+# it fails. Runs against a fake OpenAI — no key, no realtime minutes billed.
+(
+  cd chat-service
+  node realtime-test.js
+) || { echo "spoken conversation tests failed — not deploying." >&2; exit 1; }
+
+# ---------------------------------------------------------------------------
 step "Checking the project lifecycle"
 # ---------------------------------------------------------------------------
 # Removing a project deletes a directory tree, so this exercises the refusals

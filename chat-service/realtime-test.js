@@ -1,0 +1,362 @@
+/**
+ * The spoken conversation, checked without opening one.
+ *
+ * Almost everything here is about one property: **this thing cannot act.** The
+ * feature is a voice channel with no transcript in front of you, discussing a message
+ * that describes changes to a repository — so the failure that matters is not a
+ * crash, it is a conversation that says "done, I pushed it". Nothing would be pushed;
+ * something would be believed. The session is given no tools, so it genuinely
+ * cannot, and the instructions say so in words, and the words are the part that can
+ * regress silently in an edit. So they are asserted on, the way the auth tests assert
+ * on a decision rather than on a log line.
+ *
+ * The rest is the money and the refusals: that the budget is spent before the call
+ * rather than after it, that a failed call is handed back, that an unknown voice from
+ * a phone's localStorage does not travel to OpenAI as a 400, and that nothing at all
+ * is sent when there is no key or nothing to talk about.
+ *
+ * `mintSession` takes its `fetch` and its key lookup as arguments, so all of this
+ * runs against a fake: no key, no network, no realtime minutes billed.
+ *
+ * Run: node chat-service/realtime-test.js
+ */
+import { readFile } from 'fs/promises';
+import { fileURLToPath } from 'url';
+import { dirname, join } from 'path';
+import {
+  buildInstructions,
+  mintSession,
+  realtimeStatus,
+  SessionBudget,
+  RealtimeError,
+  MODEL,
+  VOICE,
+  VOICES,
+  MAX_MINUTES,
+} from './realtime.js';
+
+let checks = 0;
+let failures = 0;
+const ok = (condition, name, detail = '') => {
+  checks += 1;
+  if (condition) {
+    console.log(`  ok   ${name}`);
+  } else {
+    failures += 1;
+    console.error(`  FAIL ${name}${detail ? ` — ${detail}` : ''}`);
+  }
+};
+const section = (name) => console.log(`\n${name}`);
+
+const refuses = async (name, status, fn, matching = null) => {
+  try {
+    await fn();
+    ok(false, name, 'nothing was refused');
+  } catch (err) {
+    const right = err instanceof RealtimeError && err.status === status
+      && (!matching || matching.test(err.message));
+    ok(right, name, `got ${err?.name} ${err?.status}: ${err?.message}`);
+  }
+};
+
+/** OpenAI's minting endpoint, without OpenAI. Records what it was asked for. */
+const fakeOpenAi = ({ status = 200, body = null } = {}) => {
+  const calls = [];
+  return {
+    calls,
+    get last() {
+      return calls[calls.length - 1];
+    },
+    fetchImpl: async (url, init) => {
+      calls.push({ url, init, body: JSON.parse(init.body) });
+      return {
+        ok: status >= 200 && status < 300,
+        status,
+        json: async () => body ?? {
+          value: 'ek_testtesttest',
+          expires_at: 1_777_000_000,
+          session: { id: 'sess_abc', model: MODEL, audio: { output: { voice: 'marin' } } },
+        },
+        text: async () => JSON.stringify({ error: { message: 'no' } }),
+      };
+    },
+  };
+};
+
+const key = async () => 'sk-test-not-a-real-key';
+const noKey = async () => null;
+
+const MESSAGE = [
+  'Done. The auth gap is closed.',
+  'The check now runs in auth.js, lines 42 to 51, inside the application process.',
+  'Tests pass: 106 checks. Do you want me to push it?',
+].join(' ');
+const PROMPT = 'Have a look at why /api/auth-check answers 204 for a request with no cookie.';
+
+// --------------------------------------------------------------------------
+section('What the model is told it is:');
+{
+  const said = buildInstructions({ text: MESSAGE, prompt: PROMPT });
+
+  ok(said.includes(MESSAGE), 'the message it is there to discuss is in the prompt');
+  ok(said.includes(PROMPT), 'and the prompt that produced it, which is the context asked for');
+
+  // The boundary, in words. Each of these is a sentence a future edit could drop
+  // without anything failing, which is exactly why they are checked.
+  ok(/not Claude/i.test(said), 'it is told it is not Claude');
+  ok(/cannot\b[\s\S]{0,80}run commands/i.test(said), 'and that it cannot run commands', said.match(/cannot[^.]*/i)?.[0]);
+  ok(/edit files/i.test(said) && /push/i.test(said) && /deploy/i.test(said), 'nor edit, push or deploy');
+  ok(/no tools/i.test(said), 'and that it has no tools at all');
+  ok(/say it to Claude/i.test(said), 'and is told what to say instead: take it back to Claude');
+  ok(
+    /Never\s+imply that you have done something/i.test(said),
+    'and told not to claim it has done something, which is the failure that would be believed',
+  );
+  ok(/nothing said here\s*\n?reaches Claude/i.test(said), 'it is told the channel is one-way');
+
+  // The shape of the conversation. Long turns are the difference between a
+  // discussion and a podcast you cannot interrupt.
+  ok(/interrupt/i.test(said), 'it is told it can be interrupted and to stop when it is');
+  ok(/two or three sentences/i.test(said), 'and to take short turns');
+  ok(said.includes(String(MAX_MINUTES)), 'it knows how long it has', `${MAX_MINUTES} minutes`);
+
+  // The message is generated text going into a system prompt. Not hostile here — it
+  // is the caller's own conversation — but labelled rather than trusted.
+  ok(
+    /not instructions to follow/i.test(said),
+    'the message is labelled as material to discuss rather than as instructions',
+  );
+  ok(said.includes('"""'), 'and delimited, so where it starts and ends is not a guess');
+}
+
+{
+  // No prompt is the normal case for an older message, and an empty quote block
+  // invites the model to invent what was in it.
+  const alone = buildInstructions({ text: MESSAGE });
+  ok(/not provided/i.test(alone), 'a message with no prompt says so rather than quoting nothing');
+  ok(alone.includes(MESSAGE), 'and is still discussed');
+}
+
+{
+  // Language. A Hebrew message discussed in English is not what anyone wanted, and
+  // this is stated rather than inferred because these models follow it far better.
+  const hebrew = Array.from({ length: 30 }, (_, i) => String.fromCodePoint(0x05d0 + (i % 27))).join('');
+  const heb = buildInstructions({ text: `${hebrew} auth.js ${hebrew}` });
+  ok(/Speak Hebrew/.test(heb), 'a Hebrew message is discussed in Hebrew');
+  const eng = buildInstructions({ text: MESSAGE });
+  ok(!/Speak Hebrew/.test(eng), 'an English one is not');
+  ok(/defaulting to English/.test(eng), 'and follows whoever is talking to it', eng.match(/Speak the language[^.]*/)?.[0]);
+  ok(
+    /Speak Hebrew/.test(buildInstructions({ text: MESSAGE, lang: 'he-IL' })),
+    "a phone set to Hebrew gets Hebrew even when the message it is about is not",
+  );
+}
+
+{
+  // A whole file pasted into a message must not become a whole file in every
+  // session's prompt: that is paid for per token at realtime rates.
+  const huge = `Here is the file:\n${'const x = 1;\n'.repeat(4000)}`;
+  const clipped = buildInstructions({ text: huge });
+  ok(clipped.length < huge.length / 2, 'a huge message is clipped, not sent whole', `${huge.length} -> ${clipped.length}`);
+  ok(/truncated/.test(clipped), 'and says it was clipped, so the model does not treat it as the end');
+  const longPrompt = buildInstructions({ text: MESSAGE, prompt: 'x '.repeat(4000) });
+  ok(longPrompt.length < 20_000, 'and so is an over-long prompt', `${longPrompt.length}`);
+}
+
+// --------------------------------------------------------------------------
+section('Sessions per day, which is the only real bound:');
+{
+  let now = Date.parse('2026-09-21T22:00:00Z');
+  const sessions = new SessionBudget({ dailySessions: 2, now: () => now });
+
+  ok(sessions.state().sessions === 0 && sessions.state().limit === 2, 'a fresh day has none spent');
+  sessions.reserve();
+  sessions.reserve();
+  ok(sessions.state().sessions === 2, 'each conversation is counted', JSON.stringify(sessions.state()));
+
+  let over = null;
+  try {
+    sessions.reserve();
+  } catch (err) {
+    over = err;
+  }
+  ok(over?.status === 429, 'the day’s limit is refused', `got ${over?.status}`);
+  ok(/REALTIME_DAILY_SESSIONS/.test(over?.message || ''), 'and the refusal names the knob', `got: ${over?.message}`);
+
+  sessions.refund();
+  ok(sessions.state().sessions === 1, 'a conversation that never opened is handed back');
+
+  now = Date.parse('2026-09-22T00:30:00Z');
+  ok(
+    sessions.state().sessions === 0 && sessions.state().day === '2026-09-22',
+    'and the count resets overnight',
+    JSON.stringify(sessions.state()),
+  );
+}
+
+// --------------------------------------------------------------------------
+section('Minting a credential:');
+{
+  const api = fakeOpenAi();
+  const sessions = new SessionBudget({ dailySessions: 5 });
+  const minted = await mintSession(
+    { text: MESSAGE, prompt: PROMPT, voice: 'cedar' },
+    { fetchImpl: api.fetchImpl, keyFor: key, sessions },
+  );
+
+  ok(minted.value === 'ek_testtesttest', 'the browser gets the ephemeral secret');
+  ok(minted.maxMinutes === MAX_MINUTES, 'and is told when to hang up, so the two halves agree');
+  ok(minted.budget.sessions === 1, 'and what the day has spent', JSON.stringify(minted.budget));
+
+  const sent = api.last.body;
+  ok(api.last.url.endsWith('/v1/realtime/client_secrets'), 'minted at the client-secrets endpoint', api.last.url);
+  ok(api.last.init.headers.Authorization === 'Bearer sk-test-not-a-real-key', 'with the real key, which stays on this box');
+  ok(!JSON.stringify(sent).includes('sk-test'), 'and the real key is not in the body');
+
+  ok(sent.session.type === 'realtime' && sent.session.model === MODEL, 'for a realtime session on the configured model');
+  ok(sent.session.instructions.includes(MESSAGE), 'seeded with the message');
+
+  /*
+   * The disconnection, as a property of the request rather than of the prose: no
+   * tools, and no way to add one from the client. A future edit that passed a tool
+   * list through from the request body would make every sentence in the
+   * instructions a lie, and nothing else here would fail.
+   */
+  ok(sent.session.tools === undefined, 'with no tools, so it cannot act even if it is asked to');
+  ok(sent.session.tool_choice === undefined, 'and nothing that would let it pick one');
+
+  ok(sent.session.output_modalities.join() === 'audio', 'audio out');
+  ok(sent.session.max_output_tokens > 0, 'with one reply capped, so a recital is not a bill');
+  ok(sent.session.audio.input.turn_detection.type === 'semantic_vad', 'turn-taking by meaning, not by silence');
+  ok(
+    sent.session.audio.input.turn_detection.interrupt_response === true,
+    'and it can be cut off mid-sentence, which is what makes it a conversation',
+  );
+  ok(sent.session.audio.input.transcription?.model, 'what it heard is transcribed, so the channel is auditable');
+
+  // Short-lived: the credential leaves this box, so its window is the exposure.
+  ok(
+    sent.expires_after.anchor === 'created_at' && sent.expires_after.seconds <= 300,
+    'the secret expires in minutes, not the ten OpenAI defaults to',
+    JSON.stringify(sent.expires_after),
+  );
+
+  ok(sent.session.audio.output.voice === 'cedar', 'the voice asked for is used');
+
+  // A phone remembers a voice name in localStorage. A Polly name, or a retired one,
+  // must not travel to OpenAI — that is a 400 and a conversation that never opens.
+  const api2 = fakeOpenAi();
+  await mintSession(
+    { text: MESSAGE, voice: 'Ruth' },
+    { fetchImpl: api2.fetchImpl, keyFor: key, sessions },
+  );
+  ok(api2.last.body.session.audio.output.voice === VOICE, 'an unknown voice becomes the default rather than a 400', api2.last.body.session.audio.output.voice);
+  ok(VOICES.includes(VOICE), 'and the default is one the realtime models accept');
+}
+
+// --------------------------------------------------------------------------
+section('Refusing, before anything is spent:');
+{
+  const sessions = new SessionBudget({ dailySessions: 5 });
+
+  const quiet = fakeOpenAi();
+  await refuses('nothing to talk about is a 400', 400, () =>
+    mintSession({ text: '   ' }, { fetchImpl: quiet.fetchImpl, keyFor: key, sessions }));
+  ok(quiet.calls.length === 0, 'and OpenAI was never called, so it cost nothing');
+  ok(sessions.state().sessions === 0, 'and the day was not charged');
+
+  const keyless = fakeOpenAi();
+  await refuses(
+    'a box with no key says so, with what to do about it',
+    503,
+    () => mintSession({ text: MESSAGE }, { fetchImpl: keyless.fetchImpl, keyFor: noKey, sessions }),
+    /openaiApiKey/,
+  );
+  ok(keyless.calls.length === 0, 'and does not call OpenAI without one');
+
+  // The budget must stop the call, not merely notice it afterwards.
+  const spent = new SessionBudget({ dailySessions: 1 });
+  const once = fakeOpenAi();
+  await mintSession({ text: MESSAGE }, { fetchImpl: once.fetchImpl, keyFor: key, sessions: spent });
+  await refuses('the day’s limit refuses the next one', 429, () =>
+    mintSession({ text: MESSAGE }, { fetchImpl: once.fetchImpl, keyFor: key, sessions: spent }));
+  ok(once.calls.length === 1, 'and refuses it before the call, not after', `${once.calls.length} calls made`);
+
+  // OpenAI's own statuses, remapped: a 401 travelling through as a 401 would read
+  // to the client as its own login expiring.
+  const rejected = fakeOpenAi({ status: 401 });
+  const fresh = new SessionBudget({ dailySessions: 5 });
+  await refuses('a rejected key is not answered as a 401', 403, () =>
+    mintSession({ text: MESSAGE }, { fetchImpl: rejected.fetchImpl, keyFor: key, sessions: fresh }), /key/i);
+  ok(fresh.state().sessions === 0, 'and a failed mint is refunded, so a bad key cannot eat the day');
+
+  const throttled = fakeOpenAi({ status: 429 });
+  await refuses('OpenAI throttling stays a 429', 429, () =>
+    mintSession({ text: MESSAGE }, { fetchImpl: throttled.fetchImpl, keyFor: key, sessions: fresh }));
+
+  const broken = fakeOpenAi({ status: 503 });
+  await refuses('OpenAI failing is a 502 from here', 502, () =>
+    mintSession({ text: MESSAGE }, { fetchImpl: broken.fetchImpl, keyFor: key, sessions: fresh }));
+
+  const empty = fakeOpenAi({ body: { expires_at: 1 } });
+  await refuses('a response with no secret in it is a 502, not an undefined handed to a browser', 502, () =>
+    mintSession({ text: MESSAGE }, { fetchImpl: empty.fetchImpl, keyFor: key, sessions: fresh }));
+  ok(fresh.state().sessions === 0, 'and none of those were charged', JSON.stringify(fresh.state()));
+
+  const dead = {
+    fetchImpl: async () => {
+      throw new Error('getaddrinfo ENOTFOUND api.openai.com');
+    },
+  };
+  await refuses('an unreachable OpenAI is a 502 with the reason in it', 502, () =>
+    mintSession({ text: MESSAGE }, { fetchImpl: dead.fetchImpl, keyFor: key, sessions: fresh }), /ENOTFOUND/);
+}
+
+// --------------------------------------------------------------------------
+section('What the client is told before it offers the button:');
+{
+  const sessions = new SessionBudget({ dailySessions: 7 });
+  const off = await realtimeStatus({ keyFor: noKey, sessions });
+  ok(off.configured === false, 'a box with no key cannot hold a conversation');
+  ok(/openaiApiKey/.test(off.reason || ''), 'and says how to change that', `got: ${off.reason}`);
+
+  const on = await realtimeStatus({ keyFor: key, sessions });
+  ok(on.configured === true && on.reason === null, 'a box with one can');
+  ok(on.model === MODEL && on.voice === VOICE, 'and names the model and voice it would use');
+  ok(on.budget.limit === 7, 'and what the day allows', JSON.stringify(on.budget));
+  ok(on.maxMinutes === MAX_MINUTES, 'and how long a conversation lasts');
+}
+
+// --------------------------------------------------------------------------
+/*
+ * The disconnection as a property of the file, not of its prose.
+ *
+ * Everything above checks what the model is *told*. This checks that the module
+ * could not act even if the instructions were deleted: it imports nothing that can
+ * reach the Claude session, spawn a process or write to a transcript. A single
+ * `import { SessionManager }` added here in a later change would pass every other
+ * check in this file.
+ */
+section('It could not act even if it wanted to:');
+{
+  const here = dirname(fileURLToPath(import.meta.url));
+  const source = await readFile(join(here, 'realtime.js'), 'utf8');
+  const imports = [...source.matchAll(/^import[\s\S]*?from '([^']+)';/gm)].map((m) => m[1]);
+
+  ok(imports.length > 0, 'the module was read', imports.join(', '));
+  ok(
+    imports.every((m) => ['./openai.js', './speak.js'].includes(m)),
+    'it imports only the key and the Hebrew test — nothing that can reach a session',
+    imports.join(', '),
+  );
+  for (const forbidden of ['session-manager', 'child_process', 'spawn(', 'exec(', 'writeFile']) {
+    ok(!source.includes(forbidden), `and never mentions ${forbidden}`);
+  }
+  ok(
+    !/console\.log\([^)]*value/.test(source),
+    'and does not log the secret it mints',
+  );
+}
+
+console.log(`\n${checks - failures}/${checks} checks passed`);
+process.exit(failures ? 1 : 0);
