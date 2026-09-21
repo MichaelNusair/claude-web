@@ -49,10 +49,79 @@
  * Env: REALTIME_MODEL, REALTIME_VOICE, REALTIME_DAILY_SESSIONS,
  * REALTIME_SECRET_SECONDS, REALTIME_MAX_MINUTES.
  */
-import { openAiKey, openAiRefusal } from './openai.js';
+import {
+  azureRealtime,
+  azureRealtimeRefusal,
+  openAiKey,
+  openAiRefusal,
+} from './openai.js';
 import { needsMultilingualVoice } from './speak.js';
 
 const CLIENT_SECRETS_URL = 'https://api.openai.com/v1/realtime/client_secrets';
+const CALLS_URL = 'https://api.openai.com/v1/realtime/calls';
+
+/**
+ * Which of the two routes to the realtime models this box is holding, or `null`.
+ *
+ * Azure first, because it is the one that cannot reach a credit card — the reasoning
+ * is in `azureRealtime`. `REALTIME_PROVIDER=openai` or `=azure` pins it, which is
+ * how a box with both configured is tested against either.
+ *
+ * Everything that differs between them is decided here and nowhere else: the two
+ * URLs, the header the key travels in, what `model` means (a deployment name on
+ * Azure, a model name on OpenAI), and which vocabulary a refusal is explained in.
+ * The mint body below is identical for both — verified against a live Azure resource
+ * rather than assumed, down to `expires_after` and the input transcription model.
+ */
+async function pickProvider({ keyFor = openAiKey, azureFor = azureRealtime } = {}) {
+  const forced = String(process.env.REALTIME_PROVIDER || '').trim().toLowerCase();
+
+  if (forced !== 'openai') {
+    const azure = await azureFor();
+    if (azure) {
+      return {
+        kind: 'azure',
+        who: 'Azure OpenAI',
+        model: azure.deployment,
+        secretsUrl: `${azure.endpoint}/openai/v1/realtime/client_secrets`,
+        // No `?model=`: on Azure the deployment is fixed by the minted secret, and a
+        // query parameter here is ignored rather than honoured.
+        callUrl: `${azure.endpoint}/openai/v1/realtime/calls`,
+        headers: { 'api-key': azure.key, 'Content-Type': 'application/json' },
+        refusalFor: azureRealtimeRefusal,
+      };
+    }
+  }
+
+  if (forced !== 'azure') {
+    const key = await keyFor();
+    if (key) {
+      return {
+        kind: 'openai',
+        who: 'OpenAI',
+        model: MODEL,
+        secretsUrl: CLIENT_SECRETS_URL,
+        callUrl: `${CALLS_URL}?model=${encodeURIComponent(MODEL)}`,
+        headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
+        refusalFor: openAiRefusal,
+      };
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Why there is no key here, said in a way that names the fix.
+ *
+ * One sentence per route, because "there is no key" with two possible places to put
+ * one is the kind of message that costs an hour.
+ */
+const NO_PROVIDER =
+  'a spoken conversation needs either an Azure OpenAI realtime deployment or an ' +
+  'OpenAI key, and this box has neither — put `azureRealtimeEndpoint`, ' +
+  '`azureRealtimeKey` and `azureRealtimeDeployment`, or `openaiApiKey`, in the voice ' +
+  'secret and call /api/voice-status?refresh=1';
 
 /**
  * The flagship rather than the mini, because the thing being bought here is that it
@@ -250,20 +319,13 @@ const budget = new SessionBudget();
  */
 export async function mintSession(
   { text, prompt, voice, lang } = {},
-  { fetchImpl = fetch, keyFor = openAiKey, sessions = budget } = {},
+  { fetchImpl = fetch, keyFor = openAiKey, azureFor = azureRealtime, sessions = budget } = {},
 ) {
   const message = String(text ?? '').trim();
   if (!message) throw new RealtimeError('there is nothing to talk about', 400);
 
-  const key = await keyFor();
-  if (!key) {
-    throw new RealtimeError(
-      'a spoken conversation needs an OpenAI key, and there is none on this box — ' +
-        'put one in the `openaiApiKey` field of the voice secret and call ' +
-        '/api/voice-status?refresh=1',
-      503,
-    );
-  }
+  const provider = await pickProvider({ keyFor, azureFor });
+  if (!provider) throw new RealtimeError(NO_PROVIDER, 503);
 
   // The client picks a voice from a list this file owns, or gets the default. A name
   // straight from a phone's localStorage is not passed through to OpenAI: an
@@ -276,7 +338,8 @@ export async function mintSession(
     expires_after: { anchor: 'created_at', seconds: SECRET_SECONDS },
     session: {
       type: 'realtime',
-      model: MODEL,
+      // A deployment name on Azure, a model name on OpenAI. Same field either way.
+      model: provider.model,
       instructions: buildInstructions({ text: message, prompt, lang }),
       output_modalities: ['audio'],
       max_output_tokens: MAX_OUTPUT_TOKENS,
@@ -304,18 +367,24 @@ export async function mintSession(
   sessions.reserve();
   let res;
   try {
-    res = await fetchImpl(CLIENT_SECRETS_URL, {
+    res = await fetchImpl(provider.secretsUrl, {
       method: 'POST',
-      headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
+      headers: provider.headers,
       body: JSON.stringify(body),
       signal: AbortSignal.timeout(MINT_TIMEOUT_MS),
     });
   } catch (err) {
     sessions.refund();
     if (/abort|timeout/i.test(`${err?.name} ${err?.message}`)) {
-      throw new RealtimeError(`OpenAI took longer than ${MINT_TIMEOUT_MS}ms to answer`, 504);
+      throw new RealtimeError(
+        `${provider.who} took longer than ${MINT_TIMEOUT_MS}ms to answer`,
+        504,
+      );
     }
-    throw new RealtimeError(`could not reach OpenAI: ${err?.message || 'unknown error'}`, 502);
+    throw new RealtimeError(
+      `could not reach ${provider.who}: ${err?.message || 'unknown error'}`,
+      502,
+    );
   }
 
   if (!res.ok) {
@@ -325,21 +394,26 @@ export async function mintSession(
     // through as a 401 would read to the client as its own session expiring and
     // send it to the login page.
     const status = res.status === 429 ? 429 : res.status >= 500 ? 502 : 403;
-    throw new RealtimeError(openAiRefusal(res.status, detail), status);
+    throw new RealtimeError(provider.refusalFor(res.status, detail), status);
   }
 
   const minted = await res.json().catch(() => null);
   const value = minted?.value;
   if (!value) {
     sessions.refund();
-    throw new RealtimeError('OpenAI returned no client secret', 502);
+    throw new RealtimeError(`${provider.who} returned no client secret`, 502);
   }
 
   return {
     // The one field the browser needs, and the only place it appears. Not logged.
     value,
+    // Where to POST the SDP offer. Sent rather than built in the browser because it
+    // is the one part of this that differs per provider, and a client that hardcodes
+    // `api.openai.com` silently talks to the wrong vendor the day the box switches.
+    callUrl: provider.callUrl,
+    provider: provider.kind,
     expiresAt: minted.expires_at || null,
-    model: minted.session?.model || MODEL,
+    model: minted.session?.model || provider.model,
     voice: minted.session?.audio?.output?.voice || chosen,
     sessionId: minted.session?.id || null,
     maxMinutes: MAX_MINUTES,
@@ -355,19 +429,23 @@ export async function mintSession(
  * Answers rather than throwing, like `speechStatus`: the client's response to "no"
  * is to not offer the button, which is a rendering decision and not an error.
  */
-export async function realtimeStatus({ keyFor = openAiKey, sessions = budget } = {}) {
-  const ready = Boolean(await keyFor());
+export async function realtimeStatus({
+  keyFor = openAiKey,
+  azureFor = azureRealtime,
+  sessions = budget,
+} = {}) {
+  const provider = await pickProvider({ keyFor, azureFor });
   return {
-    configured: ready,
-    model: MODEL,
+    configured: Boolean(provider),
+    // Which route is live, for a status page and for `journalctl`. Not secret: it
+    // names a vendor, not a resource, and the client already learns it from the
+    // `callUrl` it is handed the moment it starts a conversation.
+    provider: provider?.kind || null,
+    model: provider?.model || MODEL,
     voice: VOICE,
     voices: VOICES,
     maxMinutes: MAX_MINUTES,
     budget: sessions.state(),
-    reason: ready
-      ? null
-      : 'a spoken conversation needs an OpenAI key, and there is none on this box — ' +
-        'put one in the `openaiApiKey` field of the voice secret and call ' +
-        '/api/voice-status?refresh=1',
+    reason: provider ? null : NO_PROVIDER,
   };
 }

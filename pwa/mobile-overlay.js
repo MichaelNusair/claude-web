@@ -3047,9 +3047,14 @@
         }
         const chosen = (serverSpeech.voices || []).find((v) => v.id === voiceSelect.value);
         const provider = chosen?.provider || 'polly';
+        const hebrew = String(chosen?.language || '').toLowerCase().startsWith('he');
         noteEl.textContent =
           provider === 'azure'
-            ? 'A Hebrew neural voice, on Azure’s free tier — half a million characters a month, and nothing is charged past that: it stops until the 1st. Hebrew only.'
+            ? // One free resource, one monthly allowance, two languages — so what
+              // differs between two Azure voices here is only which language it is
+              // good at. The English one is the default for anyone who has not
+              // chosen, which is why the allowance is worth stating on both.
+              `${hebrew ? 'A Hebrew neural voice' : 'An English neural voice'}, on Azure’s free tier — half a million characters a month, and nothing is charged past that: it stops until the 1st, and Polly keeps working. ${hebrew ? 'Hebrew only.' : ''}`.trim()
             : provider === 'openai'
               ? 'One voice for every language, so it reads a message with both Hebrew and English in it. Slower to start than the others, and metered by the character.'
               : 'Synthesised on the server by Polly’s generative engine — about two seconds before the first word, then continuous. A full-length message costs about seven cents. No Hebrew.';
@@ -3362,11 +3367,14 @@
    * There are two voices, and which one is used is a setting in this sheet.
    *
    *   The **server voice** is the default and the reason this feature is worth
-   *   using: Amazon Polly's generative engine, synthesised by /api/speak and
-   *   played here as ordinary audio. It sounds like a person reading — see
-   *   chat-service/speak.js. It costs about seven cents for a full-length message
-   *   and takes about two seconds to say the first word, which is why the server
-   *   cuts a message into pieces and this plays them in a chain.
+   *   using: a neural voice synthesised by /api/speak and played here as ordinary
+   *   audio, which sounds like a person reading rather than a satnav — see
+   *   chat-service/speak.js. Which provider it comes from is that file's decision
+   *   and not this one's: an Azure voice on the free tier where the box has the
+   *   credentials, Polly's generative engine where it does not, and Polly at about
+   *   seven cents a message for anyone who picks it in this sheet. Either way the
+   *   first word takes about two seconds, which is why the server cuts a message
+   *   into pieces and this plays them in a chain.
    *
    *   The **browser voice** is `speechSynthesis`, which was all of this feature
    *   until now. It is instant and free and it sounds like a satnav from 2009. It
@@ -3471,9 +3479,10 @@
    * Which voice, remembered per device.
    *
    * Empty means "whatever the server's default is", rather than a copy of the
-   * server's default frozen at first use: the default is set in one place
-   * (SPEAK_VOICE in chat-service/speak.js) and a phone that never chose should
-   * follow it. 'browser' is the explicit choice of the local voice.
+   * server's default frozen at first use: the default is decided in one place
+   * (`preferredVoice` in chat-service/speak.js, which prefers the free provider
+   * unless SPEAK_VOICE names one) and a phone that never chose should follow it —
+   * including when it changes. 'browser' is the explicit choice of the local voice.
    */
   const VOICE_KEY = 'cmo-voice';
   function voicePref() {
@@ -4468,15 +4477,19 @@
 
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
-    const answer = await fetch(
-      `https://api.openai.com/v1/realtime/calls?model=${encodeURIComponent(minted.model || '')}`,
-      {
-        method: 'POST',
-        body: offer.sdp,
-        headers: { Authorization: `Bearer ${minted.value}`, 'Content-Type': 'application/sdp' },
-      },
-    );
-    if (!answer.ok) throw new Error(`OpenAI refused the connection (${answer.status})`);
+    // Where to send it is the server's decision, not this file's: the box may be
+    // holding an Azure deployment or an OpenAI key, and only it knows which. The
+    // fallback is the OpenAI URL so that a client running against an older build of
+    // the service still works rather than posting an offer to `undefined`.
+    const callUrl =
+      minted.callUrl ||
+      `https://api.openai.com/v1/realtime/calls?model=${encodeURIComponent(minted.model || '')}`;
+    const answer = await fetch(callUrl, {
+      method: 'POST',
+      body: offer.sdp,
+      headers: { Authorization: `Bearer ${minted.value}`, 'Content-Type': 'application/sdp' },
+    });
+    if (!answer.ok) throw new Error(`the voice service refused the connection (${answer.status})`);
     const sdp = await answer.text();
     // Hung up while that was in flight: the credential has minutes left on it and
     // applying this would open the line anyway, seconds after it was ended.

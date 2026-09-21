@@ -3774,7 +3774,11 @@ function paintVoiceHint() {
   const language = String(chosen.language || '').toLowerCase();
   hint.textContent =
     chosen.provider === 'azure'
-      ? 'A Hebrew neural voice on Azure’s free tier — nothing is charged past the monthly allowance; it stops until the 1st. Hebrew only, so an English message will be read by it badly or not at all.'
+      ? // Both languages come from one free resource and share one monthly allowance,
+        // so what differs between an Azure voice and an Azure voice is only which
+        // language it is good at. The English pair are the default for everyone who has
+        // not chosen, which is why this says what happens when the month runs out.
+        `${language.startsWith('he') ? 'A Hebrew neural voice' : 'An English neural voice'} on Azure’s free tier — nothing is charged past the monthly allowance; it stops until the 1st and a Polly voice keeps working. ${language.startsWith('he') ? 'Hebrew only, so an English message will be read by it badly.' : 'English: a mostly-Hebrew message is moved to the Hebrew voice on its own.'}`
       : language === 'multi'
         ? 'One voice for every language, so it reads a message with Hebrew and English in it. Slower to start, and metered by the character.'
         : 'An English voice. It cannot read Hebrew — Polly has no Hebrew voice at all — so a Hebrew message will come back refused rather than mispronounced.';
@@ -3940,15 +3944,18 @@ async function connectTalk(minted, generation) {
 
   const offer = await pc.createOffer();
   await pc.setLocalDescription(offer);
-  const answer = await fetch(
-    `https://api.openai.com/v1/realtime/calls?model=${encodeURIComponent(minted.model || '')}`,
-    {
-      method: 'POST',
-      body: offer.sdp,
-      headers: { Authorization: `Bearer ${minted.value}`, 'Content-Type': 'application/sdp' },
-    },
-  );
-  if (!answer.ok) throw new Error(`OpenAI refused the connection (${answer.status})`);
+  // The server says where: this box may hold an Azure deployment or an OpenAI key,
+  // and a client that hardcodes one talks to the wrong vendor the day it changes.
+  // The fallback keeps an old tab working against a newer service.
+  const callUrl =
+    minted.callUrl ||
+    `https://api.openai.com/v1/realtime/calls?model=${encodeURIComponent(minted.model || '')}`;
+  const answer = await fetch(callUrl, {
+    method: 'POST',
+    body: offer.sdp,
+    headers: { Authorization: `Bearer ${minted.value}`, 'Content-Type': 'application/sdp' },
+  });
+  if (!answer.ok) throw new Error(`the voice service refused the connection (${answer.status})`);
   const sdp = await answer.text();
   if (generation !== talk.generation) return;
   await pc.setRemoteDescription({ type: 'answer', sdp });

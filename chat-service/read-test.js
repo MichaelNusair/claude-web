@@ -66,8 +66,12 @@ process.on('unhandledRejection', (err) => rejections.push(String(err?.message ||
 /** What the server says it can read with, shaped like speechStatus's answer. */
 const SPEECH = {
   configured: true,
-  voice: 'Ruth',
+  // `voice` is the server's default, which is the free one where there is one — see
+  // `preferredVoice` in speak.js. The picker shows it selected for a phone that has
+  // never chosen, and Polly is listed beside it rather than replaced by it.
+  voice: 'Ava',
   voices: [
+    { id: 'Ava', gender: 'Female', language: 'en-US', provider: 'azure' },
     { id: 'Ruth', gender: 'Female', language: 'en-US', provider: 'polly' },
     { id: 'Hila', gender: 'Female', language: 'he-IL', provider: 'azure' },
     { id: 'marin', gender: 'Female', language: 'multi', provider: 'openai' },
@@ -564,9 +568,20 @@ console.log('\nThe voice is the server’s choice per message until someone over
     'choosing the Hebrew voice does not admit that it is Hebrew-only, or that it is free',
     /free tier/.test(h.$('#voice-hint').textContent) && /Hebrew only/.test(h.$('#voice-hint').textContent),
   );
+
   check(
     'the choice was not remembered, so it has to be made again on every launch',
     JSON.parse(h.w.localStorage.getItem('claude-chat') || '{}').voice === 'Hila',
+  );
+
+  // The same resource, the same free allowance, a different language — and the note has
+  // to stop saying "Hebrew only" when the voice is the English one everybody gets by
+  // default, or the default voice reads as a mistake.
+  select.value = 'Ava';
+  select.dispatchEvent(new h.w.Event('change'));
+  check(
+    `the English Azure voice is described as Hebrew-only: ${JSON.stringify(h.$('#voice-hint').textContent)}`,
+    /free tier/.test(h.$('#voice-hint').textContent) && !/Hebrew only/.test(h.$('#voice-hint').textContent),
   );
 
   select.value = 'Ruth';

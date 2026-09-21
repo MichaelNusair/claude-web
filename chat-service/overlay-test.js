@@ -1796,15 +1796,18 @@ w.URL.revokeObjectURL = (url) => objectUrls.push(String(url));
 voiceReply = {
   configured: true,
   engine: 'generative',
-  voice: 'Ruth',
+  // The server's default, which is the free provider's voice where there is one — see
+  // `preferredVoice` in speak.js. A phone that has never chosen is read in this.
+  voice: 'Ava',
   /*
    * Shaped like the real answer, which now has three kinds of voice in it: Polly's,
-   * which are per-language and cannot say a word of Hebrew; Azure's Hebrew pair; and
-   * the multilingual OpenAI ones, whose `language` is deliberately not a locale.
-   * `Lupe` is the one that should be filtered out of a picker on an English phone,
-   * and the other two are the ones that must not be.
+   * which are per-language and cannot say a word of Hebrew; Azure's, free, a Hebrew
+   * pair and an English pair; and the multilingual OpenAI ones, whose `language` is
+   * deliberately not a locale. `Lupe` is the one that should be filtered out of a
+   * picker on an English phone, and the others are the ones that must not be.
    */
   voices: [
+    { id: 'Ava', gender: 'Female', language: 'en-US', provider: 'azure' },
     { id: 'Ruth', gender: 'Female', language: 'en-US', provider: 'polly' },
     { id: 'Matthew', gender: 'Male', language: 'en-US', provider: 'polly' },
     { id: 'Lupe', gender: 'Female', language: 'es-US', provider: 'polly' },
@@ -1855,7 +1858,7 @@ ok(
 );
 ok(
   `the picker does not start on the server's own default: ${voiceSelect()?.value}`,
-  voiceSelect()?.value === 'Ruth',
+  voiceSelect()?.value === voiceReply.voice,
 );
 /*
  * The exception to the filter above, and the reason this deployment needed one.
@@ -1883,26 +1886,44 @@ ok(
     [...(voiceSelect()?.options ?? [])].find((o) => o.value === 'marin')?.textContent || '',
   ),
 );
+/*
+ * The note about whichever voice the sheet opens on — which is the server's default,
+ * so on this deployment it is the free one. What it has to say is what a listener
+ * cannot hear: that nothing is being charged, and what happens when the month's
+ * allowance is gone.
+ */
+const note = () => doc.getElementById('cmo-voice-note')?.textContent || '';
 ok(
-  'the sheet does not say what the server voice costs, which is the one thing about ' +
+  `the sheet opens on ${voiceSelect()?.value} and describes it as: ${JSON.stringify(note())}`,
+  voiceSelect()?.value === 'Ava' && /free tier/.test(note()) && !/seven cents/.test(note()),
+);
+ok(
+  // Both Azure voices are on the one free resource, so the note used to be written for
+  // the only one there was. Left that way, the voice everybody is read in by default
+  // describes itself as unable to read the language it is reading.
+  `the default voice calls itself Hebrew-only: ${JSON.stringify(note())}`,
+  !/Hebrew only/i.test(note()),
+);
+// What each of the others means is different in the two ways that matter — what it
+// can read, and what it costs — so the note has to be asked of the voice rather than
+// assume whichever one the sheet opened on.
+voiceSelect().value = 'Ruth';
+voiceSelect().dispatchEvent(new w.Event('change'));
+ok(
+  'the sheet does not say what the paid voice costs, which is the one thing about ' +
     'it that is not obvious from hearing it',
-  /seven cents/.test(doc.getElementById('cmo-voice-note')?.textContent || ''),
+  /seven cents/.test(note()),
 );
 ok(
   'the note about Polly does not admit it cannot read Hebrew, which is the reason ' +
     'there is more than one server voice here',
-  /No Hebrew/.test(doc.getElementById('cmo-voice-note')?.textContent || ''),
+  /No Hebrew/.test(note()),
 );
-// What each of the other two means is different in the two ways that matter — what
-// it can read, and what it costs — so the note has to be asked of the voice rather
-// than assume the one that used to be the only one.
 voiceSelect().value = 'Hila';
 voiceSelect().dispatchEvent(new w.Event('change'));
 ok(
-  `choosing the Hebrew voice still describes Polly's bill: ` +
-    `${JSON.stringify(doc.getElementById('cmo-voice-note')?.textContent)}`,
-  /free tier/.test(doc.getElementById('cmo-voice-note')?.textContent || '') &&
-    !/seven cents/.test(doc.getElementById('cmo-voice-note')?.textContent || ''),
+  `choosing the Hebrew voice still describes Polly's bill: ${JSON.stringify(note())}`,
+  /free tier/.test(note()) && !/seven cents/.test(note()) && /Hebrew only/i.test(note()),
 );
 voiceSelect().value = 'marin';
 voiceSelect().dispatchEvent(new w.Event('change'));
@@ -3356,7 +3377,10 @@ await settle(30);
     win.fetch = (url, init = {}) => {
       const target = String(url);
       calls.push({ url: target, init });
-      if (target.startsWith('https://api.openai.com/')) {
+      // Matched on the path rather than the host: which vendor holds the conversation
+      // is the box's decision, and a stub that only knows `api.openai.com` would score
+      // an offer sent nowhere as a pass.
+      if (target.includes('/v1/realtime/calls')) {
         if (state.sdpStatus) {
           return Promise.resolve({ ok: false, status: state.sdpStatus, text: () => Promise.resolve('') });
         }
@@ -3382,6 +3406,7 @@ await settle(30);
           status: 200,
           json: () => Promise.resolve({
             value: SECRET,
+            ...(state.callUrl ? { callUrl: state.callUrl, provider: 'azure' } : {}),
             expiresAt: new Date(Date.now() + 120000).toISOString(),
             model: 'gpt-realtime-mini',
             voice: 'marin',
@@ -3586,10 +3611,10 @@ await settle(30);
       ours: () =>
         calls
           .map((c) => c.url)
-          .filter((u) => !u.startsWith('https://api.openai.com/'))
+          .filter((u) => u.startsWith('/') || u.startsWith('https://claude.example.com/'))
           .map((u) => u.split('?')[0]),
       mint: () => calls.find((c) => c.url.includes('/api/realtime/token')),
-      sdp: () => calls.find((c) => c.url.startsWith('https://api.openai.com/')),
+      sdp: () => calls.find((c) => c.url.includes('/v1/realtime/calls')),
       state2: state,
       text: (id) => doc2.getElementById(id)?.textContent ?? '',
       /** Every microphone track this page ever opened, whichever call it belonged to. */
@@ -4179,6 +4204,68 @@ await settle(30);
       `the sheet does not say why it ended: ${JSON.stringify(brief.text('cmo-talk-state'))}`,
       /closed/i.test(brief.text('cmo-talk-state')),
     );
+  }
+
+  // ----------------------------------------------- whose realtime API it is
+  /*
+   * The vendor is the box's decision and the overlay must not hold an opinion.
+   *
+   * This box can hold the conversation on an Azure deployment — billed to sponsorship
+   * credits, which have no card behind them — or on an OpenAI key, and it says which
+   * by handing a `callUrl` back with the credential. An overlay that keeps its own
+   * copy of `api.openai.com` sends the offer, and the ephemeral secret with it, to a
+   * vendor that never minted it: a 401 that reads on a phone as "voice is broken".
+   *
+   * The no-`callUrl` case is checked as well, and it is not decoration — the file is
+   * cached under a build number, so a tab loaded before this change is still live
+   * somewhere and will be handed a mint it does not recognise.
+   */
+  {
+    const AZURE = 'https://claudeweb-realtime-6f2a9c.openai.azure.com/openai/v1/realtime/calls';
+    const b = bootTalk({ state: { callUrl: AZURE } });
+    await settle(60);
+    await b.openStatus();
+    b.tap('cmo-talk');
+    await settle(80);
+
+    const call = b.sdp();
+    ok('no offer was sent anywhere', Boolean(call));
+    ok(
+      `the offer went to ${call?.url} rather than the URL the box minted for it`,
+      call?.url === AZURE,
+    );
+    ok(
+      'the overlay added a ?model= query of its own, which Azure does not read',
+      !String(call?.url || '').includes('?'),
+    );
+    ok(
+      'the credential went to a vendor other than the one that minted it',
+      call?.init?.headers?.Authorization === `Bearer ${SECRET}`,
+    );
+    ok('the conversation did not come up against Azure', b.peers[0]?.remote);
+    ok(
+      `a request went to our own box that should not have: ${JSON.stringify(b.ours())}`,
+      b.ours().includes('/api/realtime/token')
+        && b.ours().every((path) => ALLOWED.includes(path)),
+    );
+    b.tap('cmo-talk-end');
+    await settle(40);
+    ok('hanging up on an Azure line left the microphone live', b.allStopped());
+  }
+
+  {
+    const b = bootTalk();
+    await settle(60);
+    await b.openStatus();
+    b.tap('cmo-talk');
+    await settle(80);
+    ok(
+      `a mint with no callUrl sent the offer to ${b.sdp()?.url}`,
+      String(b.sdp()?.url || '').startsWith('https://api.openai.com/v1/realtime/calls?model='),
+    );
+    b.tap('cmo-talk-end');
+    await settle(40);
+    ok('and that path leaked a microphone', b.allStopped());
   }
 }
 

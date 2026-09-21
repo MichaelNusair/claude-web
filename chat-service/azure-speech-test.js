@@ -127,27 +127,51 @@ const wav = (seconds, byteRate = 1000) => {
 if (MODE === 'bare') {
   console.log('Azure Speech, on a box with no credentials:');
 
-  section('The two Hebrew voices:');
-  ok(AZURE_VOICES.length === 2, 'there are two of them');
+  section('The voices, two Hebrew and two English:');
+  const hebrew = AZURE_VOICES.filter((v) => v.language === 'he-IL');
+  const english = AZURE_VOICES.filter((v) => String(v.language).startsWith('en'));
+  ok(hebrew.length === 2, 'two Hebrew, which is what Polly has none of');
+  ok(english.length === 2, 'and two English, which is what the free tier is used for now');
   ok(
-    AZURE_VOICES.every((v) => v.language === 'he-IL' && v.provider === 'azure'),
-    'both are Hebrew, and both say which provider they come from',
+    AZURE_VOICES.every((v) => v.provider === 'azure'),
+    'all of them say which provider they come from',
   );
   ok(
-    AZURE_VOICES.every((v) => /^he-IL-\w+Neural$/.test(v.name)),
-    'each carries the full Azure name for the wire',
+    AZURE_VOICES.every((v) => new RegExp(`^${v.language}-\\w+$`).test(v.name)),
+    'each carries the full Azure name for the wire, and it matches its own locale',
     JSON.stringify(AZURE_VOICES.map((v) => v.name)),
+  );
+  ok(
+    AZURE_VOICES.every((v) => /Neural$/.test(v.name)),
+    'every one of them is a neural voice, which is what the free tier covers',
   );
   ok(
     AZURE_VOICES.every((v) => !v.id.includes('-')),
     'and a bare id for the picker and the phone',
     JSON.stringify(AZURE_VOICES.map((v) => v.id)),
   );
-  ok(AZURE_VOICES[0].id === 'Hila', 'the default is the one measured on this box');
+  ok(hebrew[0].id === 'Hila', 'the Hebrew default is the one measured on this box');
+  ok(english[0].id === 'Ava', 'and the English one is Ava, which speak.js prefers by name');
   ok(
-    new Set(AZURE_VOICES.map((v) => v.gender)).size === 2,
-    'one of each gender, so a picker has a real choice',
+    new Set(hebrew.map((v) => v.gender)).size === 2 &&
+      new Set(english.map((v) => v.gender)).size === 2,
+    'one of each gender in both languages, so a picker has a real choice either way',
   );
+  /*
+   * The ids are bare, so they share one namespace with Polly's — and `knownVoices` in
+   * speak.js drops an Azure voice whose name Polly already claims. Polly has voices
+   * called Emma, Brian and Aria, and Azure has all three: naming one of those here
+   * would take a voice out of the picker with nothing anywhere saying why.
+   */
+  const pollyNames = ['Emma', 'Brian', 'Aria', 'Ruth', 'Matthew', 'Danielle', 'Stephen',
+    'Joanna', 'Salli', 'Tiffany', 'Amy', 'Gregory', 'Ivy', 'Kendra', 'Kimberly'];
+  ok(
+    !AZURE_VOICES.some((v) => pollyNames.some((n) => n.toLowerCase() === v.id.toLowerCase())),
+    'and none of them is named after a Polly voice, which would be silently dropped',
+    JSON.stringify(AZURE_VOICES.map((v) => v.id)),
+  );
+  const ids = AZURE_VOICES.map((v) => v.id.toLowerCase());
+  ok(new Set(ids).size === ids.length, 'nor do two of them share a name with each other');
 
   section('SSML is XML, and a code block is full of XML:');
   ok(ssmlEscape('a && b') === 'a &amp;&amp; b', 'an ampersand becomes an entity');
@@ -452,7 +476,13 @@ if (MODE === 'env') {
   const status = await azureSpeechStatus();
   ok(status.configured === true, 'it says the voice is available');
   ok(status.region === ENV_CREDS.region, 'and which region it speaks from');
-  ok(status.voices.length === 2, 'and offers both Hebrew voices');
+  ok(
+    status.voices.length === AZURE_VOICES.length &&
+      status.voices.some((v) => v.language === 'he-IL') &&
+      status.voices.some((v) => String(v.language).startsWith('en')),
+    'and offers every voice it has, in both languages',
+    JSON.stringify(status.voices.map((v) => `${v.id}/${v.language}`)),
+  );
   ok(status.reason === null, 'with nothing to explain');
   ok(
     !JSON.stringify(status).includes(ENV_CREDS.key),

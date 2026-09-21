@@ -34,6 +34,7 @@ import {
   VOICES,
   MAX_MINUTES,
 } from './realtime.js';
+import { azureRealtime, resetOpenAi } from './openai.js';
 
 let checks = 0;
 let failures = 0;
@@ -85,6 +86,7 @@ const fakeOpenAi = ({ status = 200, body = null } = {}) => {
 
 const key = async () => 'sk-test-not-a-real-key';
 const noKey = async () => null;
+const noAzure = async () => null;
 
 const MESSAGE = [
   'Done. The auth gap is closed.',
@@ -316,15 +318,281 @@ section('Refusing, before anything is spent:');
 section('What the client is told before it offers the button:');
 {
   const sessions = new SessionBudget({ dailySessions: 7 });
-  const off = await realtimeStatus({ keyFor: noKey, sessions });
+  // `azureFor` is passed explicitly everywhere below, not left to default: the real
+  // one reads the environment, and a machine that happens to have AZURE_REALTIME_*
+  // set would otherwise flip these answers.
+  const off = await realtimeStatus({ keyFor: noKey, azureFor: noAzure, sessions });
   ok(off.configured === false, 'a box with no key cannot hold a conversation');
   ok(/openaiApiKey/.test(off.reason || ''), 'and says how to change that', `got: ${off.reason}`);
 
-  const on = await realtimeStatus({ keyFor: key, sessions });
+  const on = await realtimeStatus({ keyFor: key, azureFor: noAzure, sessions });
   ok(on.configured === true && on.reason === null, 'a box with one can');
   ok(on.model === MODEL && on.voice === VOICE, 'and names the model and voice it would use');
   ok(on.budget.limit === 7, 'and what the day allows', JSON.stringify(on.budget));
   ok(on.maxMinutes === MAX_MINUTES, 'and how long a conversation lasts');
+}
+
+// --------------------------------------------------------------------------
+/*
+ * Two routes to the same models, and why the choice is not cosmetic.
+ *
+ * Realtime audio is billed per audio token either way. The difference is what
+ * happens when the money runs out: an OpenAI account bills a card unless someone
+ * remembered to turn auto-recharge off, while an Azure sponsorship has no card
+ * behind it and simply stops. So Azure wins when both are configured, and that
+ * preference is a tested property rather than a comment — a later edit that reorders
+ * those two branches would move real spending onto a credit card silently.
+ *
+ * The rest of this section pins the four things that actually differ between the
+ * providers, because each of them is a way for the Azure path to break while every
+ * OpenAI test stays green: the URL, the header the key travels in, what `model`
+ * means, and the vocabulary a refusal is explained in.
+ */
+section('Which vendor, and on whose money:');
+{
+  const AZURE = {
+    endpoint: 'https://claudeweb-realtime-6f2a9c.openai.azure.com',
+    key: 'azure-key-not-a-real-one',
+    deployment: 'gpt-realtime-mini',
+  };
+  const azure = async () => AZURE;
+
+  {
+    const fake = fakeOpenAi();
+    const minted = await mintSession(
+      { text: MESSAGE, prompt: PROMPT },
+      { fetchImpl: fake.fetchImpl, keyFor: key, azureFor: azure, sessions: new SessionBudget() },
+    );
+    ok(
+      fake.last.url === `${AZURE.endpoint}/openai/v1/realtime/client_secrets`,
+      'with both configured the credential is minted on Azure, which cannot reach a card',
+      fake.last.url,
+    );
+    ok(
+      fake.last.init.headers['api-key'] === AZURE.key,
+      'and the key travels in api-key, which is the only header Azure reads',
+    );
+    ok(
+      !('Authorization' in fake.last.init.headers),
+      'and not as a bearer token, which Azure would ignore and OpenAI would accept',
+      JSON.stringify(Object.keys(fake.last.init.headers)),
+    );
+    ok(
+      fake.last.body.session.model === AZURE.deployment,
+      'the model field carries the deployment name, which is what Azure means by model',
+      fake.last.body.session.model,
+    );
+    ok(
+      minted.callUrl === `${AZURE.endpoint}/openai/v1/realtime/calls`,
+      'the browser is told to send its offer to the Azure resource',
+      minted.callUrl,
+    );
+    ok(
+      !minted.callUrl.includes('?'),
+      'with no ?model= query, which Azure ignores — the minted secret fixes the deployment',
+    );
+    ok(minted.provider === 'azure', 'and the answer says which vendor is in use');
+    ok(
+      !JSON.stringify(minted).includes(AZURE.key),
+      'and the resource key is not in the answer the browser gets',
+    );
+  }
+
+  {
+    const fake = fakeOpenAi();
+    process.env.REALTIME_PROVIDER = 'openai';
+    const minted = await mintSession(
+      { text: MESSAGE, prompt: PROMPT },
+      { fetchImpl: fake.fetchImpl, keyFor: key, azureFor: azure, sessions: new SessionBudget() },
+    );
+    delete process.env.REALTIME_PROVIDER;
+    ok(
+      fake.last.url === 'https://api.openai.com/v1/realtime/client_secrets',
+      'REALTIME_PROVIDER=openai overrides the preference, for a box that wants the flagship',
+      fake.last.url,
+    );
+    ok(
+      fake.last.init.headers.Authorization === 'Bearer sk-test-not-a-real-key',
+      'and the key goes back to being a bearer token',
+    );
+    ok(
+      minted.callUrl === `https://api.openai.com/v1/realtime/calls?model=${MODEL}`,
+      'and the offer goes to OpenAI, with the model in the query where they want it',
+      minted.callUrl,
+    );
+    ok(minted.provider === 'openai', 'and the answer names OpenAI');
+  }
+
+  {
+    process.env.REALTIME_PROVIDER = 'azure';
+    await refuses(
+      'REALTIME_PROVIDER=azure with no Azure resource refuses rather than quietly billing OpenAI',
+      503,
+      () => mintSession(
+        { text: MESSAGE },
+        { fetchImpl: fakeOpenAi().fetchImpl, keyFor: key, azureFor: noAzure,
+          sessions: new SessionBudget() },
+      ),
+    );
+    delete process.env.REALTIME_PROVIDER;
+  }
+
+  {
+    const fake = fakeOpenAi();
+    await refuses(
+      'a box with neither refuses',
+      503,
+      () => mintSession(
+        { text: MESSAGE },
+        { fetchImpl: fake.fetchImpl, keyFor: noKey, azureFor: noAzure,
+          sessions: new SessionBudget() },
+      ),
+      /azureRealtimeEndpoint[\s\S]*openaiApiKey|openaiApiKey[\s\S]*azureRealtimeEndpoint/,
+    );
+    ok(fake.calls.length === 0, 'and sends nothing anywhere');
+  }
+
+  {
+    // The claim that made this a small change instead of a second implementation:
+    // the mint body is the same for both vendors. Verified against a live Azure
+    // resource down to `expires_after` and the transcription model. An OpenAI-only
+    // field added to that body later would 400 on Azure and nowhere else.
+    const openaiSide = fakeOpenAi();
+    process.env.REALTIME_PROVIDER = 'openai';
+    await mintSession({ text: MESSAGE, prompt: PROMPT, voice: 'cedar' },
+      { fetchImpl: openaiSide.fetchImpl, keyFor: key, azureFor: azure,
+        sessions: new SessionBudget() });
+    delete process.env.REALTIME_PROVIDER;
+
+    const azureSide = fakeOpenAi();
+    await mintSession({ text: MESSAGE, prompt: PROMPT, voice: 'cedar' },
+      { fetchImpl: azureSide.fetchImpl, keyFor: key, azureFor: azure,
+        sessions: new SessionBudget() });
+
+    const strip = (body) => JSON.stringify({ ...body, session: { ...body.session, model: '' } });
+    ok(
+      strip(openaiSide.last.body) === strip(azureSide.last.body),
+      'the session sent to Azure is the same one sent to OpenAI, model name aside',
+    );
+    ok(
+      azureSide.last.body.session.audio.input.transcription.model === 'gpt-4o-transcribe',
+      'including the input transcription, which Azure accepts without its own deployment',
+    );
+    ok(
+      azureSide.last.body.expires_after.seconds === 120,
+      'and the two-minute expiry, which Azure honours',
+    );
+  }
+
+  {
+    // A refusal has to name the field an operator should go and look at. Sending
+    // someone to `openaiApiKey` when the deployment name is wrong is worse than
+    // giving them the bare status code.
+    const fake = fakeOpenAi({ status: 404 });
+    await refuses(
+      'a 404 from Azure talks about the deployment, not the model',
+      403,
+      () => mintSession(
+        { text: MESSAGE },
+        { fetchImpl: fake.fetchImpl, keyFor: key, azureFor: azure,
+          sessions: new SessionBudget() },
+      ),
+      /deployment/,
+    );
+
+    const denied = fakeOpenAi({ status: 401 });
+    await refuses(
+      'and a 401 names azureRealtimeKey rather than openaiApiKey',
+      403,
+      () => mintSession(
+        { text: MESSAGE },
+        { fetchImpl: denied.fetchImpl, keyFor: key, azureFor: azure,
+          sessions: new SessionBudget() },
+      ),
+      /azureRealtimeKey/,
+    );
+
+    const overQuota = fakeOpenAi({ status: 429 });
+    await refuses(
+      'and a 429 says it may be the quota rather than the balance, because on Azure it is',
+      429,
+      () => mintSession(
+        { text: MESSAGE },
+        { fetchImpl: overQuota.fetchImpl, keyFor: key, azureFor: azure,
+          sessions: new SessionBudget() },
+      ),
+      /quota/,
+    );
+  }
+
+  {
+    const sessions = new SessionBudget({ dailySessions: 3 });
+    const status = await realtimeStatus({ keyFor: noKey, azureFor: azure, sessions });
+    ok(status.configured === true, 'a box with only Azure can hold a conversation');
+    ok(status.provider === 'azure', 'and says so');
+    ok(
+      status.model === AZURE.deployment,
+      'and names the deployment it would use, not the model default',
+      status.model,
+    );
+    const neither = await realtimeStatus({ keyFor: noKey, azureFor: noAzure, sessions });
+    ok(neither.provider === null, 'a box with neither names no provider');
+    ok(
+      /azureRealtimeDeployment/.test(neither.reason || ''),
+      'and its reason lists all three Azure fields, since two of three is the common mistake',
+      neither.reason,
+    );
+  }
+}
+
+// --------------------------------------------------------------------------
+/*
+ * The credential shape, which is the only thing standing between a key in a secret
+ * and a key in a log. `azureRealtime` refuses anything it cannot use rather than
+ * half-configuring itself, because the failure of a half-configured resource is a
+ * 404 at mint time, ten minutes of walking later, with nothing to point at.
+ */
+section('What counts as a configured Azure resource:');
+{
+  const saved = {
+    endpoint: process.env.AZURE_REALTIME_ENDPOINT,
+    key: process.env.AZURE_REALTIME_KEY,
+    deployment: process.env.AZURE_REALTIME_DEPLOYMENT,
+  };
+  const set = async (endpoint, keyValue, deployment) => {
+    if (endpoint === null) delete process.env.AZURE_REALTIME_ENDPOINT;
+    else process.env.AZURE_REALTIME_ENDPOINT = endpoint;
+    if (keyValue === null) delete process.env.AZURE_REALTIME_KEY;
+    else process.env.AZURE_REALTIME_KEY = keyValue;
+    if (deployment === null) delete process.env.AZURE_REALTIME_DEPLOYMENT;
+    else process.env.AZURE_REALTIME_DEPLOYMENT = deployment;
+    resetOpenAi();
+    return azureRealtime();
+  };
+
+  const GOOD = 'https://res.openai.azure.com';
+  ok(
+    (await set(GOOD, 'k', 'dep'))?.endpoint === GOOD,
+    'all three present is a resource',
+  );
+  ok(
+    (await set(`${GOOD}/`, 'k', 'dep'))?.endpoint === GOOD,
+    'a trailing slash is trimmed, so the appended path cannot become a double slash',
+  );
+  ok(
+    (await set('http://res.openai.azure.com', 'k', 'dep')) === null,
+    'http is refused outright rather than sending the key in clear',
+  );
+  ok(
+    (await set(`${GOOD}/openai/v1`, 'k', 'dep')) === null,
+    'and so is an endpoint with a path, which would silently build the wrong URL',
+  );
+  ok((await set(GOOD, 'k', null)) === null, 'a missing deployment is not configured');
+  ok((await set(GOOD, null, 'dep')) === null, 'nor is a missing key');
+  ok((await set(null, 'k', 'dep')) === null, 'nor is a missing endpoint');
+  ok((await set(GOOD, '   ', 'dep')) === null, 'nor is a key of spaces');
+
+  await set(saved.endpoint ?? null, saved.key ?? null, saved.deployment ?? null);
 }
 
 // --------------------------------------------------------------------------

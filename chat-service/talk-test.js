@@ -80,7 +80,7 @@ const MINTED = {
 const CWD = '/workspace/projects/demo';
 const MESSAGE = 'Fixed the timeout.\n\n```js\nconst t = 1500;\n```\n\nDeployed.';
 
-function boot({ realtime = REALTIME, speech = null, webrtc = true } = {}) {
+function boot({ realtime = REALTIME, speech = null, webrtc = true, minted = MINTED } = {}) {
   const virtualConsole = new VirtualConsole();
   virtualConsole.on('jsdomError', () => {});
   const logged = [];
@@ -215,9 +215,12 @@ function boot({ realtime = REALTIME, speech = null, webrtc = true } = {}) {
       order.push('mint');
       calls.mint.push({ ...options, body: JSON.parse(options.body || '{}') });
       if (state.mintStatus) return json({ error: state.mintError }, false, state.mintStatus);
-      return json(MINTED);
+      return json(minted);
     }
-    if (u.includes('api.openai.com')) {
+    // Matched on the path, not the host: the box decides which vendor holds the
+    // conversation, so a test that only knows about api.openai.com would report a
+    // silent no-op as a pass the day it is Azure.
+    if (u.includes('/v1/realtime/calls')) {
       calls.sdp.push({ url: u, body: options.body, headers: options.headers });
       if (!state.sdpOk) return Promise.resolve({ ok: false, status: 403, text: () => Promise.resolve('no') });
       return Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve('v=0\r\no=- answer\r\n') });
@@ -691,6 +694,60 @@ console.log('\nA dropped line says so, and does not leave the mic on:');
   check(
     `the control still offers Hang up for a line that is gone: ${h.talkBtn().textContent}`,
     /talk it over/i.test(h.talkBtn().textContent),
+  );
+  check('nothing threw', h.thrown.length === 0, h.thrown.join('; '));
+  h.close();
+}
+
+// --- 8. whose realtime API it is ------------------------------------------
+/*
+ * The client does not choose the vendor, and must not know one.
+ *
+ * The box may be holding an Azure deployment (billed to sponsorship credits, which
+ * cannot reach a card) or an OpenAI key, and it says which by handing back a
+ * `callUrl` with the credential. A client that keeps its own copy of
+ * `api.openai.com` sends the offer — and the ephemeral secret — to a vendor that
+ * did not mint it, which fails as a 401 the user reads as "voice is broken".
+ *
+ * The fallback is tested too, and it is not decoration: an old tab that was loaded
+ * before this change is still running somewhere, and it gets no `callUrl` at all.
+ */
+console.log('\nThe offer goes wherever the box says, not to a vendor baked into the client:');
+{
+  const AZURE_CALL = 'https://claudeweb-realtime-6f2a9c.openai.azure.com/openai/v1/realtime/calls';
+  const { h } = await conversation({
+    minted: { ...MINTED, callUrl: AZURE_CALL, provider: 'azure', model: 'gpt-realtime-mini' },
+  });
+  h.talkBtn().dispatchEvent(new h.w.MouseEvent('click', { bubbles: true }));
+  await settle();
+  const sdp = h.calls.sdp[0];
+  check('no offer was sent at all', Boolean(sdp));
+  check(
+    `the offer ignored the URL the box minted for it and went to ${sdp?.url}`,
+    sdp?.url === AZURE_CALL,
+  );
+  check(
+    'the client appended a ?model= query Azure does not read',
+    !String(sdp?.url || '').includes('?'),
+  );
+  check(
+    'the ephemeral secret went to the vendor that minted it',
+    sdp?.headers?.Authorization === `Bearer ${MINTED.value}`,
+  );
+  check('the connection did not come up', h.peer()?.remote?.sdp?.startsWith('v=0'));
+  check('nothing threw', h.thrown.length === 0, h.thrown.join('; '));
+  h.close();
+}
+
+{
+  // No callUrl: an older service, or an older tab against one. Still works.
+  const { h } = await conversation({ minted: { ...MINTED } });
+  h.talkBtn().dispatchEvent(new h.w.MouseEvent('click', { bubbles: true }));
+  await settle();
+  const sdp = h.calls.sdp[0];
+  check(
+    `a mint with no callUrl sent the offer to ${sdp?.url} instead of OpenAI`,
+    String(sdp?.url || '').startsWith('https://api.openai.com/v1/realtime/calls?model='),
   );
   check('nothing threw', h.thrown.length === 0, h.thrown.join('; '));
   h.close();

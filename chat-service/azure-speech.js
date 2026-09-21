@@ -20,11 +20,12 @@
  *   - `he-IL-HilaNeural`, 66 characters of Hebrew → 52 KB of mp3 in 555 ms.
  *   - the same sentence spoken back through recognition → returned verbatim, with
  *     punctuation it added itself, in 710 ms.
+ *   - `en-US-AvaMultilingualNeural`, 62 characters of English → 33 KB in 387 ms.
  *
- * Two Hebrew neural voices exist (`HilaNeural`, female; `AvriNeural`, male) out of
- * 779 voices total. They are offered under bare ids, `Hila` and `Avri`, because the
- * voice picker and the phone's remembered choice are a flat list of names shared with
- * Polly's — see the de-duplication note in speak.js.
+ * Hebrew is why this file exists, but it is not the only thing the resource is used
+ * for any more: the *free* part is the point, so English reads here too and Polly is
+ * the paid alternative in the picker. See `AZURE_VOICES` and `preferredVoice` in
+ * speak.js.
  *
  * Where the credentials live: the `speechKey` and `speechRegion` fields of the same
  * voice secret that holds the optional Azure Whisper endpoint and the optional OpenAI
@@ -72,10 +73,49 @@ export const MAX_AUDIO_SECONDS = Number(process.env.AZURE_SPEECH_MAX_SECONDS || 
 
 const secrets = new SecretsManagerClient({ region: REGION });
 
-/** The two Hebrew neural voices, as voice records shaped like Polly's. */
+/**
+ * The voices this box offers through Azure, as records shaped like Polly's.
+ *
+ * Two Hebrew, because Polly has none and that is the hole this file was opened to
+ * fill. Two English as well, because of what the F0 tier costs: nothing. Polly's
+ * generative engine reads English beautifully at $30 per million characters; these
+ * read it free until the month's half-million characters are gone and then answer 429.
+ * The standing instruction for this deployment is credits only, never a card, so the
+ * free pair is what a client that asks for no voice in particular is given, and Polly
+ * stays one tap away in the picker for anyone who would rather have it. The choosing
+ * is `preferredVoice` in speak.js.
+ *
+ * The English pair are the `Multilingual` variants rather than plain `AvaNeural` and
+ * `AndrewNeural` — same price, and asked of this resource they carry 92 secondary
+ * locales including `he-IL`, so a Hebrew word quoted inside an English sentence is
+ * spoken instead of skipped. Their `language` is nonetheless `en-US`, which is what
+ * they are: that is what keeps a message that is *mostly* Hebrew routed to Hila,
+ * whose Hebrew is native rather than accented (see `speaksHebrew` in speak.js).
+ *
+ * Ids are bare — `Hila`, `Ava` — because the picker and the phone's remembered choice
+ * are one flat list of names shared with Polly's. Which is also why these four and
+ * not others: Polly has voices called Emma, Brian and Aria, Azure has all three too,
+ * and `knownVoices` resolves a collision in Polly's favour — so an Azure voice under
+ * one of those names would be quietly dropped from the list. These four collide with
+ * none of Polly's 109.
+ */
 export const AZURE_VOICES = [
   { id: 'Hila', name: 'he-IL-HilaNeural', gender: 'Female', language: 'he-IL', provider: 'azure' },
   { id: 'Avri', name: 'he-IL-AvriNeural', gender: 'Male', language: 'he-IL', provider: 'azure' },
+  {
+    id: 'Ava',
+    name: 'en-US-AvaMultilingualNeural',
+    gender: 'Female',
+    language: 'en-US',
+    provider: 'azure',
+  },
+  {
+    id: 'Andrew',
+    name: 'en-US-AndrewMultilingualNeural',
+    gender: 'Male',
+    language: 'en-US',
+    provider: 'azure',
+  },
 ];
 
 let cached = null; // { key, region } once resolved, false for "asked, there is none"

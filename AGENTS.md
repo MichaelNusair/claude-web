@@ -335,12 +335,13 @@ chat-service/            The chat backend + PWA client. The security boundary.
   polish.js              Makes a finished dictation readable: punctuation,
                          capitals, misheard names. Bedrock Haiku, one bounded
                          pass, returns the raw transcript on any failure.
-  speak.js               The other direction: reads a message out loud in
-                         Amazon Polly's generative voice. Cut into segments so
-                         the voice starts ~2s after the tap, cached by a hash of
-                         what it says, and capped by a daily character budget —
-                         Polly bills per character, so most of this file is
-                         about not buying the same audio twice.
+  speak.js               The other direction: reads a message out loud in a
+                         neural voice — Azure's free tier by default, Polly's
+                         generative engine or OpenAI if asked for, chosen by
+                         `preferredVoice`. Cut into segments so the voice starts
+                         ~2s after the tap, cached by a hash of what it says, and
+                         capped by a daily character budget per provider, since
+                         two of the three bill per character.
   smoke-test.js          Boots app.js in jsdom — catches load-time breakage.
                          Also the notification switch, against stubbed
                          Notification/PushManager/serviceWorker: every way that
@@ -591,6 +592,35 @@ is not arbitrary:
   `limit_req` — a location-level directive *replaces* the inherited one. That is
   the same bug as the editor gate above, twice, which is why both are derived from
   the config in `manifest-test.js` rather than listed.
+
+### "Set up the voices" (or: why is Read aloud / Talk it over missing?)
+
+Everything that speaks or listens here is optional, reports `configured: false` with a
+sentence saying why when its credentials are absent, and reads those credentials from
+**one** secret — the `WhisperConfig` one, whose ARN arrives as `WHISPER_SECRET_ARN`.
+One secret because the instance role is granted `secretsmanager:GetSecretValue` per ARN
+in `infra/lib/stack.js`: a *new* secret is a stack change, and a stack change replaces
+UserData and reboots this box, killing every live conversation on it. A new *field* is
+an app-only deploy and nothing else. Its fields, all optional:
+
+| Field | What it turns on | Bills |
+|---|---|---|
+| `speechKey`, `speechRegion` | Azure AI Speech: the default read-aloud voice (`Ava`), the Hebrew voices (`Hila`, `Avri`), and Hebrew dictation | Nothing — `F0` answers 429 when the month's 0.5M characters are gone |
+| `openaiApiKey` | The multilingual read-aloud voices (`marin` and friends) and, without the three fields below, the spoken conversation | A card, unless the account is on prepaid credits |
+| `azureRealtimeEndpoint`, `azureRealtimeKey`, `azureRealtimeDeployment` | The spoken conversation, on Azure OpenAI instead — preferred over `openaiApiKey` when both are present | Sponsorship credit, which stops rather than overdrawing |
+| `endpoint`, `key` | Azure Whisper for dictation, overriding the local `ggml-base.en.bin` | Per minute |
+
+Two things to get right when writing to it. **`put-secret-value` replaces the whole
+document**, so read it, merge, and write it back — dropping `speechKey` while adding a
+realtime field takes read-aloud with it. And **`azureRealtimeDeployment` is the name you
+gave the deployment**, not the model name; a wrong one is a 404 at mint time.
+
+Then `GET /api/voice-status?refresh=1`, which re-reads all of it without a restart —
+that route exists so that adding a credential does not have to end every live
+conversation on the box. `SPEAK_VOICE`, `SPEAK_ENGINE`, `AZURE_SPEECH_KEY`,
+`AZURE_SPEECH_REGION`, `OPENAI_API_KEY`, `AZURE_REALTIME_*` and `REALTIME_PROVIDER`
+override the same values from the environment, which is how the service runs on a
+laptop with no instance role to borrow.
 
 ### "Make it cheaper"
 
@@ -1403,9 +1433,10 @@ Things that have burned people, in this codebase specifically:
   and the extension host is a node process with no audio device, so neither can
   make a sound — and the text itself needs no new route, because
   `/api/claude-status` already returns it. So the workbench page speaks and the panel
-  is untouched. It speaks in one of two voices, and which one is the device's own
-  choice, remembered in `cmo-voice`: Amazon Polly's generative voice, through
-  `/api/speak/prepare` and `/api/speak` (see `chat-service/speak.js`), or the
+  is untouched. It speaks in one of two kinds of voice, and which one is the device's
+  own choice, remembered in `cmo-voice`: a neural voice synthesised on the box, through
+  `/api/speak/prepare` and `/api/speak` — Azure's free tier by default, Polly's
+  generative engine for anyone who picks it, see `chat-service/speak.js` — or the
   browser's own `speechSynthesis` — instant, free and robotic — which is both the
   fallback whenever the server voice is unavailable or refuses and a choice in the
   picker for anyone who prefers it. Whichever one speaks, the same iOS rule shapes

@@ -32,6 +32,8 @@
  *
  * Run: node chat-service/speak-test.js
  */
+import { execFileSync } from 'child_process';
+import { AZURE_VOICES } from './azure-speech.js';
 import {
   VoiceCache,
   SpeakError,
@@ -40,6 +42,7 @@ import {
   prepare,
   speechStatus,
   chooseVoice,
+  preferredVoice,
   hebrewShare,
   needsMultilingualVoice,
   codeAloud,
@@ -378,13 +381,20 @@ section('What the phone is told:');
   const asked = await prepare('Read this.', { voice: 'Matthew' });
   ok(asked.voice === 'Matthew', 'a voice this deployment offers is the one used', `got ${asked.voice}`);
   const unknown = await prepare('Read this too.', { voice: 'Clippy; DROP TABLE' });
+  /*
+   * Which voice that lands on depends on the box — an Azure English voice where there
+   * are credentials for one, Polly where there are not, and that is the point of
+   * `preferredVoice` below. What must hold on every box is that it is a voice this
+   * deployment actually has, rather than the caller's string handed to an API.
+   */
+  const offered = (id) => [...FALLBACK_VOICES, ...AZURE_VOICES, ...OPENAI_VOICES].some((v) => v.id === id);
   ok(
-    FALLBACK_VOICES.some((v) => v.id === unknown.voice),
+    offered(unknown.voice),
     'an unknown voice falls back to a real one instead of being passed through',
     `got ${unknown.voice}`,
   );
   ok((await prepare('And this.', {})).voice === unknown.voice, 'and so does no voice at all');
-  ok(FALLBACK_VOICES.some((v) => v.id === 'Ruth'), 'Ruth, the default, is in the fallback list');
+  ok(FALLBACK_VOICES.some((v) => v.id === 'Ruth'), "Ruth, Polly's default, is in the fallback list");
   ok(
     FALLBACK_VOICES.every((v) => v.id && v.gender && v.language),
     'every fallback voice has the gender and language the picker shows',
@@ -524,6 +534,120 @@ section('Which voice ends up reading it:');
 
 // --------------------------------------------------------------------------
 /*
+ * Which voice a caller who asked for nothing gets, which is the one that decides what
+ * read-aloud costs.
+ *
+ * Almost every read is this case: a phone stores a voice only when someone picks one
+ * in the sheet, so an empty `voice` is the normal request and whatever this resolves to
+ * is what the feature is billed at. Three of the four providers here are metered — Polly
+ * at $30 per million characters, OpenAI near $17 — and one is not: Azure's F0 tier
+ * answers 429 when the month's half-million characters are gone rather than charging
+ * anyone. The standing instruction for this deployment is credits only, never a card,
+ * so the default has to lean on the free one, and it has to keep doing so after someone
+ * edits this file for an unrelated reason. Hence a section rather than one check.
+ *
+ * `preferredVoice` is a pure function over the list for that reason: this is checkable
+ * with no credentials, no network and nothing spent, while the same question asked
+ * through `prepare` would answer differently on a box with Azure credentials than on
+ * one without — which is exactly the behaviour, and exactly why it cannot be the test.
+ */
+section('The default voice is the free one:');
+{
+  const polly = FALLBACK_VOICES.map((v) => ({ ...v, provider: 'polly', engine: 'generative' }));
+  const azure = AZURE_VOICES.map((v) => ({ ...v, engine: v.name }));
+  const openai = OPENAI_VOICES.map((v) => ({ ...v, engine: 'gpt-4o-mini-tts' }));
+  const hebrew = Array.from({ length: 20 }, (_, i) => String.fromCodePoint(0x05d0 + i)).join('');
+
+  ok(preferredVoice(polly).id === 'Ruth', 'a box with only Polly reads in Ruth, as it always did');
+
+  const free = preferredVoice([...polly, ...azure, ...openai]);
+  ok(
+    free.provider === 'azure',
+    'a box with Azure credentials reads in the free voice instead',
+    `got ${free.id}/${free.provider}`,
+  );
+  ok(free.id === 'Ava', 'which is Ava — the name the picker shows as the default', free.id);
+  ok(
+    /^en/i.test(String(free.language)),
+    'an English voice, so an English message is not read in a Hebrew accent',
+    String(free.language),
+  );
+  ok(
+    free.engine === 'en-US-AvaMultilingualNeural',
+    'carrying the full Azure name as its engine, which is what the wire wants',
+    String(free.engine),
+  );
+  ok(
+    preferredVoice([...polly, ...openai]).provider === 'polly',
+    'an OpenAI key alone does not move the default — that provider is metered too',
+  );
+
+  // A deployment with Hebrew Azure voices and no English ones: the preference must not
+  // reach for Hila, whose English is accented, while Polly is in the list.
+  const hebrewOnlyAzure = [...polly, ...azure.filter((v) => v.language === 'he-IL')];
+  ok(
+    preferredVoice(hebrewOnlyAzure).id === 'Ruth',
+    'an Azure resource with only Hebrew voices leaves English on Polly',
+    preferredVoice(hebrewOnlyAzure).id,
+  );
+  ok(preferredVoice(azure).id === 'Ava', 'a box with no Polly at all still has a default');
+  ok(
+    preferredVoice([]) === undefined,
+    'and a box with no voices answers nothing rather than inventing one',
+  );
+
+  // `chooseVoice` is what actually routes a message, so it has to reach the same
+  // conclusion — and the Hebrew rule has to survive the new default.
+  const both = [...polly, ...azure];
+  ok(chooseVoice('', MESSAGE, both).id === 'Ava', 'a message with no voice asked for is read free');
+  ok(
+    chooseVoice('Ruth', MESSAGE, both).id === 'Ruth',
+    'and Polly is still one tap away for anyone who asks for it by name',
+  );
+  ok(
+    chooseVoice('', hebrew, both).id === 'Hila',
+    'a Hebrew message still goes to the native Hebrew voice, not to the English default',
+    chooseVoice('', hebrew, both).id,
+  );
+  ok(
+    chooseVoice('', hebrew, both).provider === 'azure',
+    'which is free as well, so neither language is the expensive one',
+  );
+
+  /*
+   * And the operator's override, which can only be checked in another process: it is
+   * read from the environment at import time, because it is a deployment setting rather
+   * than something a request carries.
+   */
+  const pinned = (value) =>
+    execFileSync(
+      process.execPath,
+      [
+        '--input-type=module',
+        '-e',
+        "import { preferredVoice, FALLBACK_VOICES } from './speak.js';" +
+          "import { AZURE_VOICES } from './azure-speech.js';" +
+          "const known = [...FALLBACK_VOICES.map((v) => ({ ...v, provider: 'polly' })), ...AZURE_VOICES];" +
+          "process.stdout.write(preferredVoice(known)?.id || '');",
+      ],
+      {
+        cwd: new URL('.', import.meta.url).pathname,
+        env: { ...process.env, SPEAK_VOICE: value },
+        encoding: 'utf8',
+      },
+    ).trim();
+
+  ok(pinned('Matthew') === 'Matthew', "an operator's SPEAK_VOICE outranks the free default", pinned('Matthew'));
+  ok(pinned('') === 'Ava', 'an unset SPEAK_VOICE means the free voice, not Ruth');
+  ok(
+    pinned('Clippy') === 'Ava',
+    'and a SPEAK_VOICE this box does not have falls through to it rather than failing',
+    pinned('Clippy'),
+  );
+}
+
+// --------------------------------------------------------------------------
+/*
  * Two providers, two budgets.
  *
  * Separate allowances because they are separately priced and separately risky: Polly
@@ -577,6 +701,33 @@ section('Two providers, two budgets:');
     /SPEAK_OPENAI_DAILY_CHARS/.test(spent?.message || ''),
     'and the refusal names the knob for that provider, not the other one',
     `got: ${spent?.message}`,
+  );
+
+  /*
+   * Azure's refusal names Azure's knob, and says the one thing the other two cannot:
+   * that there is somewhere to go besides waiting for midnight. It is the provider
+   * most likely to hit its limit now that English reads through it, and the operator
+   * sent to `SPEAK_DAILY_CHARS` — which is Polly's — would raise a number that changes
+   * nothing and conclude the box is broken.
+   */
+  const rationed = new VoiceCache({ synthesize: voice.synthesize, dailyChars: { azure: 5 } });
+  const a = rationed.prepare(SHORT, 'Ava', 'en-US-AvaMultilingualNeural', 'azure');
+  let out = null;
+  try {
+    await rationed.audio(a.id, 0);
+  } catch (err) {
+    out = err;
+  }
+  ok(out?.status === 429, "reading past Azure's daily ration is refused too", `got ${out?.status}`);
+  ok(
+    /SPEAK_AZURE_DAILY_CHARS/.test(out?.message || ''),
+    'and names Azure’s knob rather than Polly’s',
+    `got: ${out?.message}`,
+  );
+  ok(
+    /Polly/.test(out?.message || ''),
+    'and says a paid voice is a tap away, since this limit is a ration of a free month',
+    `got: ${out?.message}`,
   );
 
   // The point of separating them.
@@ -652,6 +803,42 @@ section('What the phone is told about the second voice:');
     /own voice/i.test(noKey.hebrew.reason || ''),
     "and that the device's own voice is what reads it instead, rather than nothing",
     `got: ${noKey.hebrew.reason}`,
+  );
+
+  /*
+   * A box with the Azure credentials this deployment has: what the sheet is told is
+   * the default, which is what a phone that has never chosen will be read in.
+   */
+  const withAzure = await speechStatus({
+    lang: 'en',
+    describe,
+    hasOpenAi: async () => false,
+    hasAzure: async () => true,
+  });
+  ok(withAzure.voice === 'Ava', 'the reported default is the free voice', String(withAzure.voice));
+  ok(
+    withAzure.voices.some((v) => v.id === 'Ava' && v.provider === 'azure'),
+    'which is in the list the picker is built from',
+    withAzure.voices.map((v) => `${v.id}/${v.provider}`).join(', '),
+  );
+  ok(
+    withAzure.voices.some((v) => v.id === 'Ruth' && v.provider === 'polly'),
+    'and Polly is still offered alongside it rather than replaced',
+  );
+  ok(
+    withAzure.voices.findIndex((v) => v.id === 'Ava') <
+      withAzure.voices.findIndex((v) => v.id === 'Hila'),
+    'an English phone is offered the English Azure voice before the Hebrew ones',
+    withAzure.voices.map((v) => v.id).join(', '),
+  );
+  ok(
+    withAzure.hebrew.available === true && withAzure.hebrew.voice === 'Hila',
+    'Hebrew is still read by the native Hebrew voice, not by the English default',
+    JSON.stringify(withAzure.hebrew),
+  );
+  ok(
+    withAzure.budgets?.azure?.provider === 'azure',
+    'and the free provider’s allowance is reported, because it is the one that runs out',
   );
 
   // The collision the id scheme cannot survive, resolved in favour of the provider a

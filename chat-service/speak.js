@@ -92,6 +92,27 @@
  *    near $17, so one shared allowance would either starve the cheap one or
  *    overspend on the expensive one.
  *
+ * ---------------------------------------------------------------------------
+ *
+ * **And the default voice is the free one, which is a third provider.**
+ *
+ * Azure came in for Hebrew and turned out to be the answer to a different question.
+ * Its Speech resource is on the `F0` tier: half a million characters of neural TTS a
+ * month, and when that is gone it answers 429 rather than charging anyone. Polly's
+ * generative engine is $30 per million — about seven cents for a full-length message,
+ * which is not much and is also not nothing, and the standing instruction for this
+ * deployment is credits only, never a card.
+ *
+ * So a client that asks for no voice in particular now gets `Ava`, an Azure neural
+ * voice, rather than `Ruth` on Polly. Polly is not gone and is not a fallback of last
+ * resort: it is still in the picker, still the better-sounding of the two to some ears,
+ * and still what a box with no Azure credentials reads with. `SPEAK_VOICE` pins a name
+ * for an operator who wants one. What changed is only which way the default leans when
+ * nobody has said — towards the provider that cannot produce an invoice. The order
+ * lives in `preferredVoice`, and nothing else in this file knows about it.
+ *
+ * ---------------------------------------------------------------------------
+ *
  * One property the cache relies on is weaker for the second provider: OpenAI does
  * not promise byte-identical audio for an identical request. It does not matter
  * here, because an id is only ever resolved against the bytes this process already
@@ -117,7 +138,17 @@ const REGION = process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || 'us-e
 // are here as an escape hatch for a region without generative voices, or for an
 // operator who would rather pay less — both still beat the browser's voice.
 const ENGINE = process.env.SPEAK_ENGINE || 'generative';
-const DEFAULT_VOICE = process.env.SPEAK_VOICE || 'Ruth';
+/**
+ * The voice an operator has pinned, if any — and Polly's default for a box that has
+ * nothing free to read with.
+ *
+ * These used to be one constant, `SPEAK_VOICE || 'Ruth'`, because there was one
+ * provider and its cheapest option was still metered. Now there is a free one, and
+ * "the default voice" is no longer a name that can be written down here: it depends on
+ * what the box has. `preferredVoice` decides; this is only what it starts from.
+ */
+const SPEAK_VOICE = (process.env.SPEAK_VOICE || '').trim();
+const POLLY_VOICE = 'Ruth';
 
 /*
  * The second provider.
@@ -175,11 +206,26 @@ const OPENAI_DAILY_CHARS = Number(process.env.SPEAK_OPENAI_DAILY_CHARS || 300_00
 /*
  * Azure's allowance is not about money — the F0 tier is free and answers 429 rather
  * than billing — it is about not spending the whole month in an afternoon. 0.5M
- * characters a month over 31 days is 16,129, so 16,000 a day keeps the Hebrew voice
+ * characters a month over 31 days is 16,129, so 16,000 a day keeps the free voice
  * working on the 28th. Going over is not a charge and this is not protecting anyone
  * from one; it is rationing a free thing so it lasts.
+ *
+ * It matters more now than when only Hebrew came through here, because English is the
+ * default and English is most of what gets read: about a dozen full-length messages a
+ * day fit inside it. What happens at the limit is a 429 and the client's usual answer
+ * to one — the overlay reads with the browser's voice, the chat app says it cannot —
+ * and *not* a silent move onto Polly, which would turn a rationed free thing into an
+ * unasked-for bill. Anyone who would rather pay than wait for midnight can pick a
+ * Polly voice in the picker, which is the sentence the refusal ends with.
  */
 const AZURE_DAILY_CHARS = Number(process.env.SPEAK_AZURE_DAILY_CHARS || 16_000);
+
+/** Which knob raises each provider's allowance, for a refusal to name the right one. */
+const DAILY_KNOBS = {
+  polly: 'SPEAK_DAILY_CHARS',
+  openai: 'SPEAK_OPENAI_DAILY_CHARS',
+  azure: 'SPEAK_AZURE_DAILY_CHARS',
+};
 // Long enough to finish reading a message and to read it again; short enough that
 // a phone left on the sheet is not holding megabytes of audio for the afternoon.
 const TTL_MS = Number(process.env.SPEAK_TTL_MS || 10 * 60 * 1000);
@@ -686,7 +732,10 @@ export class VoiceCache {
       throw new SpeakError(
         `the ${provider} voice has read ${budget.chars} characters today and the daily ` +
           `limit is ${budget.limit} — it resets at midnight UTC, or raise ` +
-          `${provider === 'openai' ? 'SPEAK_OPENAI_DAILY_CHARS' : 'SPEAK_DAILY_CHARS'}`,
+          `${DAILY_KNOBS[provider] || DAILY_KNOBS.polly}` +
+          // Only the free provider has somewhere to go that is not "wait": Azure's
+          // ration is of a free month, and Polly is a tap away in the picker.
+          (provider === 'azure' ? ', or pick a Polly voice in the picker' : ''),
         429,
       );
     }
@@ -891,7 +940,7 @@ async function describeVoices() {
     }));
     probed = { voices, reason: null };
   } catch (err) {
-    probed = { voices: [], reason: pollyRefusal(err, DEFAULT_VOICE, ENGINE).message };
+    probed = { voices: [], reason: pollyRefusal(err, POLLY_VOICE, ENGINE).message };
   }
   return probed;
 }
@@ -958,6 +1007,37 @@ export function speaksHebrew(voice) {
 }
 
 /**
+ * The voice for a caller who asked for nothing, which is most of them.
+ *
+ * A pure function over the list for the same reason `chooseVoice` is one: this is
+ * where "what does read-aloud cost by default" is decided, and it should be checkable
+ * without an AWS account, a key or a network.
+ *
+ * The order, and why:
+ *
+ *  1. **`SPEAK_VOICE`, if it is set and the box has it.** An operator who names a
+ *     voice has said something more specific than any rule here.
+ *  2. **An Azure English voice.** Free until the month's half-million characters are
+ *     gone, then a 429 — the only arrangement that cannot produce an invoice. English
+ *     rather than any Azure voice, because Hila would read an English message with a
+ *     Hebrew accent; a Hebrew message is moved by `chooseVoice` below, which is a
+ *     separate decision made from the text.
+ *  3. **Polly.** What this read with before there was anything free, what a box with
+ *     no Azure credentials still reads with, and never worse than the device's own.
+ *
+ * A `SPEAK_VOICE` naming a voice this box does not have falls through rather than
+ * failing: it is a preference, not an assertion, and the deployment it is most likely
+ * to be wrong on is one where the credentials for its provider have been removed.
+ */
+export function preferredVoice(known) {
+  const byName = (name) => known.find((v) => v.id.toLowerCase() === String(name).toLowerCase());
+  const free = known.find(
+    (v) => v.provider === 'azure' && /^en/i.test(String(v.language || '')),
+  );
+  return (SPEAK_VOICE ? byName(SPEAK_VOICE) : null) || free || byName(POLLY_VOICE);
+}
+
+/**
  * The voice to use, as a whole record: which provider, which engine, which name.
  *
  * Three things happen here, and the order matters.
@@ -981,7 +1061,7 @@ export function chooseVoice(requested, text, known) {
   const wanted = String(requested || '').trim();
   const byName = (name) => known.find((v) => v.id.toLowerCase() === String(name).toLowerCase());
 
-  let chosen = byName(wanted) || byName(DEFAULT_VOICE) || known[0];
+  let chosen = byName(wanted) || preferredVoice(known) || known[0];
 
   if (needsMultilingualVoice(text) && !speaksHebrew(chosen)) {
     // In order: the Hebrew voice this deployment prefers, any Hebrew voice, any
@@ -1103,7 +1183,14 @@ export async function speechStatus({
   return {
     configured: ordered.length > 0,
     engine: ENGINE,
-    voice: ordered.length ? (await pickVoice(DEFAULT_VOICE)).id : null,
+    /*
+     * Which voice a phone that has never chosen will be read in — asked of the list
+     * this answer is built from rather than of `knownVoices()`, so that what the
+     * picker shows as the default is the default *for this answer*. The two lists can
+     * differ: this one is injectable, which is what lets every ordering below be
+     * checked without an AWS account or an Azure key.
+     */
+    voice: ordered.length ? (preferredVoice(ordered) || ordered[0]).id : null,
     voices: ordered,
     // `budget` is Polly's, unchanged, because that is what every existing client
     // reads. `budgets` is both, for a sheet that wants to show which voice has room

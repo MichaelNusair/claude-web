@@ -69,9 +69,13 @@ const secrets = new SecretsManagerClient({ region: REGION });
  */
 let cached = null;
 
+/** The same, for the Azure resource in `azureRealtime`. */
+let cachedAzure = null;
+
 /** Drop the cached key so a newly added or rotated one is picked up. */
 export function resetOpenAi() {
   cached = null;
+  cachedAzure = null;
 }
 
 /**
@@ -108,6 +112,75 @@ export async function openAiKey() {
     cached = false;
   }
   return cached || null;
+}
+
+/**
+ * The Azure OpenAI resource that can hold a realtime conversation, or `null`.
+ *
+ * Why there are two routes to the same models. The realtime API is billed per audio
+ * token and nothing about it is free, so the question is not which vendor is nicer
+ * but which one fails closed. `api.openai.com` bills a card unless the account is
+ * on prepaid credits with auto-recharge off — an account setting this box cannot
+ * see, let alone enforce. An Azure *sponsorship* subscription has no card behind it:
+ * when the credit is gone the subscription stops, which is the same property the F0
+ * Speech tier has and the reason read-aloud uses it. So Azure is preferred when both
+ * are configured, and `REALTIME_PROVIDER=openai` is the way to say otherwise.
+ *
+ * The three fields, all required, in the same voice secret as everything else here:
+ *
+ *     azureRealtimeEndpoint    https://<resource>.openai.azure.com
+ *     azureRealtimeKey         one of the resource's two keys
+ *     azureRealtimeDeployment  the *deployment* name, not the model name
+ *
+ * The deployment is required rather than defaulted because on Azure the model name
+ * in the request is whatever you called the deployment, and a wrong one is a 404 at
+ * mint time with nothing on this box to say which of the two it was. Better to
+ * refuse while the operator is still looking at the secret. Quota is per model and
+ * per region and is frequently zero for the flagship — `gpt-realtime-mini` is what
+ * a new subscription can actually deploy, which is why this is not a one-liner.
+ */
+export async function azureRealtime() {
+  if (cachedAzure !== null) return cachedAzure || null;
+
+  const shape = (endpoint, key, deployment) => {
+    const host = String(endpoint || '').trim().replace(/\/+$/, '');
+    const secret = String(key || '').trim();
+    const name = String(deployment || '').trim();
+    if (!host || !secret || !name) return false;
+    // An endpoint that is not https is a key sent in clear; refuse rather than
+    // downgrade, and refuse a path because the paths are appended below.
+    if (!/^https:\/\/[^/]+$/.test(host)) return false;
+    return { endpoint: host, key: secret, deployment: name };
+  };
+
+  const fromEnv = shape(
+    process.env.AZURE_REALTIME_ENDPOINT,
+    process.env.AZURE_REALTIME_KEY,
+    process.env.AZURE_REALTIME_DEPLOYMENT,
+  );
+  if (fromEnv) {
+    cachedAzure = fromEnv;
+    return cachedAzure;
+  }
+
+  if (!SECRET_ARN) {
+    cachedAzure = false;
+    return null;
+  }
+
+  try {
+    const res = await secrets.send(new GetSecretValueCommand({ SecretId: SECRET_ARN }));
+    const raw = JSON.parse(res.SecretString || '{}');
+    cachedAzure = shape(
+      raw.azureRealtimeEndpoint || raw.azureOpenAiEndpoint,
+      raw.azureRealtimeKey || raw.azureOpenAiKey,
+      raw.azureRealtimeDeployment || raw.azureOpenAiDeployment,
+    );
+  } catch {
+    // Same as `openAiKey`: unreadable and absent are one thing to every caller.
+    cachedAzure = false;
+  }
+  return cachedAzure || null;
 }
 
 /** Is there a key at all? What the status routes ask. */
@@ -153,6 +226,53 @@ export function openAiRefusal(status, body) {
     return `OpenAI is failing (${status})${tail} — try again in a moment`;
   }
   return `OpenAI answered ${status}${tail}`;
+}
+
+/**
+ * The same, for Azure. A separate function rather than a flag on the one above,
+ * because every sentence in it would have to change: the field to check has a
+ * different name, a 404 means a deployment that does not exist rather than a model
+ * this account cannot see, and a 429 on Azure is as likely to be a quota of zero on
+ * the deployment as it is an exhausted balance. An operator who is told to check
+ * `openaiApiKey` when the problem is a deployment name has been sent to the wrong
+ * place, which is worse than a bare status code.
+ */
+export function azureRealtimeRefusal(status, body) {
+  const text = String(body || '').slice(0, 600);
+  let detail = '';
+  try {
+    detail = JSON.parse(text)?.error?.message || '';
+  } catch {
+    detail = '';
+  }
+  const tail = detail ? ` — ${detail}` : '';
+
+  if (status === 401 || status === 403) {
+    return (
+      'Azure rejected the key. Check `azureRealtimeKey` in the voice secret ' +
+      `(${SECRET_ARN || 'AZURE_REALTIME_KEY'}) — the resource has two, either works — ` +
+      `then GET /api/voice-status?refresh=1${tail}`
+    );
+  }
+  if (status === 404) {
+    return (
+      'Azure has no such deployment. `azureRealtimeDeployment` must be the name you ' +
+      `gave the deployment, not the model name${tail}`
+    );
+  }
+  if (status === 429) {
+    return (
+      'Azure is rate limiting this deployment, or the subscription is out of credit. ' +
+      `Check the deployment's tokens-per-minute quota as well as the balance${tail}`
+    );
+  }
+  if (status === 400 || status === 422) {
+    return `Azure refused the request${tail}`;
+  }
+  if (status >= 500) {
+    return `Azure OpenAI is failing (${status})${tail} — try again in a moment`;
+  }
+  return `Azure answered ${status}${tail}`;
 }
 
 /** Which secret the key is expected in, for a status answer to name. */
