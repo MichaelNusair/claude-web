@@ -761,6 +761,38 @@ server {
     # nothing else, including the 100M uploads and the long-lived streams below.
     limit_req zone=login_by_path burst=5 nodelay;
 
+    # Compression, and it belongs to the editor routes even though it is set here.
+    #
+    # Those routes strip the browser's Accept-Encoding, because sub_filter cannot
+    # rewrite bytes it cannot read — and that one header was throwing away
+    # compression code-server had already done. Left alone it answers /static/…
+    # and /vscode-remote-resource with \`Content-Encoding: br\` and a year of
+    # max-age; stripped, it answers with the raw file. Measured on the box:
+    # workbench.web.main.internal.js 17.2M -> 4.3M, the Claude panel's own webview
+    # bundle 5.2M -> 1.4M, the workbench CSS 1.25M -> 160K. About 24M of
+    # JavaScript per cold editor load, uncompressed, which is what a phone on a
+    # mobile link feels as the panel taking forever to appear.
+    #
+    # nginx's gzip filter runs *after* sub_filter, so the injection still happens
+    # and the browser still gets compressed bytes: the strip stays where it is and
+    # the compression moves one hop later. gzip rather than brotli because AL2023
+    # ships no nginx brotli module (checked: the repos have brotli itself and
+    # nginx-mod-{headers-more,njs,stream,…}, not that one) — a few hundred
+    # kilobytes worse than code-server's br, against the ~18M this puts back.
+    #
+    # \`gzip_proxied any\` is load-bearing: every route below is a proxy_pass, and
+    # without it nginx compresses none of them. Cost is ~0.5s of one CPU per 17M
+    # asset, and only on a cold load — these carry max-age=31536000, so a warm
+    # browser re-downloads nothing. text/event-stream is absent from the list on
+    # purpose, and so is anything already compressed (woff2, png, the vsix).
+    gzip on;
+    gzip_proxied any;
+    gzip_vary on;
+    gzip_comp_level 5;
+    gzip_min_length 1024;
+    gzip_types text/css text/javascript application/javascript application/json
+               application/manifest+json image/svg+xml application/wasm;
+
     # ALB health check — must not require a password.
     location = /healthz {
         access_log off;
