@@ -255,6 +255,21 @@ step "Checking the spoken conversation"
 ) || { echo "spoken conversation tests failed — not deploying." >&2; exit 1; }
 
 # ---------------------------------------------------------------------------
+step "Checking which model hears you"
+# ---------------------------------------------------------------------------
+# Dictation has three backends now, and the routing between them is the kind of
+# thing that fails without failing: the model installed on this box is
+# `ggml-base.en.bin`, and handed Hebrew it returns a fluent English sentence
+# nobody said, straight into the box where a prompt is typed. So this checks that
+# a non-English request never reaches it — and, in a second pass with a fake key,
+# that English still goes to the free local model rather than quietly starting to
+# cost money per minute. No whisper run, no network, no audio transcribed.
+(
+  cd chat-service
+  node transcribe-test.js
+) || { echo "dictation routing tests failed — not deploying." >&2; exit 1; }
+
+# ---------------------------------------------------------------------------
 step "Checking the project lifecycle"
 # ---------------------------------------------------------------------------
 # Removing a project deletes a directory tree, so this exercises the refusals

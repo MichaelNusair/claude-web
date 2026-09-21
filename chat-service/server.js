@@ -537,9 +537,18 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    /*
+     * Hear a dictation. `?lang=he` is a routing decision, not a hint: the model
+     * installed on this box is English-only and answers Hebrew speech with fluent
+     * English that nobody said, so a language other than English is sent to a hosted
+     * model or refused. See transcribe.js. No parameter means English, which is what
+     * every existing client sends and what the local model is for.
+     */
     if (pathname === '/api/transcribe' && req.method === 'POST') {
       const body = await readBody(req);
-      const text = await transcribe(body, req.headers['content-type']);
+      const text = await transcribe(body, req.headers['content-type'], {
+        lang: url.searchParams.get('lang') || '',
+      });
       json(res, 200, { text });
       return;
     }
