@@ -271,9 +271,10 @@ step "Checking which model hears you"
 # thing that fails without failing: the model installed on this box is
 # `ggml-base.en.bin`, and handed Hebrew it returns a fluent English sentence
 # nobody said, straight into the box where a prompt is typed. So this checks that
-# a non-English request never reaches it — and, in a second pass with a fake key,
+# a non-English request never reaches it — and, across four passes with fake keys,
 # that English still goes to the free local model rather than quietly starting to
-# cost money per minute. No whisper run, no network, no audio transcribed.
+# cost money per minute, and that Hebrew goes to the free recognizer before the
+# metered one. No whisper run, no network, no audio transcribed.
 (
   cd chat-service
   node transcribe-test.js

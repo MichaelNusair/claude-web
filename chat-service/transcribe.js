@@ -1,5 +1,5 @@
 /**
- * Transcription with three backends.
+ * Transcription with four backends.
  *
  * Local whisper.cpp is the default: no quota to request, no API key, no
  * per-request cost, and nothing leaves the box. Measured on this instance
@@ -9,7 +9,8 @@
  * Azure OpenAI Whisper is used instead when credentials are present, for when
  * a bigger/faster hosted model is wanted.
  *
- * **OpenAI is used when the language is not English, and that is not a preference.**
+ * **A hosted model is used when the language is not English, and that is not a
+ * preference.**
  * The model installed on this box is `ggml-base.en.bin` — the `.en` is the whole
  * point of it — and the way an English-only Whisper model fails on Hebrew speech is
  * the worst available: not an error, not silence, but a fluent English sentence that
@@ -20,6 +21,14 @@
  * sentence saying why. Same reasoning as read aloud, where Polly skips Hebrew
  * characters rather than mispronouncing them: the refusals here exist because the
  * successes are indistinguishable from them.
+ *
+ * Which hosted one: **Azure AI Speech first**, because its F0 tier is free and it is
+ * the fastest of the three from this box — 710 ms for a Hebrew sentence, against an
+ * upload to OpenAI. It only takes WAV, though, and only 55 seconds of it, so OpenAI is
+ * second and is what actually answers for a client that could not convert its
+ * recording. Azure OpenAI's Whisper is third if a deployment exists. The order is cost
+ * first and capability second, which is why a webm recording still works and still
+ * costs something.
  */
 import { execFile } from 'child_process';
 import { writeFile, unlink, mkdtemp, access } from 'fs/promises';
@@ -31,6 +40,22 @@ import {
   GetSecretValueCommand,
 } from '@aws-sdk/client-secrets-manager';
 import { openAiKey, openAiRefusal, resetOpenAi } from './openai.js';
+/*
+ * Two different Azures are in this file, which is confusing enough to be worth saying
+ * once: `loadAzure`/`transcribeAzure` are **Azure OpenAI**, a Whisper deployment
+ * someone would have to create, billed per minute. `hearAzure` is **Azure AI Speech**,
+ * the free F0 resource this deployment actually has. They share a secret and nothing
+ * else, and the free one goes first.
+ */
+import {
+  azureCanHear,
+  azureSpeechConfigured,
+  azureSpeechStatus,
+  hearAzure,
+  resetAzureSpeech,
+  wavSeconds,
+  MAX_AUDIO_SECONDS,
+} from './azure-speech.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -74,6 +99,10 @@ export function resetConfigCache() {
   // as a rotated Azure one. `resetSpeech()` also does this and the second call is a
   // no-op; both are here so neither module depends on the other being called.
   resetOpenAi();
+  // And the Speech credentials, which live in the same secret and are the likeliest
+  // thing to have just been added by hand: without this, adding them and calling
+  // /api/voice-status?refresh=1 would report the new Hebrew ear and keep refusing.
+  resetAzureSpeech();
 }
 
 async function haveLocalWhisper() {
@@ -315,10 +344,27 @@ export async function transcribe(body, contentType, { lang } = {}) {
    * Not English. The local model is `.en` and would answer with fluent nonsense, so
    * it is not in this branch at all — not even as a last resort, because a last
    * resort whose output cannot be told apart from a success is worse than a refusal.
-   * OpenAI first, Azure's Whisper second (multilingual, if a deployment happens to be
-   * configured), and then a sentence saying what to do.
+   *
+   * Azure AI Speech first, because it is free and because it is the fastest of the
+   * three from this box: measured at 710 ms for a Hebrew sentence, against several
+   * seconds for an upload to OpenAI. OpenAI second — it is metered per minute, and it
+   * is also the only one of the three that can take webm, which is what two of the
+   * three clients send when they cannot convert. Azure OpenAI's Whisper third, if
+   * someone has deployed one. Then a sentence saying what to do.
    */
   if (!english) {
+    const speech = await azureSpeechConfigured();
+    if (speech && azureCanHear(audio)) {
+      try {
+        return await hearAzure(audio, code);
+      } catch (err) {
+        // Only worth continuing if something else could answer. The message is kept
+        // either way: "the free tier's month is used up" and "no Hebrew in that
+        // recording" are different problems and the log is where they are told apart.
+        if (!(await openAiKey()) && !azure) throw err;
+        console.warn(`azure speech failed, falling back: ${err.message}`);
+      }
+    }
     if (await openAiKey()) {
       try {
         return await transcribeOpenAi(audio, code);
@@ -328,11 +374,33 @@ export async function transcribe(body, contentType, { lang } = {}) {
       }
     }
     if (azure) return transcribeAzure(audio, azure, code);
+
+    /*
+     * Nothing can hear this. Which sentence to say depends on *why*, because the two
+     * reasons need opposite actions: with no credentials at all someone has to add
+     * some, but with Speech configured and a webm recording the credentials are fine
+     * and the recording is the problem — and telling that person to go and buy an
+     * OpenAI key would be wrong as well as expensive.
+     */
+    if (speech) {
+      const seconds = wavSeconds(audio);
+      throw new Error(
+        seconds > MAX_AUDIO_SECONDS
+          ? `that recording is ${Math.round(seconds)} seconds and the free Hebrew ` +
+            `recognizer takes ${MAX_AUDIO_SECONDS} at a time — say it in a shorter go, ` +
+            'or add an `openaiApiKey` to the voice secret for long recordings'
+          : `dictation in "${code}" works here, but only from a WAV recording: this one ` +
+            'arrived in the format the browser recorded, and the free recognizer does ' +
+            'not take it. Dictate from the editor overlay, which converts before ' +
+            'uploading, or add an `openaiApiKey` to the voice secret',
+      );
+    }
     throw new Error(
       `dictation in "${code}" needs a hosted model: the only one installed here is ` +
         `${basename(WHISPER_MODEL)}, which is English-only and would answer with ` +
-        'confident English nonsense rather than an error. Put an OpenAI key in the ' +
-        '`openaiApiKey` field of the voice secret and call /api/voice-status?refresh=1',
+        'confident English nonsense rather than an error. Put `speechKey` and ' +
+        '`speechRegion` for an Azure Speech resource in the voice secret — its free ' +
+        'tier covers this — or an `openaiApiKey`, then call /api/voice-status?refresh=1',
     );
   }
 
@@ -363,16 +431,32 @@ export async function voiceStatus() {
   const azure = await loadAzure();
   const local = await haveLocalWhisper();
   const openai = Boolean(await openAiKey());
+  const speech = await azureSpeechStatus();
   // The local model's filename is the whole story: `.en` means English-only, which
   // is why a language is a routing decision here and not a parameter.
   const englishOnly = /\.en\b/.test(basename(WHISPER_MODEL));
   return {
-    configured: Boolean(azure) || local || openai,
+    configured: Boolean(azure) || local || openai || speech.configured,
     backend: azure ? 'azure' : local ? 'local' : openai ? 'openai' : 'none',
     local: { available: local, binary: WHISPER_BIN, model: WHISPER_MODEL, englishOnly },
     azure: azure
       ? { endpoint: azure.endpoint, deployment: azure.deployment }
       : { configured: false },
+    /*
+     * Azure AI Speech, which is a different thing from `azure` above — that one is an
+     * Azure OpenAI Whisper deployment. Reported under its own key rather than folded
+     * into the other, because they cost differently: this one is free and that one is
+     * per-minute, and an operator reading this is usually asking which is in use.
+     */
+    speech: {
+      configured: speech.configured,
+      region: speech.region,
+      tier: speech.tier,
+      // What it will and will not take, because this is the backend whose refusals are
+      // about the recording rather than about the credentials.
+      wants: `WAV, up to ${MAX_AUDIO_SECONDS}s at a time`,
+      reason: speech.reason,
+    },
     openai: openai
       ? { configured: true, model: OPENAI_MODEL, budget: uploadBudget() }
       : { configured: false },
@@ -384,14 +468,17 @@ export async function voiceStatus() {
      * get either a refusal or, before this existed, an English sentence nobody said.
      */
     languages: {
-      english: Boolean(azure) || local || openai,
-      other: openai || Boolean(azure),
-      via: openai ? 'openai' : azure ? 'azure' : null,
-      reason: openai || azure
+      english: Boolean(azure) || local || openai || speech.configured,
+      other: speech.configured || openai || Boolean(azure),
+      // In the order they are actually tried, so this answers "what will happen" and
+      // not just "what exists". Speech leads because it is free and the fastest.
+      via: speech.configured ? 'azure-speech' : openai ? 'openai' : azure ? 'azure' : null,
+      reason: speech.configured || openai || azure
         ? null
         : `the only model installed here is ${basename(WHISPER_MODEL)}, which is ` +
-          'English-only — put an OpenAI key in the `openaiApiKey` field of the voice ' +
-          'secret to dictate in another language',
+          'English-only — put `speechKey` and `speechRegion` for an Azure Speech ' +
+          'resource in the voice secret (its free tier covers this) or an ' +
+          '`openaiApiKey`, to dictate in another language',
     },
   };
 }

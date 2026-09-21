@@ -68,7 +68,7 @@ const TTS_FORMAT = process.env.AZURE_SPEECH_FORMAT || 'audio-24khz-48kbitrate-mo
  * about the request body and reads like a bug in the app rather than "that was too
  * long to say in one go".
  */
-const MAX_AUDIO_SECONDS = Number(process.env.AZURE_SPEECH_MAX_SECONDS || 55);
+export const MAX_AUDIO_SECONDS = Number(process.env.AZURE_SPEECH_MAX_SECONDS || 55);
 
 const secrets = new SecretsManagerClient({ region: REGION });
 
@@ -259,6 +259,25 @@ export async function speakAzure(text, voiceName, { fetchImpl = fetch, config: g
  * rather than assuming 16 kHz mono, because the two clients record differently and a
  * refusal computed from the wrong rate would be wrong in both directions.
  */
+/**
+ * Can this recognizer be given these bytes at all?
+ *
+ * Asked because it is not the same question as whether there are credentials. The
+ * short-audio API takes WAV; the editor overlay converts to WAV before uploading, but
+ * the chat PWA falls back to raw webm/opus when it cannot, and the voice extension
+ * sends webm always. Handed webm under a WAV content type, Azure answers 400 — so a
+ * caller that routed on credentials alone would turn a working OpenAI transcription
+ * into a failure for anyone on the surfaces that do not convert.
+ *
+ * The length ceiling is part of the same answer for the same reason: a 90-second
+ * Hebrew recording is not something this backend can do, and the caller wants to know
+ * that before it commits rather than after.
+ */
+export function azureCanHear(audio) {
+  const seconds = wavSeconds(audio);
+  return seconds > 0 && seconds <= MAX_AUDIO_SECONDS;
+}
+
 export function wavSeconds(audio) {
   if (!Buffer.isBuffer(audio) || audio.length < 44) return 0;
   if (audio.subarray(0, 4).toString('ascii') !== 'RIFF') return 0;
