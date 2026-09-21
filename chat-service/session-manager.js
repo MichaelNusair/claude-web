@@ -102,12 +102,16 @@ function truncate(text, max = 70) {
  * one of these callers deletes a directory tree, so the name it is handed must
  * not be able to name a directory somewhere else.
  */
-function projectPathFor(name) {
+function assertSafeName(name) {
   if (typeof name !== 'string' || !/^[A-Za-z0-9._-]+$/.test(name)) {
     throw new Error('name may only contain letters, numbers, dot, dash and underscore');
   }
   if (name.startsWith('.') || name.length > 100) throw new Error('invalid project name');
-  return join(PROJECTS_ROOT, name);
+  return name;
+}
+
+function projectPathFor(name) {
+  return join(PROJECTS_ROOT, assertSafeName(name));
 }
 
 /**
@@ -158,6 +162,139 @@ async function git(cwd, args, { timeout = 60_000, env = {} } = {}) {
       err: (err.stderr || err.message || '').toString().trim(),
     };
   }
+}
+
+// Directories a repository is never kept in, and which are large enough that
+// walking them is the difference between a status call costing milliseconds and
+// costing seconds. A dependency tree holds other people's code by definition.
+const NEVER_A_PROJECT_REPO = new Set(['node_modules', 'vendor', '__pycache__']);
+
+/**
+ * Every git repository inside a project, the project root included.
+ *
+ * A project here is a *directory*, not a repository — the same shape as a VS
+ * Code workspace — so `api/` and `web/` side by side is one project with two
+ * repos and nothing at its root. Anything that inspects or deletes a project has
+ * to see all of them: the version of this that only looked at the root would
+ * push the root, report a verified success, and then `rm -rf` a sibling repo's
+ * unpushed commits.
+ *
+ * Deliberately a filesystem walk rather than asking git. A repo the outer
+ * `.gitignore` hides is invisible to `git status`, and that is precisely the
+ * case that loses work without anyone noticing.
+ *
+ * `.git` has to be a *directory*. When it is a file the checkout belongs to some
+ * other repository — a submodule, or a linked worktree — and pushing it from
+ * here would mean pushing another repo's detached HEAD. Submodules already
+ * travel with their superproject, which is why `cloneProject` recurses them.
+ *
+ * Returned root-first, parents before their descendants, which is the order
+ * `removeProject` reverses to save an embedded repo before the repo embedding it.
+ */
+async function findRepos(root, { maxDepth = 3, limit = 25 } = {}) {
+  const found = [];
+
+  const walk = async (dir, rel, depth) => {
+    if (found.length >= limit) return;
+    const dotGit = await stat(join(dir, '.git')).catch(() => null);
+    if (dotGit?.isDirectory()) found.push(rel);
+    if (depth >= maxDepth) return;
+
+    for (const entry of await readdir(dir, { withFileTypes: true }).catch(() => [])) {
+      // `isDirectory()` is false for a symlink, which is what keeps this walk
+      // from following one out of the project or around in a circle.
+      if (!entry.isDirectory() || entry.name.startsWith('.')) continue;
+      if (NEVER_A_PROJECT_REPO.has(entry.name)) continue;
+      await walk(join(dir, entry.name), rel ? `${rel}/${entry.name}` : entry.name, depth + 1);
+    }
+  };
+
+  await walk(root, '', 0);
+  return found;
+}
+
+/**
+ * How to name a repository in a sentence the user reads.
+ *
+ * A project with one repo at its root is the common case and should read exactly
+ * as it did when that was the only case — `"koinespace"`, not
+ * `"koinespace" (the project root)`. Only a project with more than one repo needs
+ * the subdirectory said out loud.
+ */
+function label(project, repo) {
+  return repo.dir ? `"${project}/${repo.dir}"` : `"${project}"`;
+}
+
+/** The path a `git status --porcelain` line refers to, without its status flags. */
+function porcelainPath(line) {
+  return line.slice(3).replace(/^"|"$/g, '').replace(/\/$/, '');
+}
+
+/**
+ * What one repository still holds that nothing else has.
+ *
+ * `nested` names the repos that live *inside* this one, relative to it. They are
+ * dropped from this repo's own dirty and ignored lists, because they get a block
+ * of their own: without this, a project whose root repo contains `web/` reports
+ * "1 uncommitted change: web/" for what is actually a whole second repository,
+ * and the number the user is deciding from is describing the wrong thing.
+ */
+async function repoStatus(dir, rel, nested = []) {
+  const repo = {
+    dir: rel,
+    path: dir,
+    hasCommits: false,
+    branch: null,
+    remote: null,
+    dirty: 0,
+    dirtySample: [],
+    unpushed: 0,
+    unpushedBranches: [],
+    stashes: 0,
+    // Present in the directory but invisible to git: an .env or a local build
+    // that no push can preserve. Almost always fine to lose, occasionally the
+    // only copy of a credential, so it is shown rather than assumed.
+    ignored: [],
+  };
+
+  const isNested = (line) => nested.includes(porcelainPath(line));
+
+  const branch = await git(dir, ['rev-parse', '--abbrev-ref', 'HEAD']);
+  repo.branch = branch.ok ? branch.out : null;
+  repo.hasCommits = (await git(dir, ['rev-parse', '--verify', 'HEAD'])).ok;
+
+  const remote = await git(dir, ['remote', 'get-url', 'origin']);
+  repo.remote = remote.ok ? remote.out : null;
+
+  const porcelain = await git(dir, ['status', '--porcelain']);
+  const changes = (porcelain.out ? porcelain.out.split('\n') : []).filter((l) => !isNested(l));
+  repo.dirty = changes.length;
+  repo.dirtySample = changes.slice(0, 8).map((l) => l.slice(3));
+
+  // `--ignored` collapses whole ignored directories into one entry, so this is
+  // "node_modules/, .env" rather than forty thousand paths.
+  const ignored = await git(dir, ['status', '--porcelain', '--ignored']);
+  repo.ignored = (ignored.out ? ignored.out.split('\n') : [])
+    .filter((l) => l.startsWith('!! ') && !isNested(l))
+    .map((l) => l.slice(3))
+    .slice(0, 12);
+
+  const stashes = await git(dir, ['stash', 'list']);
+  repo.stashes = stashes.out ? stashes.out.split('\n').length : 0;
+
+  // Per branch, not just the current one: the directory is about to stop
+  // existing, so a side branch nobody pushed is a side branch that is gone.
+  const heads = await git(dir, ['for-each-ref', '--format=%(refname:short)', 'refs/heads']);
+  for (const head of heads.out ? heads.out.split('\n') : []) {
+    const log = await git(dir, ['log', '--oneline', head, '--not', '--remotes']);
+    const commits = log.ok && log.out ? log.out.split('\n').length : 0;
+    if (commits) {
+      repo.unpushed += commits;
+      repo.unpushedBranches.push({ dir: rel, branch: head, commits });
+    }
+  }
+
+  return repo;
 }
 
 /**
@@ -871,6 +1008,16 @@ export class SessionManager {
    * answer before offering the button. Every field here exists because it names a
    * way work can live *only* on this machine: uncommitted edits, commits no
    * remote has, stashes, and files git was told to ignore.
+   *
+   * `repos` is the real answer — one entry per repository in the project, root
+   * first — because a project may hold several, or none at its root. The flat
+   * fields beside it are kept for two reasons: the root repository is what the
+   * single-repo majority of projects means by "the repo", and a client cached
+   * from before this existed still reads them. So `isRepo`, `branch`, `remote`,
+   * `hasCommits` and `dirtySample` describe the *root*, while the counters —
+   * `dirty`, `unpushed`, `stashes`, `ignored` — are totals across every repo.
+   * Totals are the safe direction for an old client to be wrong in: it warns
+   * about work it cannot attribute, rather than missing it.
    */
   async projectStatus(name) {
     const path = projectPathFor(name);
@@ -880,6 +1027,7 @@ export class SessionManager {
     const status = {
       name,
       path,
+      repos: [],
       isRepo: false,
       hasCommits: false,
       branch: null,
@@ -889,51 +1037,41 @@ export class SessionManager {
       unpushed: 0,
       unpushedBranches: [],
       stashes: 0,
-      // Present in the directory but invisible to git: an .env or a local build
-      // that no push can preserve. Almost always fine to lose, occasionally the
-      // only copy of a credential, so it is shown rather than assumed.
       ignored: [],
       live: this.#liveIn(path).map((c) => ({ sessionId: c.sessionId, busy: c.busy })),
       transcripts: (await this.listSessions(path)).length,
     };
 
-    if (!(await git(path, ['rev-parse', '--git-dir'])).ok) return status;
-    status.isRepo = true;
-
-    const branch = await git(path, ['rev-parse', '--abbrev-ref', 'HEAD']);
-    status.branch = branch.ok ? branch.out : null;
-    status.hasCommits = (await git(path, ['rev-parse', '--verify', 'HEAD'])).ok;
-
-    const remote = await git(path, ['remote', 'get-url', 'origin']);
-    status.remote = remote.ok ? remote.out : null;
-
-    const porcelain = await git(path, ['status', '--porcelain']);
-    const changes = porcelain.out ? porcelain.out.split('\n') : [];
-    status.dirty = changes.length;
-    status.dirtySample = changes.slice(0, 8).map((l) => l.slice(3));
-
-    // `--ignored` collapses whole ignored directories into one entry, so this is
-    // "node_modules/, .env" rather than forty thousand paths.
-    const ignored = await git(path, ['status', '--porcelain', '--ignored']);
-    status.ignored = (ignored.out ? ignored.out.split('\n') : [])
-      .filter((l) => l.startsWith('!! '))
-      .map((l) => l.slice(3))
-      .slice(0, 12);
-
-    const stashes = await git(path, ['stash', 'list']);
-    status.stashes = stashes.out ? stashes.out.split('\n').length : 0;
-
-    // Per branch, not just the current one: the directory is about to stop
-    // existing, so a side branch nobody pushed is a side branch that is gone.
-    const heads = await git(path, ['for-each-ref', '--format=%(refname:short)', 'refs/heads']);
-    for (const head of heads.out ? heads.out.split('\n') : []) {
-      const log = await git(path, ['log', '--oneline', head, '--not', '--remotes']);
-      const commits = log.ok && log.out ? log.out.split('\n').length : 0;
-      if (commits) {
-        status.unpushed += commits;
-        status.unpushedBranches.push({ branch: head, commits });
-      }
+    const dirs = await findRepos(path);
+    for (const rel of dirs) {
+      // The repos directly under this one, named the way its own `git status`
+      // names them, so this repo's counts describe this repo.
+      const prefix = rel ? `${rel}/` : '';
+      const nested = dirs
+        .filter((other) => other !== rel && other.startsWith(prefix))
+        .map((other) => other.slice(prefix.length));
+      status.repos.push(await repoStatus(join(path, rel), rel, nested));
     }
+
+    const root = status.repos.find((r) => r.dir === '');
+    if (root) {
+      status.isRepo = true;
+      status.hasCommits = root.hasCommits;
+      status.branch = root.branch;
+      status.remote = root.remote;
+      status.dirtySample = root.dirtySample;
+    }
+
+    for (const repo of status.repos) {
+      status.dirty += repo.dirty;
+      status.unpushed += repo.unpushed;
+      status.stashes += repo.stashes;
+      status.unpushedBranches.push(...repo.unpushedBranches);
+      // Prefixed so "not in git" still says *where*, now that it can come from
+      // more than one repository.
+      status.ignored.push(...repo.ignored.map((f) => (repo.dir ? `${repo.dir}/${f}` : f)));
+    }
+    status.ignored = status.ignored.slice(0, 12);
 
     return status;
   }
@@ -950,6 +1088,12 @@ export class SessionManager {
    * Chat transcripts under CLAUDE_HOME are deliberately left in place. They are
    * small, they are the record of what was done here, and keeping them means
    * cloning the repo back later lands next to its own history.
+   *
+   * Every repository in the project goes through this, not just the one at the
+   * root. A project holding two repos has two sets of commits to save, and the
+   * outer repo cannot stand in for the inner one: `git add -A` records an
+   * embedded repository as a gitlink, so pushing the outer repo sends a *pointer*
+   * to a commit that then gets deleted along with the only repository that has it.
    */
   async removeProject(name, { force = false } = {}) {
     const status = await this.projectStatus(name);
@@ -963,87 +1107,101 @@ export class SessionManager {
       if (status.live.some((c) => c.busy)) {
         block('a chat in this project is still working — stop it first, or force the removal');
       }
-      if (!status.isRepo) {
+      if (!status.repos.length) {
         block(`"${name}" is not a git repository, so there is nowhere to push it — deleting it would lose the files outright`);
       }
-      if (status.stashes) {
-        block(`${status.stashes} stashed change${status.stashes === 1 ? '' : 's'} would be lost — a stash is not pushed by anything`);
+      for (const repo of status.repos) {
+        if (repo.stashes) {
+          block(`${repo.stashes} stashed change${repo.stashes === 1 ? '' : 's'} in ${label(name, repo)} would be lost — a stash is not pushed by anything`);
+        }
       }
     }
 
-    if (status.isRepo) {
-      if (status.hasCommits && status.branch === 'HEAD' && !force) {
-        block('HEAD is detached — check out a branch so there is something to push');
+    /**
+     * Save one repository: commit what is loose, push every branch and tag, then
+     * ask the remote whether it really has the commit.
+     */
+    const save = async (repo) => {
+      const dir = repo.path;
+      const where = label(name, repo);
+      const at = (step, rest) => steps.push({ step, dir: repo.dir, ...rest });
+
+      if (repo.hasCommits && repo.branch === 'HEAD' && !force) {
+        block(`HEAD is detached in ${where} — check out a branch so there is something to push`);
       }
 
-      if (status.dirty) {
-        const add = await git(path, ['add', '-A'], { timeout: 300_000 });
-        if (!add.ok && !force) block(`git add failed: ${add.err}`);
+      if (repo.dirty) {
+        const add = await git(dir, ['add', '-A'], { timeout: 300_000 });
+        if (!add.ok && !force) block(`git add failed in ${where}: ${add.err}`);
         const commit = await git(
-          path,
+          dir,
           ['commit', '-m', 'Save work before removing this project from the workspace'],
           { timeout: 300_000 },
         );
         // "nothing to commit" is a success here: it means everything still
         // showing as dirty was ignored, which the ignored-files list covers.
         const empty = /nothing to commit|nothing added to commit/i.test(`${commit.out}\n${commit.err}`);
-        if (!commit.ok && !empty && !force) block(`git commit failed: ${commit.err || commit.out}`);
-        steps.push({ step: 'commit', ok: commit.ok || empty, error: commit.ok || empty ? undefined : commit.err });
+        if (!commit.ok && !empty && !force) block(`git commit failed in ${where}: ${commit.err || commit.out}`);
+        at('commit', { ok: commit.ok || empty, error: commit.ok || empty ? undefined : commit.err });
       }
 
       // Re-read after the commit: an empty repository that had uncommitted files
       // has a HEAD (and a branch) now, and both are what the push verifies.
-      const hasCommits = (await git(path, ['rev-parse', '--verify', 'HEAD'])).ok;
+      const hasCommits = (await git(dir, ['rev-parse', '--verify', 'HEAD'])).ok;
       const branch = hasCommits
-        ? (await git(path, ['rev-parse', '--abbrev-ref', 'HEAD'])).out
+        ? (await git(dir, ['rev-parse', '--abbrev-ref', 'HEAD'])).out
         : null;
 
       if (!hasCommits) {
         // A git repo with no commits holds nothing a push could preserve.
-        steps.push({ step: 'push', ok: true, note: 'no commits to push' });
-      } else if (!status.remote && !force) {
-        block(`"${name}" has no git remote — there is nothing to push to, so deleting it would lose the commits`);
-      } else if (status.remote) {
+        at('push', { ok: true, note: 'no commits to push' });
+      } else if (!repo.remote && !force) {
+        block(`${where} has no git remote — there is nothing to push to, so deleting it would lose the commits`);
+      } else if (repo.remote) {
         // Every branch and every tag, because none of them survive the delete.
-        const all = await git(path, ['push', '--all', 'origin'], { timeout: 900_000 });
+        const all = await git(dir, ['push', '--all', 'origin'], { timeout: 900_000 });
         if (all.ok) {
-          steps.push({ step: 'push', ok: true });
+          at('push', { ok: true });
         } else {
           // One branch failing (a diverged side branch, a protected ref) must not
           // stop the current branch from being saved. The verification below is
           // what decides whether pushing only HEAD was good enough.
-          const head = await git(path, ['push', '-u', 'origin', 'HEAD'], { timeout: 900_000 });
-          steps.push({
-            step: 'push',
+          const head = await git(dir, ['push', '-u', 'origin', 'HEAD'], { timeout: 900_000 });
+          at('push', {
             ok: head.ok,
             note: head.ok ? `some branches were not pushed: ${all.err.slice(0, 200)}` : undefined,
             error: head.ok ? undefined : head.err.slice(0, 300),
           });
         }
-        const tags = await git(path, ['push', '--tags', 'origin'], { timeout: 300_000 });
-        if (!tags.ok) steps.push({ step: 'push tags', ok: false, error: tags.err.slice(0, 200) });
+        const tags = await git(dir, ['push', '--tags', 'origin'], { timeout: 300_000 });
+        if (!tags.ok) at('push tags', { ok: false, error: tags.err.slice(0, 200) });
       }
 
       if (hasCommits && !force) {
-        const leftover = await git(path, ['log', '--oneline', '--branches', '--not', '--remotes']);
+        const leftover = await git(dir, ['log', '--oneline', '--branches', '--not', '--remotes']);
         if (leftover.out) {
           const n = leftover.out.split('\n').length;
-          block(`${n} commit${n === 1 ? '' : 's'} still exist only on this machine after pushing — refusing to delete`);
+          block(`${n} commit${n === 1 ? '' : 's'} in ${where} still exist only on this machine after pushing — refusing to delete`);
         }
 
         // Ask the remote directly. The check above trusts remote-tracking refs,
         // which are local files and can be stale or hand-edited; this one cannot.
-        const local = await git(path, ['rev-parse', 'HEAD']);
-        const remoteRef = await git(path, ['ls-remote', 'origin', `refs/heads/${branch}`], {
+        const local = await git(dir, ['rev-parse', 'HEAD']);
+        const remoteRef = await git(dir, ['ls-remote', 'origin', `refs/heads/${branch}`], {
           timeout: 120_000,
         });
-        if (!remoteRef.ok) block(`could not reach the remote to verify the push: ${remoteRef.err}`);
+        if (!remoteRef.ok) block(`could not reach the remote of ${where} to verify the push: ${remoteRef.err}`);
         if (!remoteRef.out.startsWith(local.out)) {
-          block(`the remote's ${branch} is not at the commit on this machine — refusing to delete`);
+          block(`the remote's ${branch} for ${where} is not at the commit on this machine — refusing to delete`);
         }
-        steps.push({ step: 'verify', ok: true, commit: local.out.slice(0, 12), branch });
+        at('verify', { ok: true, commit: local.out.slice(0, 12), branch });
       }
-    }
+    };
+
+    // Deepest first. An embedded repo has to reach its own remote before the repo
+    // containing it commits the gitlink pointing at it, or the outer repo's
+    // history references a commit that only this disk has.
+    for (const repo of [...status.repos].reverse()) await save(repo);
 
     // Stop the processes before the directory goes away: a `claude` whose cwd has
     // been deleted keeps running against a working directory that no longer
@@ -1067,15 +1225,32 @@ export class SessionManager {
    * credential helper being configured. Plain `git clone` is the fallback, which
    * is what works on a box provisioned with the helper but no gh.
    */
-  async cloneProject({ repo, name } = {}) {
+  async cloneProject({ repo, name, into } = {}) {
     const { slug, repo: repoName } = parseGithubRepo(repo);
     const target = name ? name : repoName;
-    const path = projectPathFor(target);
+
+    // `into` is what makes a project able to hold more than one repository: the
+    // clone lands in a subdirectory of an existing project instead of becoming a
+    // project of its own. Both names go through the same validation, because both
+    // are caller-supplied and both end up as a path component.
+    let parent = PROJECTS_ROOT;
+    if (into) {
+      parent = projectPathFor(into);
+      const info = await stat(parent).catch(() => null);
+      if (!info?.isDirectory()) throw new Error(`no project named "${into}"`);
+    }
+    // Reuses the project-name rules deliberately: no slash and no leading dot is
+    // exactly what keeps `join` from writing outside the directory chosen above.
+    const path = join(parent, assertSafeName(target));
 
     if (await stat(path).catch(() => null)) {
-      throw new Error(`"${target}" already exists in the workspace`);
+      throw new Error(
+        into
+          ? `"${into}" already has a ${target} directory`
+          : `"${target}" already exists in the workspace`,
+      );
     }
-    await mkdir(PROJECTS_ROOT, { recursive: true });
+    await mkdir(parent, { recursive: true });
 
     const steps = [];
     const token = await getGithubToken();
@@ -1086,7 +1261,7 @@ export class SessionManager {
 
     let clone;
     if (token) {
-      clone = await git(PROJECTS_ROOT, ['clone', '--recurse-submodules', url, target], {
+      clone = await git(parent, ['clone', '--recurse-submodules', url, target], {
         timeout,
         env: { GH_TOKEN: token, GITHUB_TOKEN: token },
       });
@@ -1103,20 +1278,27 @@ export class SessionManager {
         if (viaGh.ok) clone = viaGh;
       }
     } else {
-      clone = await git(PROJECTS_ROOT, ['clone', '--recurse-submodules', url, target], { timeout });
+      clone = await git(parent, ['clone', '--recurse-submodules', url, target], { timeout });
     }
 
     if (!clone.ok) {
       // A failed clone can leave a partial directory behind, and a half-repo in
-      // the project list is worse than no project at all.
+      // the project list is worse than no project at all. `path` and never
+      // `parent`: cloning into an existing project must not be able to delete the
+      // project it was cloning into.
       await rm(path, { recursive: true, force: true }).catch(() => {});
       const hint = /not found|repository .* does not exist|could not read Username/i.test(clone.err)
         ? ' — check the name, and that the workspace token can see it'
         : '';
       throw new Error(`clone failed: ${clone.err.slice(0, 400)}${hint}`);
     }
-    steps.push({ step: 'clone', ok: true, url: `https://github.com/${slug}` });
+    steps.push({ step: 'clone', ok: true, url: `https://github.com/${slug}`, dir: into ? target : '' });
 
+    // The project is what the client opens, so when the clone went *into* one, the
+    // answer is that project and not the directory just created inside it.
+    if (into) {
+      return { name: into, path: parent, repo: target, sessions: await this.listSessions(parent), steps };
+    }
     return { name: target, path, sessions: [], steps };
   }
 

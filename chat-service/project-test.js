@@ -293,6 +293,124 @@ console.log('\nCommits, pushes, verifies, then deletes:');
   );
 }
 
+console.log('\nA project may hold more than one repository:');
+{
+  // The workspace shape: `api/` and `web/` are separate repos opened as one
+  // project, and nothing sits at the project root.
+  const apiRemote = await makeRemote('api');
+  const webRemote = await makeRemote('web');
+  const path = join(root, 'workspace-style');
+  await mkdir(join(path, 'api'), { recursive: true });
+  await mkdir(join(path, 'web'), { recursive: true });
+  for (const [dir, remote] of [['api', apiRemote], ['web', webRemote]]) {
+    const repo = join(path, dir);
+    await writeFile(join(repo, 'file.txt'), `${dir}\n`);
+    await git(repo, 'init', '-b', 'main');
+    await git(repo, 'add', '-A');
+    await git(repo, 'commit', '-m', 'first');
+    await git(repo, 'remote', 'add', 'origin', remote);
+    await git(repo, 'push', '-u', 'origin', 'main');
+  }
+  // A repo deep enough to need the walk, and one place a repo must not be looked
+  // for: a dependency tree is not the user's work and is far too big to walk.
+  await mkdir(join(path, 'node_modules', 'dep'), { recursive: true });
+  await git(join(path, 'node_modules', 'dep'), 'init', '-b', 'main');
+
+  const status = await manager.projectStatus('workspace-style');
+  const dirs = status.repos.map((r) => r.dir).sort();
+  check('finds every repository in the project', JSON.stringify(dirs) === '["api","web"]', JSON.stringify(dirs));
+  check('does not walk into node_modules', !dirs.includes('node_modules/dep'));
+  check('reports no repo at the root', status.isRepo === false);
+  check('each repo carries its own remote',
+    status.repos.every((r) => r.remote && r.remote.endsWith(`${r.dir}.git`)),
+    JSON.stringify(status.repos.map((r) => r.remote)));
+
+  // Unpushed work in *one* of them has to stop the delete and say which.
+  await writeFile(join(path, 'web', 'only-here.txt'), 'unpushed\n');
+  await git(join(path, 'web'), 'add', '-A');
+  await git(join(path, 'web'), 'commit', '-m', 'web only');
+  await git(join(path, 'web'), 'remote', 'set-url', 'origin', join(remotes, 'gone.git'));
+
+  const refused = await attemptRemove('workspace-style');
+  check('an unreachable remote in one repo stops the whole delete', Boolean(refused.error?.blocked));
+  check('says which repo', /workspace-style\/web/.test(refused.error?.message || ''), refused.error?.message);
+  check('the project survives', await exists(path));
+  check('and so does the repo that was fine', await exists(join(path, 'api', 'file.txt')));
+
+  // Repaired, it goes through — and both remotes get the work.
+  await git(join(path, 'web'), 'remote', 'set-url', 'origin', webRemote);
+  await writeFile(join(path, 'api', 'late.txt'), 'late\n');
+  const result = await manager.removeProject('workspace-style');
+  check('removes a multi-repo project once every repo is safe', result.removed === true);
+  check('the directory is gone', !(await exists(path)));
+  check('each repo was verified',
+    ['api', 'web'].every((d) => result.steps.some((s) => s.step === 'verify' && s.dir === d && s.ok)),
+    JSON.stringify(result.steps));
+  const { stdout: apiFiles } = await git(apiRemote, 'ls-tree', '-r', '--name-only', 'main');
+  check('the loose edit in api reached its own remote', apiFiles.includes('late.txt'), apiFiles);
+  const { stdout: webFiles } = await git(webRemote, 'ls-tree', '-r', '--name-only', 'main');
+  check('the commit in web reached its own remote', webFiles.includes('only-here.txt'), webFiles);
+}
+
+console.log('\nA repository embedded in another is not saved by pushing the outer one:');
+{
+  // The dangerous shape, and the reason this is not just about tidy siblings.
+  // `git add -A` in the outer repo records `inner` as a gitlink — a pointer to a
+  // commit the outer remote does not have and never will. A push of the outer
+  // repo therefore exits 0, verifies, and proves nothing about `inner`.
+  const outerRemote = await makeRemote('outer');
+  const path = await makeProject('embedded', { remote: outerRemote });
+  const inner = join(path, 'inner');
+  await mkdir(inner, { recursive: true });
+  await writeFile(join(inner, 'inner.txt'), 'work that exists nowhere else\n');
+  await git(inner, 'init', '-b', 'main');
+  await git(inner, 'add', '-A');
+  await git(inner, 'commit', '-m', 'inner work');
+
+  const status = await manager.projectStatus('embedded');
+  check('sees both the outer and the embedded repo',
+    JSON.stringify(status.repos.map((r) => r.dir)) === '["","inner"]',
+    JSON.stringify(status.repos.map((r) => r.dir)));
+  check('the embedded repo is not counted as the outer repo being dirty',
+    status.repos[0].dirty === 0, JSON.stringify(status.repos[0].dirtySample));
+  check('its unpushed commit is counted', status.unpushed === 1, `got ${status.unpushed}`);
+
+  const refused = await attemptRemove('embedded');
+  check('the embedded repo having no remote stops the delete', Boolean(refused.error?.blocked));
+  check('says so about the embedded repo, not the outer one',
+    /embedded\/inner/.test(refused.error?.message || ''), refused.error?.message);
+  check('the work that exists nowhere else is still there', await exists(join(inner, 'inner.txt')));
+
+  const innerRemote = await makeRemote('inner');
+  await git(inner, 'remote', 'add', 'origin', innerRemote);
+  const result = await manager.removeProject('embedded');
+  check('removed once the embedded repo can be pushed too', result.removed === true);
+  const { stdout: innerFiles } = await git(innerRemote, 'ls-tree', '-r', '--name-only', 'main');
+  check('the embedded repo reached its own remote', innerFiles.includes('inner.txt'), innerFiles);
+}
+
+console.log('\nCloning into an existing project:');
+{
+  await makeProject('host', { repo: false });
+  const outside = await manager
+    .cloneProject({ repo: 'someone/thing', into: '../escape' })
+    .then(() => null, (err) => err.message);
+  check('will not clone into a name outside the projects root', Boolean(outside), outside);
+
+  const missing = await manager
+    .cloneProject({ repo: 'someone/thing', into: 'no-such-project' })
+    .then(() => null, (err) => err.message);
+  check('will not clone into a project that does not exist', /no project named/.test(missing || ''), missing);
+
+  await mkdir(join(root, 'host', 'taken-slot'), { recursive: true });
+  const clash = await manager
+    .cloneProject({ repo: 'someone/taken-slot', into: 'host' })
+    .then(() => null, (err) => err.message);
+  check('will not clone over a directory already in the project',
+    /already has a taken-slot directory/.test(clash || ''), clash);
+  check('and the project it was cloning into is untouched', await exists(join(root, 'host', 'file.txt')));
+}
+
 console.log('\nForce is an override, not a shortcut:');
 {
   await makeProject('forced', { repo: false });

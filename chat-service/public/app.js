@@ -549,47 +549,125 @@ async function openProjectSheet(project) {
   }
 }
 
-function renderProjectFacts(status) {
+function factList(facts) {
+  return `<ul class="fact-list">${facts
+    .map(
+      (f) =>
+        `<li class="${f.atRisk ? 'at-risk' : ''}"><span>${escapeHtml(f.label)}</span>` +
+        `<span>${escapeHtml(f.value)}</span></li>`,
+    )
+    .join('')}</ul>`;
+}
+
+/** What one repository holds, in the order that matters if the folder disappears. */
+function repoFacts(repo) {
   const facts = [];
   const add = (label, value, atRisk = false) => facts.push({ label, value, atRisk });
 
-  if (!status.isRepo) {
-    add('Git', 'not a repository', true);
+  add('Branch', repo.hasCommits ? repo.branch || 'unknown' : 'no commits yet');
+  add(
+    'Remote',
+    repo.remote ? repo.remote.replace(/^https:\/\/github\.com\//, '').replace(/\.git$/, '') : 'none',
+    !repo.remote,
+  );
+  add('Uncommitted changes', repo.dirty ? `${repo.dirty} (will be committed)` : 'none');
+  add('Unpushed commits', repo.unpushed ? `${repo.unpushed} (will be pushed)` : 'none');
+  if (repo.stashes) add('Stashes', `${repo.stashes} — not pushed by anything`, true);
+  if (repo.ignored.length) add('Not in git', repo.ignored.join(', '), true);
+  return facts;
+}
+
+/**
+ * A project is a directory, so it can hold one repository, several, or none —
+ * the same shape as a VS Code workspace. Each one is pushed and verified
+ * separately before the folder is deleted, so each one gets its own block of
+ * facts. One repo at the root is still the common case, and still reads as the
+ * single flat list it always did.
+ */
+function renderProjectFacts(status) {
+  const repos = status.repos || [];
+  let body = '';
+
+  if (!repos.length) {
+    body += factList([{ label: 'Git', value: 'not a repository', atRisk: true }]);
+  } else if (repos.length === 1 && !repos[0].dir) {
+    body += factList(repoFacts(repos[0]));
   } else {
-    add('Branch', status.hasCommits ? status.branch || 'unknown' : 'no commits yet');
-    add(
-      'Remote',
-      status.remote ? status.remote.replace(/^https:\/\/github\.com\//, '').replace(/\.git$/, '') : 'none',
-      !status.remote,
-    );
-    add('Uncommitted changes', status.dirty ? `${status.dirty} (will be committed)` : 'none');
-    add('Unpushed commits', status.unpushed ? `${status.unpushed} (will be pushed)` : 'none');
-    if (status.stashes) add('Stashes', `${status.stashes} — not pushed by anything`, true);
-    if (status.ignored.length) {
-      add('Not in git', status.ignored.join(', '), true);
+    for (const repo of repos) {
+      body +=
+        `<h3 class="repo-heading">${escapeHtml(repo.dir || 'project root')}</h3>` +
+        factList(repoFacts(repo));
     }
   }
+
+  const tail = [];
   if (status.live.length) {
     const busy = status.live.filter((c) => c.busy).length;
-    add('Open chats', busy ? `${status.live.length} (${busy} working)` : String(status.live.length), Boolean(busy));
+    tail.push({
+      label: 'Open chats',
+      value: busy ? `${status.live.length} (${busy} working)` : String(status.live.length),
+      atRisk: Boolean(busy),
+    });
   }
-  add('Chat history', `${status.transcripts} kept after deleting`);
+  tail.push({ label: 'Chat history', value: `${status.transcripts} kept after deleting` });
+  body += factList(tail);
 
-  $('#project-sheet-body').innerHTML =
-    `<ul class="fact-list">${facts
-      .map(
-        (f) =>
-          `<li class="${f.atRisk ? 'at-risk' : ''}"><span>${escapeHtml(f.label)}</span>` +
-          `<span>${escapeHtml(f.value)}</span></li>`,
-      )
-      .join('')}</ul>` +
-    '<p class="hint" style="margin-top:14px">Commits and pushes everything, checks the ' +
-    'remote really has it, then deletes the folder from this machine. Chat history stays.</p>';
+  body +=
+    `<p class="hint" style="margin-top:14px">Commits and pushes ${
+      repos.length > 1 ? 'every repository above, checks each remote' : 'everything, checks the remote'
+    } really has it, then deletes the folder from this machine. Chat history stays.</p>` +
+    // Cloning a second repository in is what makes this a workspace rather than
+    // a single checkout, and this sheet is already where a project is managed.
+    '<h3 class="repo-heading">Add a repository</h3>' +
+    '<form id="form-add-repo" class="inline-form">' +
+    '<input id="input-add-repo" type="text" placeholder="owner/repo" autocomplete="off" ' +
+    'autocapitalize="none" autocorrect="off" spellcheck="false" required>' +
+    '<button type="submit">Clone in</button></form>' +
+    '<p class="hint" id="add-repo-status">Clones it into this project, beside what is already here.</p>';
+
+  $('#project-sheet-body').innerHTML = body;
+  $('#form-add-repo').addEventListener('submit', addRepoToProject);
 
   const btn = $('#btn-project-remove');
   btn.textContent = 'Push & delete from this machine';
   btn.onclick = () => removeProjectFromMachine(false);
   btn.classList.remove('hidden');
+}
+
+/**
+ * Clone another repository into the project this sheet is open on.
+ *
+ * Slow enough to need its own progress line — a large repository on this
+ * instance is minutes — and the sheet is re-read afterwards so the new repo
+ * appears in the facts above, which is the confirmation that it landed.
+ */
+async function addRepoToProject(e) {
+  e.preventDefault();
+  const project = sheetProject;
+  const input = $('#input-add-repo');
+  const status = $('#add-repo-status');
+  const repo = input.value.trim();
+  if (!project || !repo) return;
+
+  input.disabled = true;
+  status.textContent = `Cloning ${repo} into ${project.name}… this can take a few minutes.`;
+
+  try {
+    const res = await api('/api/projects/clone', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ repo, into: project.name }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'could not clone that repository');
+    toast(`Cloned ${repo} into "${project.name}".`);
+    await refreshList();
+    // Re-reads the project, which redraws this sheet with the new repository in it.
+    if (sheetProject?.name === project.name) await openProjectSheet(project);
+  } catch (err) {
+    input.disabled = false;
+    status.textContent = err.message;
+  }
 }
 
 async function removeProjectFromMachine(force) {

@@ -90,7 +90,10 @@ const json = (res, code, body) => {
  *
  * None of these are bugs, and each one has something the client can do about it:
  * 404 means prepare the text again (which is free), 429 means the day's character
- * budget is spent, 403 means this instance's role cannot call Polly. The overlay's
+ * budget is spent for that provider, 403 means this instance's role cannot call
+ * Polly, and 409 means the message is in Hebrew and this box has no voice that can
+ * say it — the one refusal whose fallback is better than what it refused, since a
+ * phone's own voice does speak Hebrew and Polly would have read silence. The overlay's
  * response to all of them is the same — go back to the browser's own voice — so
  * the sentence travels in the body, where the status sheet can show it instead of
  * the read just going quiet. Anything without a status is a real error and is left
@@ -423,10 +426,18 @@ const server = http.createServer(async (req, res) => {
 
     // Bring an existing GitHub repository into the workspace. Cloning is slow
     // enough on a phone to need its own progress reporting client-side.
+    //
+    // `into` names an existing project to clone *inside*, which is how a project
+    // comes to hold more than one repository — the workspace shape where `api/`
+    // and `web/` are separate repos opened as one project.
     if (pathname === '/api/projects/clone' && req.method === 'POST') {
       const body = JSON.parse((await readBody(req, 4 * 1024)).toString() || '{}');
       json(res, 200, {
-        project: await manager.cloneProject({ repo: body.repo, name: body.name }),
+        project: await manager.cloneProject({
+          repo: body.repo,
+          name: body.name,
+          into: body.into,
+        }),
       });
       return;
     }
@@ -513,13 +524,22 @@ const server = http.createServer(async (req, res) => {
      * whole message. See speak.js for the measurements the sizes come from.
      *
      * The text is whatever the client wants said. It is already the caller's own
-     * conversation, reduced from markdown in the overlay, and it goes nowhere but
-     * Polly.
+     * conversation, reduced from markdown in the overlay, and it goes to one of two
+     * synthesisers: Polly, on this instance's own role, for everything it can say,
+     * and OpenAI for a message with Hebrew in it, which Polly cannot say at all.
+     * Which one is not the client's choice to make — `chooseVoice` decides from the
+     * text, and the answer names the voice that will read it, so a caller can see
+     * where its words went. A box with no OpenAI key sends nothing to OpenAI and
+     * refuses Hebrew with a 409 instead; see speak.js.
      */
     if (pathname === '/api/speak/prepare' && req.method === 'POST') {
       const body = JSON.parse((await readBody(req, 64 * 1024)).toString() || '{}');
       try {
-        json(res, 200, prepareSpeech(body.text, { voice: body.voice }));
+        // Awaited: choosing the voice depends on whether this box has an OpenAI
+        // key, because a message with Hebrew in it cannot be given to Polly. The
+        // key is read from Secrets Manager once per process, so this is a real
+        // round trip on the first read after a restart and free afterwards.
+        json(res, 200, await prepareSpeech(body.text, { voice: body.voice }));
       } catch (err) {
         speakRefusal(res, err);
       }

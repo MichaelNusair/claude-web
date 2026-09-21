@@ -457,6 +457,15 @@ html, body {
 /* Anything that only exists on this machine is called out, because it is the
    whole reason the delete button might be the wrong thing to press. */
 .fact-list li.at-risk span:last-child { color: var(--accent); }
+/* Names one repository in a project that holds more than one. Monospace because
+   it is a directory name, and the first block is a heading over a list rather
+   than a section after one, so it loses the top margin. */
+.repo-heading {
+  margin: 18px 0 4px; font-size: 12px; font-weight: 600;
+  text-transform: uppercase; letter-spacing: .07em; color: var(--text-dim);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+#project-sheet-body > .repo-heading:first-child { margin-top: 0; }
 .danger { background: var(--error); }
 .subtle { background: var(--bg-input); color: var(--text); }
 
