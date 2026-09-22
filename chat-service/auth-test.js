@@ -206,6 +206,11 @@ const guarded = [
   ['POST', '/api/admin/kill'],
   ['POST', '/api/admin/reap'],
   ['GET', '/api/live'],
+  // Which build is running. Not a secret worth widening the allowlist for — it
+  // names a commit of a private repository, and the only caller is a signed-in
+  // page — but an unauthenticated one would tell a stranger which version of this
+  // app to look up known problems in.
+  ['GET', '/api/version'],
   ['GET', '/app.js'],
   ['GET', '/'],
 ];

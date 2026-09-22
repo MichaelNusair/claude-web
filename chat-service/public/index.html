@@ -12,6 +12,12 @@
      not. app.js reads it to title the tab "<name>: <project>"; the title below is
      rewritten by the same pass. See applyDeploymentName in chat-service/manifest.js. -->
 <meta name="deployment" content="">
+<!-- The build this page was served by, filled in by the server on the way past
+     (applyBuildStamp in chat-service/build.js). It is how a tab that has been open
+     since before a deploy can tell: app.js remembers this value and compares it
+     with what /api/version says now. Empty here on purpose — a shell read off disk
+     belongs to no deploy. -->
+<meta name="build" content="">
 <title>Claude</title>
 <!-- use-credentials is required: a manifest is fetched with credentials omitted
      by default, which now means a 401 and no install prompt. -->
@@ -197,6 +203,16 @@
       Notify me when a session outside the app finishes
     </label>
     <p class="hint" id="push-hint"></p>
+    <!-- Which build is answering, and whether this tab is still it. Last in the
+         sheet because it is the one thing here that is not a setting: it is read,
+         not changed. Ruled off for the same reason. See paintBuild in app.js. -->
+    <div class="build-block">
+      <p class="hint" id="build-line">Checking…</p>
+      <p class="hint" id="build-note"></p>
+      <button type="button" id="btn-build-reload" class="wide subtle hidden">
+        Reload to get the new version
+      </button>
+    </div>
     <button data-close-sheet class="wide">Done</button>
   </div>
 </div>

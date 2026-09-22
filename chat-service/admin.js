@@ -45,6 +45,7 @@ import { execFile } from 'child_process';
 import { promisify } from 'util';
 import os from 'os';
 import { brokerSessions as liveBrokerSessions } from './claude-status.js';
+import { buildInfo } from './build.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -85,6 +86,11 @@ const defaultDeps = {
   // Null for every kind of "cannot say", and this page must stay useful when it
   // is: the broker being down is one of the things you come here to find out.
   liveSessions: () => liveBrokerSessions(),
+  // Which payload is running. It belongs on this page more than anywhere else:
+  // "the box is behaving oddly" and "the box is running something older than I
+  // think" are the same question asked twice, and until this was here the second
+  // one could only be answered from a shell. See build.js.
+  build: () => buildInfo(),
   memory: () => ({ total: os.totalmem(), free: os.freemem() }),
   load: () => os.loadavg(),
   uptime: () => os.uptime(),
@@ -425,10 +431,11 @@ export function createAdmin({ manager, deps: overrides = {} } = {}) {
       };
     });
 
-    const [broker, tmux, disk] = await Promise.all([
+    const [broker, tmux, disk, build] = await Promise.all([
       brokerSessions(deps, table, brokerUnit?.mainPid || null),
       tmuxSessions(deps, table, tmuxUnit?.mainPid || null),
       diskUsage(deps, DATA_MOUNT),
+      deps.build(),
     ]);
 
     const mem = deps.memory();
@@ -446,6 +453,7 @@ export function createAdmin({ manager, deps: overrides = {} } = {}) {
         load: deps.load().map((n) => Math.round(n * 100) / 100),
         memory,
         disk,
+        build,
       },
       units,
       surfaces: { chat, broker, tmux },

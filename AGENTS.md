@@ -199,6 +199,8 @@ npm run test:polish    # 19/19; the dictation cleanup's bounds, and its failure 
 npm run test:speak     # 64/64; where a read-aloud message is cut, and every refusal
 npm run test:projects  # 53/53; real git repos, real pushes
 npm run test:admin     # the operations surface, and every refusal it makes
+npm run test:build     # 47/47; which build the app says it is, from a payload
+                       # that has no .git, and a tab left open through a deploy
 npm run test:status    # 42/42; which conversation a device is told about, and from where
 npm run test:broker    # 51/51; one process per conversation, and what counts as a turn
 npm run test:landing   # 53/53; the marketing page's analytics, which fails silently
@@ -284,6 +286,16 @@ chat-service/            The chat backend + PWA client. The security boundary.
                          surfaces, what is wrong with it, and stopping one thing
                          at a time. Reads the broker's processes from outside
                          with ps, and refuses far more than it does.
+  build.js               Which build this is: a short id, the version, the
+                         commit and when it shipped. Three sources in order —
+                         the build.json deploy.sh writes at pack time, then git,
+                         then asset mtimes — because the running payload has no
+                         .git and the checkout has no stamp. Never throws: an
+                         app that cannot name itself must still serve.
+  build-test.js          That precedence, the sanitizing of a value a deploy box
+                         wrote into an HTML attribute, and the five things the
+                         settings sheet can say — including a tab left open
+                         across a deploy, which is the whole point.
   claude-status.js       "Is Claude working, and what did it last say" for the
                          EDITOR's panel, in ~40ms, so a device need not wait out
                          the panel's own history load to find out. Two sources,
@@ -474,6 +486,15 @@ machine they just deployed from already qualifies; the minimum version of this a
 is "keep running full deploys from here, not from the workspace".
 
 ### "It deployed but X is broken"
+
+First settle whether the new build is even live, because "deployed" and "running"
+are different facts and half of this section is wasted on the gap. Settings in the
+chat names the running build (`v3.0.0 · 33d370b · deployed 2h ago`) and says so
+again if the open tab was served by an older one; `/chat/admin` carries the same
+line. From a shell on the box, the stamp itself is the answer:
+`cat /opt/claude-web/chat-service/build.json` — `/api/version` serves the same
+thing but is gated like every other route, so curl gets the login. If the id is the
+commit you expected, the deploy worked and the bug is yours.
 
 The Troubleshooting section of [docs/DEPLOY.md](docs/DEPLOY.md) covers the known
 failure modes. Diagnose from the box rather than guessing:
@@ -786,6 +807,12 @@ under the parent we expected — the one thing this file must never become is a 
 to turn a caller-supplied string into a signal for an arbitrary process.
 `admin-test.js` tests the refusals hardest, and `deploy.sh` will not deploy without
 it.
+
+**It says which build it is.** The first card is the payload the box is running,
+because "the box is behaving oddly" and "the box is running something older than I
+think" arrive as the same sentence and only one of them is worth debugging. It comes
+from the same [`build.js`](chat-service/build.js) the chat's settings sheet uses, so
+the two surfaces cannot disagree.
 
 **A bulk stop asks one question that carries all the refusals.** Fifteen panel
 sessions across two projects is the state this page is actually opened in, and

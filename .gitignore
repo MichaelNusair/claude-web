@@ -19,6 +19,12 @@ claude-web.*.config.json
 # account id. Regenerated on demand, so there is no reason to commit it.
 infra/cdk.context.json
 
+# Which build is running, written into the *staged* payload by deploy.sh — see
+# chat-service/build.js. It should never exist in a checkout, and a committed one
+# would be worse than none: every box would then report the build of whoever
+# committed it, confidently and forever.
+chat-service/build.json
+
 # Copied in from pwa/ + pwa-icons/ by deploy.sh. pwa/ is the source of truth;
 # committing both copies lets them drift.
 chat-service/public/manifest.webmanifest

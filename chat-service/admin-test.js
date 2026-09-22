@@ -181,6 +181,20 @@ function makeDeps(state) {
     // the page has to survive it: a socket that is not there, a broker mid-restart,
     // a timeout.
     liveSessions: async () => state.live,
+    // The stamp deploy.sh writes into a real payload, fixed here so the card can be
+    // asserted. Two hours old in wall-clock terms, because the card says how long
+    // ago the box was deployed and that is the half of it worth reading. See
+    // chat-service/build.js.
+    build: async () => ({
+      id: 'abc1234',
+      version: '3.0.0',
+      commit: 'abc1234',
+      commitAt: Date.now() - 3 * 3600 * 1000,
+      subject: 'the payload this box is running',
+      dirty: false,
+      builtAt: Date.now() - 2 * 3600 * 1000,
+      source: 'stamp',
+    }),
     memory: () => state.mem,
     load: () => [0.42, 0.31, 0.25],
     uptime: () => 30 * 3600,
@@ -544,7 +558,16 @@ const $ = (sel) => w.document.querySelector(sel);
   check('errors are marked as errors', findings.querySelectorAll('.finding.error').length === 2);
   check('the probes finding has its reap button', findings.querySelectorAll('.kill-btn').length === 1);
 
-  check('four host cards', $('#host').querySelectorAll('.card').length === 4);
+  check('five host cards', $('#host').querySelectorAll('.card').length === 5);
+  // Which payload is running, which is half of "why is this box behaving oddly":
+  // a deploy that shipped a stale tree looks exactly like a feature that does not
+  // work. See buildCard in public/admin.js.
+  const build = $('#host .card.full');
+  check('the build is one of them', Boolean(build));
+  check('it names the commit', build?.textContent.includes('abc1234'), build?.textContent);
+  check('the version', build?.textContent.includes('v3.0.0'), build?.textContent);
+  check('when it was deployed', build?.textContent.includes('deployed 2.0h ago'), build?.textContent);
+  check('and what it contains', build?.textContent.includes('the payload this box is running'));
   check('memory is on one of them', $('#host').innerHTML.includes('90%'));
   // 8 GiB of memory, said in the units it is in. The threshold used to be compared
   // against a kilobyte count as though it were megabytes, so this box's 7.7 GB of

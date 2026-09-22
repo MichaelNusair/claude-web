@@ -360,6 +360,38 @@ function renderHost(host) {
       <div class="card-label">Uptime</div>
       <div class="card-value">${duration(host.uptimeSeconds)}</div>
       <div class="card-note">${escapeHtml(host.hostname)}</div>
+    </div>
+    ${buildCard(host.build)}`;
+}
+
+/**
+ * Which payload this box is running, as the last card in the Host row.
+ *
+ * Here because the two questions are the same one: half of "why is this box
+ * behaving oddly" is "is it even running what I think it is", and the answer used
+ * to require an SSM shell. A deploy that reported success while shipping a stale
+ * tree looks exactly like a feature that does not work.
+ *
+ * Tolerant of a `build` that is not there at all: this page polls a server that a
+ * deploy is in the middle of restarting, and an older one does not send this
+ * field. A missing card beats a dashboard that throws in its first render.
+ */
+function buildCard(build) {
+  if (!build) return '';
+  const id = build.commit ? `${build.commit}${build.dirty ? '+' : ''}` : 'unstamped';
+  const note = [
+    build.version ? `v${build.version}` : '',
+    build.builtAt ? `deployed ${duration((Date.now() - build.builtAt) / 1000)} ago` : '',
+    build.dirty ? 'from a tree with uncommitted changes' : '',
+    build.subject,
+  ]
+    .filter(Boolean)
+    .join(' · ');
+  return `
+    <div class="card full">
+      <div class="card-label">Build</div>
+      <div class="card-value">${escapeHtml(id)}</div>
+      <div class="card-note">${escapeHtml(note)}</div>
     </div>`;
 }
 
@@ -553,7 +585,7 @@ document.addEventListener('visibilitychange', () => {
 // Exposed for admin-test.js, which boots this file in jsdom for the same reason
 // smoke-test.js boots app.js: a runtime error at load leaves a page that looks
 // like the server is down, and this is the page you would be checking.
-window.__adminForTest = { refresh, kill, stopAll, reap, renderFindings, duration, rss };
+window.__adminForTest = { refresh, kill, stopAll, reap, renderFindings, buildCard, duration, rss };
 
 refresh();
 startPolling();

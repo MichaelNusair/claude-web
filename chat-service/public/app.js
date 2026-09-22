@@ -201,6 +201,20 @@ const DEPLOYMENT = $('meta[name="deployment"]')?.content.trim() || '';
 const BASE_TITLE = document.title;
 
 /**
+ * The build that served this page, read once at load.
+ *
+ * Read from the document rather than fetched for the reason it has to be: this is
+ * the value /api/version is later compared against, and a fetched one would be the
+ * server's current build — which is what we are trying to tell it apart from. A
+ * page held open on a phone for a week and a page loaded a second ago ask that
+ * endpoint the same question and must get different answers.
+ *
+ * Empty on a server too old to stamp it (or a shell opened from disk), which
+ * paintBuild treats as "cannot say", never as "out of date".
+ */
+const PAGE_BUILD = $('meta[name="build"]')?.content.trim() || '';
+
+/**
  * Title the tab after the project on screen, or after the deployment when none is.
  *
  * "<name>: <project>" is the same label the project's own installed icon carries
@@ -4145,7 +4159,90 @@ document.querySelectorAll('[data-close-talk]').forEach((el) =>
 );
 
 // --- settings ---------------------------------------------------------------
-$('#btn-settings').addEventListener('click', () => $('#sheet').classList.remove('hidden'));
+/*
+ * Which build is running, and whether this tab is still it.
+ *
+ * The question this answers is the one that follows every deploy: is what I am
+ * looking at what was just shipped. Two halves, and the second is the one that
+ * cannot be skipped — a phone keeps this app open for days, so the tab is often
+ * *not* the build on the box, and a version line that reported the server's build
+ * while the page ran older code would answer the question wrongly rather than not
+ * at all. PAGE_BUILD is what the shell was stamped with; /api/version is what the
+ * server is now. They are the same string when there is nothing to do.
+ *
+ * Asked on every open of the sheet rather than polled: it costs one small request
+ * at the moment somebody is looking, and a phone in a pocket has no use for the
+ * answer. The elements are guarded because a browser holding a stale index.html
+ * has none of them, and the whole point of this is to be readable from exactly
+ * that tab.
+ */
+const buildLine = $('#build-line');
+const buildNote = $('#build-note');
+const buildReload = $('#btn-build-reload');
+
+/** "v3.0.0 · 33d370b · deployed 2h ago", out of whatever parts are known. */
+function buildSummary(build) {
+  const parts = [];
+  if (build.version) parts.push(`v${build.version}`);
+  // The `+` is the id's own marker for a payload that was not exactly a commit —
+  // see idFor in chat-service/build.js — and the note below spells it out.
+  if (build.commit) parts.push(build.dirty ? `${build.commit}+` : build.commit);
+  else parts.push('unstamped build');
+  if (build.builtAt) parts.push(`deployed ${relTime(build.builtAt)}`);
+  return parts.join(' · ') || 'version unknown';
+}
+
+/** The second line: what that build actually contains, or why it cannot be named. */
+function buildDetail(build) {
+  const notes = [];
+  if (build.subject) notes.push(`“${build.subject}”`);
+  else if (!build.commit) notes.push('No commit in this payload, so only its date is known.');
+  if (build.dirty) notes.push('Shipped from a working tree with uncommitted changes.');
+  return notes.join(' ');
+}
+
+async function paintBuild() {
+  if (!buildLine || !buildNote || !buildReload) return;
+  let build;
+  try {
+    const res = await api('/api/version');
+    if (!res.ok) throw new Error(`server returned ${res.status}`);
+    build = await res.json();
+  } catch {
+    // Nothing to say about the server, but the tab can still say what it is —
+    // which is the more useful half when the network is the thing that is wrong.
+    buildLine.classList.remove('stale');
+    buildLine.textContent = PAGE_BUILD
+      ? `Couldn't ask the server which version it is running. This tab is on ${PAGE_BUILD}.`
+      : "Couldn't ask the server which version it is running.";
+    buildNote.textContent = '';
+    buildReload.classList.add('hidden');
+    return;
+  }
+
+  // Only a *difference* is staleness. An unstamped page or an unidentifiable
+  // build means the comparison cannot be made, and saying "out of date" then
+  // would send somebody reloading after every deploy they had already got.
+  const stale = Boolean(PAGE_BUILD) && Boolean(build.id) && build.id !== PAGE_BUILD;
+  buildLine.classList.toggle('stale', stale);
+  buildLine.textContent = stale
+    ? `${buildSummary(build)} — this tab is still on ${PAGE_BUILD}`
+    : buildSummary(build);
+  buildNote.textContent = buildDetail(build);
+  buildReload.classList.toggle('hidden', !stale);
+}
+
+buildReload?.addEventListener('click', () => {
+  // A plain reload. The shell and app.js are both served with revalidation and the
+  // asset URLs carry the build's mtime, so there is nothing here to bust by hand —
+  // and a reload is the one action that cannot leave the page half-updated.
+  location.reload();
+});
+
+$('#btn-settings').addEventListener('click', () => {
+  $('#sheet').classList.remove('hidden');
+  paintBuild();
+});
 document.querySelectorAll('[data-close-sheet]').forEach((el) =>
   el.addEventListener('click', () => $('#sheet').classList.add('hidden')),
 );
@@ -4461,6 +4558,11 @@ window.__speechForTest = {
 // credential for a paid service, a live microphone and a peer connection, none of
 // which a test can see from the outside.
 window.__talkForTest = { talk, startTalking, endTalking, promptBefore, onTalkEvent };
+// The version line, whose interesting state is the one a test can create and a
+// browser cannot: a tab whose page was served by a build the server has since
+// replaced. PAGE_BUILD comes along so the test can see what the shell was stamped
+// with rather than infer it.
+window.__buildForTest = { paintBuild, buildSummary, buildDetail, PAGE_BUILD };
 
 // A device that wakes up may have been asleep for hours: iOS suspends timers
 // and freezes sockets when the app is backgrounded, and the close event often

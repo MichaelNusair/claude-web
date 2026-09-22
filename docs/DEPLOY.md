@@ -594,6 +594,13 @@ server a deploy is about to kill. It can stop one conversation at a time, and as
 first if that conversation might be mid-turn. It cannot restart a service; that is
 below.
 
+It also names the build the box is running — the version, the commit and when it
+shipped — and so does **Settings** in the chat, which additionally tells you when the
+tab you are looking at was served by an older build than the server has now and
+offers a reload. Worth checking before you debug a change you thought you deployed.
+From a shell on the box the same answer is in `/opt/claude-web/chat-service/build.json`,
+written when the payload was packed.
+
 ```bash
 # Shell in (no SSH port is open)
 aws ssm start-session --target <InstanceId>

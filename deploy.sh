@@ -345,6 +345,20 @@ step "Checking the project lifecycle"
 ) || { echo "project lifecycle tests failed — not deploying." >&2; exit 1; }
 
 # ---------------------------------------------------------------------------
+step "Checking the app can say which build it is"
+# ---------------------------------------------------------------------------
+# The version line's two failure modes are both silent, and this deploy is the
+# thing that creates one of them: it writes the stamp read by build.js a few
+# hundred lines below. So the resolution order is checked here — a stamp is never
+# guessed at, and a stamp written by a deploy box cannot carry markup into the
+# `<meta>` tag it lands in — along with the client's answer for a tab that was
+# loaded before this deploy and is about to be out of date.
+(
+  cd chat-service
+  node build-test.js
+) || { echo "build identity tests failed — not deploying." >&2; exit 1; }
+
+# ---------------------------------------------------------------------------
 step "Checking the operations surface"
 # ---------------------------------------------------------------------------
 # /chat/admin can signal processes, so what it *refuses* is the code under test:
@@ -539,6 +553,55 @@ step "Uploading application payload"
 rm -rf dist/stage && mkdir -p dist/stage
 cp -R chat-service dist/stage/chat-service
 rm -rf dist/stage/chat-service/node_modules
+# ---------------------------------------------------------------------------
+# Which build this is
+# ---------------------------------------------------------------------------
+# Stamped into the payload here because here is the only place that knows. A
+# deploy ships a tarball with no `.git` in it, so the running service cannot ask
+# git what it is; and the checkout on the box answers for the checkout, which on
+# the shared workspace instance is routinely several commits away from what is
+# installed. Without this, "am I running what I pushed" has no answer inside the
+# app — which is the whole reason chat-service/build.js exists.
+#
+# `dirty` is recorded rather than refused: `--app-only` deliberately ships the
+# working tree, and a sha that quietly stood for uncommitted work would be the one
+# kind of version number worse than none. The app shows it as `<sha>+`.
+BUILD_COMMIT="$(git rev-parse --short HEAD 2>/dev/null || true)"
+BUILD_COMMIT_AT="$(git log -1 --format=%ct 2>/dev/null || true)"
+BUILD_SUBJECT="$(git log -1 --format=%s 2>/dev/null || true)"
+# -uno: an untracked scratch file in a shared checkout is not a different build.
+if [ -n "$(git status --porcelain -uno 2>/dev/null || true)" ]; then
+  BUILD_DIRTY=true
+else
+  BUILD_DIRTY=false
+fi
+python3 - "$BUILD_COMMIT" "$BUILD_COMMIT_AT" "$BUILD_SUBJECT" "$BUILD_DIRTY" \
+  > dist/stage/chat-service/build.json <<'STAMP'
+import json, sys, time
+commit, commit_at, subject, dirty = sys.argv[1:5]
+try:
+    version = json.load(open('package.json'))['version']
+except Exception:
+    version = ''
+json.dump(
+    {
+        'version': version,
+        'commit': commit,
+        'commitAt': int(commit_at) * 1000 if commit_at.isdigit() else None,
+        'subject': subject,
+        'dirty': dirty == 'true',
+        'builtAt': int(time.time() * 1000),
+    },
+    sys.stdout,
+    indent=2,
+)
+sys.stdout.write('\n')
+STAMP
+if [ "$BUILD_DIRTY" = true ]; then
+  echo "  build: ${BUILD_COMMIT:-unknown}+ (uncommitted changes in this tree)"
+else
+  echo "  build: ${BUILD_COMMIT:-unknown}"
+fi
 # The overlay script is injected into the editor shell by nginx, so it ships as
 # a top-level asset rather than inside the chat service.
 mkdir -p dist/stage/pwa && cp pwa/mobile-overlay.js dist/stage/pwa/

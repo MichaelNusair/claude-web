@@ -448,6 +448,22 @@ html, body {
 }
 .hint { font-size: 12.5px; color: var(--text-dim); margin: 0; }
 
+/* Which build is running, at the foot of the settings sheet. Ruled off above
+   because everything before it is a control and this is a fact. */
+.build-block {
+  margin-top: 16px; padding-top: 14px;
+  border-top: 1px solid var(--border);
+}
+.build-block .hint + .hint { margin-top: 3px; }
+/* The tab is behind the server. Said in the accent rather than the error colour:
+   nothing is broken, there is something to reload. */
+.build-block .hint.stale { color: var(--accent); }
+/* The settings sheet now has one more line than the screen it was designed for.
+   Without this the sheet grows off the top of a small phone and the Model row
+   becomes unreachable, taking the Done button with it — the project sheet has
+   carried the same rule since it started listing what a project holds. */
+#sheet .sheet-body { max-height: 86vh; overflow-y: auto; }
+
 /* --- toast --- */
 .toast {
   position: fixed; left: 50%; transform: translateX(-50%);
@@ -560,6 +576,13 @@ html, body {
   font-size: 11.5px; color: var(--text-dim);
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
+/* One fact that is a sentence rather than a number: the build. Full width because
+   a sha plus a commit subject does not fit in half of a phone, and the note below
+   it is the one card note allowed to wrap. */
+.card.full { grid-column: 1 / -1; }
+.card.full .card-value { font-size: 17px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.card.full .card-note { white-space: normal; }
+
 .meter { height: 4px; margin-bottom: 6px; border-radius: 999px; background: var(--bg-input); overflow: hidden; }
 .meter span { display: block; height: 100%; background: var(--accent-dim); }
 .meter span.hot { background: var(--error); }

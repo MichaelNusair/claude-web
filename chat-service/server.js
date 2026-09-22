@@ -27,6 +27,7 @@ import {
   SILENT_WAV,
 } from './speak.js';
 import { mintSession, realtimeStatus } from './realtime.js';
+import { buildInfo, applyBuildStamp } from './build.js';
 import { claudeStatus, firstPromptFor } from './claude-status.js';
 import {
   manifestForProject,
@@ -165,11 +166,18 @@ async function serveStatic(req, res, pathname) {
     // literal it saves.
     if (file.endsWith('.html')) {
       const v = await getAssetVersion();
+      // Which build this response came from, for the shell to remember. It is the
+      // only way a running page can later notice it is older than the server —
+      // see applyBuildStamp in build.js.
+      const build = await buildInfo();
       data = Buffer.from(
-        applyDeploymentName(
-          data
-            .toString()
-            .replace(/(src|href)="(\/chat\/[A-Za-z0-9._-]+\.(?:js|css))"/g, `$1="$2?v=${v}"`),
+        applyBuildStamp(
+          applyDeploymentName(
+            data
+              .toString()
+              .replace(/(src|href)="(\/chat\/[A-Za-z0-9._-]+\.(?:js|css))"/g, `$1="$2?v=${v}"`),
+          ),
+          build.id,
         ),
       );
     }
@@ -680,6 +688,26 @@ const server = http.createServer(async (req, res) => {
         'Cache-Control': 'no-store',
       });
       res.end(JSON.stringify({ sessions: manager.liveSummary(), at: Date.now() }));
+      return;
+    }
+
+    /*
+     * Which build is running, so the app can show it and a stale tab can notice.
+     *
+     * Behind the gate with everything else: it names a commit of a private
+     * repository, which is not a secret worth a route in the allowlist, and the
+     * only caller is a page that is already signed in. `no-store` matters more than
+     * it looks — a cached answer here would report the build of whatever was
+     * running when the response was first made, which is precisely the mistake
+     * this route exists to catch. See build.js.
+     */
+    if (pathname === '/api/version' && req.method === 'GET') {
+      const build = await buildInfo();
+      res.writeHead(200, {
+        'Content-Type': 'application/json; charset=utf-8',
+        'Cache-Control': 'no-store',
+      });
+      res.end(JSON.stringify(build));
       return;
     }
 
