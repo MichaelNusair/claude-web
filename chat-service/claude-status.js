@@ -34,7 +34,7 @@
  * should move without being rewritten.
  */
 import net from 'net';
-import { open, readdir, stat } from 'fs/promises';
+import { open, readdir, readFile, realpath, stat } from 'fs/promises';
 import { join } from 'path';
 // isSyntheticUserText is the one piece of chat-service that is really about
 // transcripts rather than about the chat: the CLI writes skill loaders, hook
@@ -240,6 +240,128 @@ async function startedAt(pid) {
   } catch {
     return null; // exited between the broker's answer and this read, or no /proc
   }
+}
+
+/**
+ * The same directory, under whichever name it was reached by.
+ *
+ * The two halves of this file's central join disagree about symlinks, and until
+ * 2026-09-23 nothing noticed. `mangleCwd` resolves, because it has to: the CLI names
+ * a transcript directory after the resolved path. The broker does not, because it
+ * has to not: `cwd` there is the string its client was started with, which is how a
+ * client identifies itself and must come back unaltered.
+ *
+ * So a project reachable by two names splits the answer down the middle — the
+ * transcript is found, the process holding it is not, and a conversation with a turn
+ * in flight is reported "your turn · not running". That is what this repository did
+ * to itself: renamed from `claude-web` to `triplec` with a symlink left behind, six
+ * live conversations recorded by the broker under the old path, every page asking
+ * about the new one, and every one of them read as idle.
+ *
+ * Falls back to the literal path, which is what a directory that cannot be resolved
+ * had to match against anyway.
+ */
+async function resolveDir(dir) {
+  try {
+    return await realpath(dir);
+  } catch {
+    return dir;
+  }
+}
+
+/*
+ * How long a /proc sweep for unbrokered conversations is reused.
+ *
+ * The sweep is cheap but not free — one `readdir` and a `cmdline` read per process,
+ * a few hundred on this box — and it answers a question that cannot change usefully
+ * faster than this: a process either exists or it does not, and one that came and
+ * went inside two seconds was never the thing a badge was about. Memoised rather
+ * than gated per request so that the cost is the box's, not each device's: ten
+ * phones polling every three seconds share one sweep instead of taking thirty.
+ */
+const RESUME_SCAN_TTL_MS = 2000;
+
+let resumeScan = { at: 0, sessions: new Map() };
+
+/**
+ * The conversations something is running that the broker has never heard of.
+ *
+ * "The broker holds no session for this conversation" was read here as proof that
+ * nothing could be working — no process, nothing to be in flight. That was true only
+ * while every panel process was a broker child, and it stopped being true without
+ * anything being changed here: the extension launches `claude` through the wrapper
+ * only while `claudeCode.claudeProcessWrapper` is in the settings its extension host
+ * read at startup, and a host that came up without it spawns the real binary itself.
+ * Measured on this box 2026-09-23, minutes after an extension update: of nine live
+ * panel conversations, three were direct children of an extension host and invisible
+ * to `op: 'status'` — one of them the conversation whose own page was being told,
+ * mid-turn, that nothing was running it.
+ *
+ * What identifies one is its own argv: the panel resumes a conversation by id, so
+ * `--resume=<id>` names the conversation a process is holding, and `/proc/<pid>` is
+ * stamped with when it started, which is the fact `unseen` needs and the reason this
+ * is worth doing properly rather than trusting a clock. A conversation nobody
+ * resumed — a fresh one, or one the wrapper started — is not found here, and that is
+ * the old answer, not a new wrong one.
+ *
+ * Deliberately narrow: `--resume` with a session id, in the argv of something called
+ * claude. A tool that merely mentions an id (this file's own grep, a text editor
+ * holding the transcript open) is not running a conversation.
+ */
+async function resumingSessions() {
+  if (Date.now() - resumeScan.at < RESUME_SCAN_TTL_MS) return resumeScan.sessions;
+
+  const sessions = new Map();
+  try {
+    const entries = await readdir('/proc');
+    await Promise.all(entries.map(async (entry) => {
+      if (!/^\d+$/.test(entry)) return;
+      let argv;
+      try {
+        argv = await readFile(`/proc/${entry}/cmdline`, 'utf8');
+      } catch {
+        return; // exited mid-sweep, or not ours to read
+      }
+      if (!argv.includes('--resume') || !argv.includes('claude')) return;
+      const id = /--resume[=\0]([0-9a-fA-F-]{8,64})(?:\0|$)/.exec(argv)?.[1];
+      if (!id) return;
+      const pid = Number(entry);
+      // The oldest wins where two processes resume one id, because that is the fork
+      // this whole daemon exists to prevent and the older one is the turn in
+      // progress. `findings` in admin.js is where the fork itself is reported.
+      const seen = sessions.get(id);
+      if (!seen || pid < seen.pid) sessions.set(id, offBrokerSession(id, pid));
+    }));
+  } catch {
+    /* no /proc: nothing more can be said, and the broker's answer stands alone */
+  }
+
+  resumeScan = { at: Date.now(), sessions };
+  return sessions;
+}
+
+/**
+ * An unbrokered process, in the shape the rest of this file reads.
+ *
+ * `working: false` is not a claim that it is idle — it is the only honest thing to
+ * say, because in-flight is exactly what the broker was for and nobody is reading
+ * this process's stdout. It is also the input the transcript overrides are built for:
+ * `unseen` takes a live pid and a mid-turn file the pid is old enough to have
+ * written, which is the whole of what is knowable from out here. Everything the
+ * broker alone can count is null rather than 0, so no client reports a number that
+ * came from nowhere.
+ */
+function offBrokerSession(sessionId, pid) {
+  return {
+    cwd: null,
+    sessionId,
+    working: false,
+    clients: null,
+    idleMs: null,
+    spokeMs: null,
+    pid,
+    brokered: false,
+  };
 }
 
 /**
@@ -766,9 +888,15 @@ function guessConversation(candidates) {
  *                right here, so there is nothing to wait for.
  *
  * A broker answer beats the transcript whenever there is one — including when the
- * broker reports no session for this directory at all, which is a *definite* idle:
- * no process exists, so nothing can be working, whatever state the transcript was
- * left in.
+ * broker reports no session for this conversation, which is nearly a definite idle:
+ * nothing it holds can be working, whatever state the transcript was left in.
+ *
+ * Nearly, because the broker is not the only thing that can hold a conversation. A
+ * panel process started without the wrapper is invisible to it, and this used to
+ * answer "nothing is running it" about a turn in flight — so where the broker knows
+ * nothing, /proc is asked whether anything is resuming the conversation, and the
+ * answer is subject to the same transcript tests as any other live process. See
+ * resumingSessions.
  */
 export async function claudeStatus(cwd, { sessionId: asked = null } = {}) {
   // `cwd` arrives from a browser and ends up in a filesystem path. Reaching this
@@ -780,13 +908,36 @@ export async function claudeStatus(cwd, { sessionId: asked = null } = {}) {
 
   const dir = join(CLAUDE_HOME, 'projects', await mangleCwd(cwd));
   const live = await brokerSessions();
+  // Which of the broker's sessions are in this directory, by the directory itself
+  // rather than by the spelling of its path — see resolveDir. One `realpath` per
+  // distinct path, not per session, and the literal match short-circuits it.
+  const root = await resolveDir(cwd);
+  const samePlace = new Map();
+  for (const s of live || []) {
+    if (samePlace.has(s.cwd)) continue;
+    samePlace.set(s.cwd, s.cwd === cwd || (await resolveDir(s.cwd)) === root);
+  }
   // A session with no id has never been spoken to — the panel opens such probes
   // and never sends them a message. They hold no conversation.
-  const candidates = live?.filter((s) => s.cwd === cwd && s.sessionId) || [];
-  const liveFor = (id) => candidates.find((s) => s.sessionId === id) || null;
+  const candidates = live?.filter((s) => samePlace.get(s.cwd) && s.sessionId) || [];
+  const brokered = (id) => candidates.find((s) => s.sessionId === id) || null;
 
   const files = await transcripts(cwd);
   const sessionId = asked || guessConversation(candidates)?.sessionId || files[0]?.sessionId || null;
+
+  /*
+   * The processes the broker never saw, looked for only where it had nothing to say:
+   * the conversation being asked about, and the rows listed beside it. Skipped
+   * entirely when the broker could not be asked, because then the transcript decides
+   * everything on its own and a pid would change no answer here.
+   *
+   * `liveFor` is what the rest of this function and the list below both read, so both
+   * get the same answer about the same conversation — see resumingSessions.
+   */
+  const listed = files.slice(0, LIST_LIMIT);
+  const unknown = [sessionId, ...listed.map((f) => f.sessionId)].some((id) => id && !brokered(id));
+  const offBroker = live && unknown ? await resumingSessions() : new Map();
+  const liveFor = (id) => brokered(id) || offBroker.get(id) || null;
   const mine = sessionId ? liveFor(sessionId) : null;
 
   const transcript = sessionId
@@ -838,10 +989,13 @@ export async function claudeStatus(cwd, { sessionId: asked = null } = {}) {
    * those minutes your turn. Or the process start cannot be read at all, and the clock
    * answers as it used to.
    *
-   * Takes a live process either way, like every other transcript override here. A
-   * broker that reports no session for this conversation is already a definite idle —
-   * nothing exists to be working — and a mid-turn transcript with no process behind it
-   * is the abandoned turn this must never report as work.
+   * Takes a live process either way, like every other transcript override here: a
+   * mid-turn transcript with no process behind it is the abandoned turn this must
+   * never report as work. That process no longer has to be one the broker holds —
+   * `mine` can now be a pid found in /proc, which is the whole point of looking there
+   * (see resumingSessions), and it is checked against the file exactly as a brokered
+   * one is. A process too new to have written the mid-turn entry fails `wroteIt`
+   * whichever way it was found.
    */
   const fresh = transcript?.mtimeMs ? Date.now() - transcript.mtimeMs < FRESH_TURN_MS : false;
   const startMs = mine ? await startedAt(mine.pid) : null;
@@ -878,6 +1032,15 @@ export async function claudeStatus(cwd, { sessionId: asked = null } = {}) {
     // Whether a process for this conversation exists at all. Null when the broker
     // could not be asked, which is not the same as "no".
     live: live ? Boolean(mine) : null,
+    /*
+     * Whether that process is one the broker holds. False is the fork this daemon
+     * exists to prevent, back again: a panel process nobody shares, so a second
+     * device opening the conversation gets a second `claude` on one transcript. It
+     * is also why the numbers beside it are null — see resumingSessions.
+     *
+     * Null when there is no process, or no broker answer to compare against.
+     */
+    brokered: mine ? mine.brokered !== false : null,
     // How many pages are driving it. 0 with a live session is the case this whole
     // service exists for: a conversation nobody is watching, still running.
     clients: mine?.clients ?? null,
@@ -913,7 +1076,7 @@ export async function claudeStatus(cwd, { sessionId: asked = null } = {}) {
     // Every other conversation in this project, so that the guess above can be
     // checked rather than taken on trust — and so that switching conversations
     // does not mean waiting out the panel again to find out where you are.
-    conversations: await summarise(dir, files.slice(0, LIST_LIMIT), { liveFor, live, sessionId }),
+    conversations: await summarise(dir, listed, { liveFor, live, sessionId }),
     at: Date.now(),
   };
 }
@@ -965,6 +1128,8 @@ async function summarise(dir, files, { liveFor, live, sessionId }) {
         // worth seeing, because it is the one you would otherwise keep waiting on.
         cutOff: state === 'idle' ? tail?.cutOff || null : null,
         live: live ? Boolean(running) : null,
+        // As above: false means a process nobody shares. See resumingSessions.
+        brokered: running ? running.brokered !== false : null,
         clients: running?.clients ?? null,
         at: file.mtimeMs,
         bytes: file.size,

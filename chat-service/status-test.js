@@ -625,6 +625,107 @@ status = await claudeStatus(CWD, { sessionId: SESSION });
 ok(status.state === 'idle' && status.live === false,
   'with no process behind it there is nothing to overrule — a dead mid-turn conversation is idle');
 
+section('A project reached by another of its names is the same project:');
+/*
+ * The bug this was written for, on the box that produced it. This repository was
+ * renamed and the old path left behind as a symlink; the broker went on reporting
+ * the six conversations it held under the name they were started with, every page
+ * asked about the new one, and `s.cwd === cwd` matched none of them. Every live
+ * conversation in the project then read "your turn · not running" — the transcript
+ * was found (mangleCwd resolves) and the process holding it was not.
+ *
+ * Both directions matter, because either side can be the one holding the old name:
+ * a page can be opened on a symlink, and a process can have been started on one.
+ */
+const LINK = path.join(PROJECTS, 'demo-by-another-name');
+fs.symlinkSync(CWD, LINK);
+writeConvo(TRANSCRIPT, title('The one on screen', SESSION), assistant('done'), userText('a follow-up'));
+
+brokerReply = liveSession({ working: true });
+status = await claudeStatus(LINK);
+ok(status.state === 'working' && status.source === 'broker',
+  'a page asking by the symlink finds the session the broker recorded by the real path');
+
+brokerReply = liveSession({ working: true, cwd: LINK });
+status = await claudeStatus(CWD);
+ok(status.state === 'working' && status.source === 'broker',
+  'and a session the broker recorded by the symlink is found by a page asking for the real path');
+ok(status.clients === 1, 'with everything the broker said about it, not a bare "running"');
+
+brokerReply = liveSession({ working: true, cwd: path.join(PROJECTS, 'elsewhere-entirely') });
+status = await claudeStatus(CWD);
+ok(status.state === 'idle' && status.live === false,
+  'a different directory is still a different directory — the resolving is not a free pass');
+
+section('A conversation the broker never heard of is still a conversation:');
+/*
+ * The second half of the same report, and the deeper half. "The broker holds no
+ * session for this" was treated as proof that nothing could be running — true only
+ * while every panel process was a broker child. The extension launches `claude`
+ * through the wrapper only while `claudeCode.claudeProcessWrapper` is in the settings
+ * its extension host read at startup; a host that came up without it spawns the real
+ * binary itself, and the broker never hears of the conversation. Three of nine live
+ * conversations on this box were in that state on 2026-09-23 — including the one
+ * whose own page was being told, mid-turn, that nothing was running it.
+ *
+ * So a process is looked for where the broker has nothing: by `--resume=<id>` in the
+ * argv of something called claude. The fixture is exactly that — a `claude` that is
+ * really node, because what is being tested is the finding, not the CLI — and it is
+ * started *before* the mid-turn entry so that it is the process that could have
+ * written it. See resumingSessions and `startedAt`.
+ */
+const FAKE_CLAUDE = path.join(TMP, 'bin', 'claude');
+fs.mkdirSync(path.dirname(FAKE_CLAUDE), { recursive: true });
+fs.symlinkSync(process.execPath, FAKE_CLAUDE);
+const SLEEPER = path.join(TMP, 'sleep.js');
+fs.writeFileSync(SLEEPER, 'setTimeout(() => {}, 120000);\n');
+const unbrokered = spawn(FAKE_CLAUDE, [SLEEPER, `--resume=${SESSION}`], { stdio: 'ignore' });
+unbrokered.unref();
+brokerReply = { ok: true, v: 1, sessions: [] };
+writeConvo(TRANSCRIPT, title('The one on screen', SESSION), assistant('let me look', 'tool_use'));
+
+/*
+ * Polled rather than asked once, because the /proc sweep is memoised for two seconds
+ * — the check above took one, and this is not a test of the clock. It resolves inside
+ * that window or it has failed.
+ */
+const settle = async (want, ms = 6000) => {
+  const until = Date.now() + ms;
+  for (;;) {
+    status = await claudeStatus(CWD, { sessionId: SESSION });
+    if (want(status) || Date.now() > until) return status;
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  }
+};
+
+await settle((s) => s.live === true);
+ok(status.live === true && status.state === 'working' && status.source === 'transcript',
+  'a turn in flight in a process the broker never spawned is working, not your turn');
+ok(status.brokered === false,
+  'and says the process is one nobody shares, which is the fork the broker exists to prevent');
+ok(status.clients === null && status.idleMs === null,
+  'with no numbers invented for the things only the broker can count');
+ok(status.conversations?.find((c) => c.sessionId === SESSION)?.state === 'working',
+  'the list agrees, rather than offering the row you would type over');
+
+/*
+ * And the protection that has to survive it: an abandoned mid-turn transcript, with a
+ * process resuming the conversation that is *newer* than the entry. That is a resume
+ * over the top of a killed turn, which must never read as work — found in /proc or
+ * not, the same two clocks decide it.
+ */
+writeConvo(TRANSCRIPT, title('The one on screen', SESSION), assistantAgo('let me look', 'tool_use', 10 * 60 * 1000));
+staleBy(TRANSCRIPT, 10 * 60 * 1000);
+status = await claudeStatus(CWD, { sessionId: SESSION });
+ok(status.live === true && status.state === 'idle',
+  'a mid-turn entry older than the process resuming it is an abandoned turn, wherever the pid came from');
+
+unbrokered.kill();
+writeConvo(TRANSCRIPT, title('The one on screen', SESSION), assistant('let me look', 'tool_use'));
+await settle((s) => s.live === false);
+ok(status.live === false && status.state === 'idle',
+  'and once nothing is resuming it, a mid-turn conversation is your turn again');
+
 section('One project is never answered with another project’s conversation:');
 /*
  * The case the user had not tried yet. Sessions are matched on cwd, and this is
