@@ -215,7 +215,14 @@ const SURFACES = {
       // A probe has no reason at all, which is why a page full of them asks the
       // short question. `working` is null when the broker could not be asked, and
       // null is not a reason to claim anything.
-      live: s.working ? 'working right now' : s.clients ? 'open on a device' : null,
+      //
+      // Waiting on an answer is named first and separately, because it is the one
+      // reason the confirmation can talk you out of: "working right now" is a
+      // machine you would be interrupting, "waiting for you" is a machine that
+      // would still be there when you get back to it.
+      live: s.awaiting
+        ? 'waiting for an answer from you'
+        : s.working ? 'working right now' : s.clients ? 'open on a device' : null,
     })),
   },
   tmux: {
@@ -453,18 +460,41 @@ function renderBroker(sessions) {
   }
 }
 
+/**
+ * What the wait is about, in the words the person answering it will recognise.
+ *
+ * A permission prompt is best named by its tool — "needs you · Bash" is the whole
+ * story. A question is not: the broker names it `AskUserQuestion` because that is
+ * what the tool is called, which tells a reader nothing they want, so it is spelled
+ * out instead. Never the request's input, here or in the API: this page is visible
+ * to anyone who can reach it, and a tool's arguments are the conversation's content.
+ */
+function askedAbout(s) {
+  if (s.awaiting === 'question') return 'a question';
+  return s.awaitingName || 'a tool';
+}
+
 function brokerRow(s) {
   const badges = [];
   if (s.probe) badges.push(badge('idle probe', 'warn'));
-  // Only the broker can say either of these, and only about a process it still
-  // holds. Both are absent rather than false when it could not be asked.
-  if (s.working) badges.push(badge('working', 'hot'));
+  // Only the broker can say any of these, and only about a process it still holds.
+  // They are absent rather than false when it could not be asked.
+  //
+  // `awaiting` replaces `working` rather than sitting beside it. Both are true — a
+  // conversation stopped at a permission prompt is mid-turn, and the broker is right
+  // to keep saying so — but a row badged "working" and "needs you" at once makes the
+  // reader pick which one to believe, and the answer they came for is the second.
+  if (s.awaiting) badges.push(badge(`needs you · ${askedAbout(s)}`, 'ask'));
+  else if (s.working) badges.push(badge('working', 'hot'));
   if (s.clients) badges.push(badge(`${s.clients} attached`));
   return row({
     title: groupKey(s),
     sub:
       `${escapeHtml(s.sessionId ? `${s.sessionId.slice(0, 8)}…` : 'no session')} · ` +
-      `pid ${s.pid} · ${rss(s.rssKb)} · ${duration(s.ageSeconds)}`,
+      `pid ${s.pid} · ${rss(s.rssKb)} · ${duration(s.ageSeconds)}` +
+      // How long it has been stuck, next to how long it has been alive: an hour-old
+      // session waiting ten seconds is fine, a ten-minute wait is someone's tab.
+      (s.awaiting ? ` · waiting ${duration(s.awaitingMs == null ? null : s.awaitingMs / 1000)}` : ''),
     badges,
     action: {
       label: 'Stop',

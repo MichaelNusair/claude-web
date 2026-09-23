@@ -105,6 +105,56 @@ const USER_MESSAGE = '"type":"user"';
 const ASSISTANT_EVENT = '"type":"assistant"';
 
 /*
+ * A question the CLI has put to whoever is driving it, as it appears on stdout.
+ *
+ * `turnInFlight` answers "is Claude working, or is it my turn", and there is a third
+ * state it cannot express: Claude is working *on you*. A permission prompt and an
+ * `AskUserQuestion` are both a `control_request` written to stdout, after which the
+ * CLI blocks until a `control_response` comes back up stdin. No `result` is written
+ * in the meantime, so the turn is legitimately in flight — and nothing will move
+ * until a person clicks something. Measured on the transcripts here: a median wait of
+ * three minutes on an answered question and a longest of 5.9 hours, every minute of
+ * it reported as "working".
+ *
+ * The two subtypes are the two that only a person can settle, verified against the
+ * CLI this box runs (2.1.280) by driving it with `--permission-prompt-tool stdio` and
+ * reading its stdout:
+ *
+ *   can_use_tool         a permission prompt. `requires_user_interaction: true`
+ *                        marks the ones whose whole purpose is to ask — that is how
+ *                        `AskUserQuestion` arrives — and its absence a plain approval.
+ *   request_user_dialog  a tool asking the client to render a blocking dialog.
+ *
+ * Everything else on this channel is the client asking the CLI (`set_permission_mode`,
+ * `auth_status`, `initialize`), which is traffic, not a question. See ASK_SUBTYPES.
+ */
+const ASK_EVENT = '"type":"control_request"';
+
+/** The two the client answers, and what each one is to a person looking at a badge. */
+const ASK_SUBTYPES = new Map([
+  ['can_use_tool', 'permission'],
+  ['request_user_dialog', 'question'],
+]);
+
+/**
+ * The tool that is nothing but a question, so a prompt for it is never an approval.
+ * `chat-service/claude-status.js` names the same tool for the same reason, from the
+ * transcript rather than the wire.
+ */
+const ASK_TOOL = 'AskUserQuestion';
+
+/*
+ * The answer, going the other way: `{"type":"control_response","response":{…,
+ * "request_id":…}}` on stdin, or a `control_cancel_request` when the client gives up
+ * on one. The id is what ties it to the ask, and it is nested one level deeper on a
+ * response than on a request — which is why this is read by parsing rather than by
+ * matching, like everything else on the input side.
+ */
+const ANSWER_EVENTS = ['control_response', 'control_cancel_request'];
+
+const NEWLINE = 0x0a;
+
+/*
  * A single input line is normally tiny, but a pasted file is one line and can be
  * megabytes. Past this, stop waiting for the newline and decide on what is here.
  */
@@ -166,6 +216,21 @@ class Session {
     // Partial input line, so a message split across two writes is still seen as
     // one frame. See #noteTurnStart.
     this.inputBuffer = '';
+    /*
+     * The questions the CLI has asked and nobody has answered: request id -> what it
+     * is, what it is about, and when it was asked. Keyed by id because the answers can
+     * come back out of order — three tools in one assistant turn are three prompts —
+     * and insertion order is age order, which is what `statusSnapshot` reports.
+     *
+     * Empty is the normal state, and the flag it feeds is deliberately not `working`:
+     * a session waiting on a person IS working by the only definition this daemon can
+     * defend, and a badge that says so is exactly the one that has been useless. See
+     * ASK_EVENT.
+     */
+    this.asks = new Map();
+    // Trailing partial line of stdout, kept only while it could still turn out to be
+    // one of those frames. See #noteAsks for why that condition and not a plain buffer.
+    this.askTail = Buffer.alloc(0);
     // When someone last actually said something to this conversation, as opposed
     // to when the CLI last wrote a byte. This is what identifies the conversation
     // a person is in: a resumed one emits output while being read back, but only
@@ -182,6 +247,10 @@ class Session {
       this.#broadcast('out', chunk);
       this.#sniffSessionId(chunk);
       this.#noteTurnEdges(chunk);
+      // After the turn edges, never before: the chunk that carries the model's tool
+      // call can carry the prompt for it as well, and #noteTurnEdges is where a new
+      // word from the model clears the questions that came before it.
+      this.#noteAsks(chunk);
     });
 
     this.proc.stderr.on('data', (chunk) => {
@@ -283,7 +352,23 @@ class Session {
       return Buffer.concat([this.turnTail, chunk.subarray(0, marker.length)]).includes(marker);
     };
 
-    if (!this.turnInFlight && carries(ASSISTANT_EVENT)) {
+    const producing = carries(ASSISTANT_EVENT);
+    /*
+     * The model producing again is the end of every question, whoever answered it.
+     *
+     * Needed because an ask is not always settled by an answer this daemon can see:
+     * the CLI cancels a dialog it has given up on and abandons a permission request
+     * whose client went away, and neither writes anything up the stdin held here. Both
+     * end the same way — the tool comes back refused and the turn carries on — so the
+     * model's next word is the backstop, and it is one this already knows about.
+     *
+     * Ordered before the frames in this chunk are read, because the chunk that carries
+     * the model's tool call can carry the prompt for it too, and clearing after adding
+     * would drop the very question that was just asked.
+     */
+    if (producing && this.asks.size) this.asks.clear();
+
+    if (!this.turnInFlight && producing) {
       this.turnInFlight = true;
       // Something asked it something, so this process holds a conversation and is
       // not one of the panel's throwaway probes — `detach` must not stop it.
@@ -298,6 +383,11 @@ class Session {
     // `result` after them is a chunk that ended the turn.
     if (this.turnInFlight && carries(RESULT_EVENT)) {
       this.turnInFlight = false;
+      // Nothing is waiting on an answer once the turn is over — an unanswered prompt
+      // is why some turns end. Holding one past the turn would put "answer me" on a
+      // conversation whose answer is that it gave up, which is the wrong half of the
+      // only distinction any of this is for.
+      this.asks.clear();
     }
 
     // The tail of the STREAM, not of this chunk. Keeping only the last chunk's
@@ -310,7 +400,77 @@ class Session {
   }
 
   /**
-   * Whether these bytes contain the start of a turn.
+   * Notice a question the CLI has asked, so that "working" can stop covering for
+   * "waiting for you". See ASK_EVENT for what those frames are and why the turn flag
+   * cannot answer this.
+   *
+   * Parsed by line, not matched as a substring, and the reason is the same one the
+   * input side has: the difference that matters is between a frame whose `type` is
+   * `control_request` and a tool result that merely quotes one — reading this very
+   * file back into a conversation would otherwise ask you to approve something. A
+   * quoted frame is escaped inside its own JSON string, so it cannot match; a parse
+   * makes that a fact rather than a hope.
+   *
+   * The cost is kept off the common path, because this runs on every byte the CLI
+   * writes and a conversation can write MAX_LOG_BYTES of them. Per chunk that carries
+   * no frame: one `lastIndexOf`, one `includes` over at most a line's worth of bytes,
+   * and one over the chunk. Nothing is turned into a string until a completed line
+   * really does carry one.
+   */
+  #noteAsks(chunk) {
+    const buffered = this.askTail.length ? Buffer.concat([this.askTail, chunk]) : chunk;
+    const nl = buffered.lastIndexOf(NEWLINE);
+    const partial = nl === -1 ? buffered : buffered.subarray(nl + 1);
+    /*
+     * Carry the unfinished line only while it could still become one of these frames:
+     * either it already names one, or it is short enough that the name is what the
+     * chunk boundary cut in half — the CLI writes `type` first, so a line past that
+     * length with no match is model output. Without the test, one long unfinished line
+     * would put every later chunk of the conversation through the parse below; without
+     * the carry, a frame split inside its own name would be missed, which the real CLI
+     * does whenever a flush lands mid-token.
+     */
+    this.askTail = partial.includes(ASK_EVENT) || partial.length <= ASK_EVENT.length
+      ? Buffer.from(partial)
+      : Buffer.alloc(0);
+    if (nl === -1) return;
+
+    const complete = buffered.subarray(0, nl);
+    if (!complete.includes(ASK_EVENT)) return;
+
+    for (const line of complete.toString().split('\n')) {
+      if (!line.includes(ASK_EVENT)) continue;
+      let frame;
+      try {
+        frame = JSON.parse(line);
+      } catch {
+        continue; // not a frame we can read; not a question we can claim
+      }
+      if (frame.type !== 'control_request' || !frame.request_id) continue;
+      const kind = ASK_SUBTYPES.get(frame.request?.subtype);
+      if (!kind) continue;
+      this.asks.set(frame.request_id, {
+        // `requires_user_interaction` is the CLI's own word for a request whose point
+        // is to ask rather than to gate: it is how `AskUserQuestion` arrives, as a
+        // `can_use_tool` for a tool that is a question. Verified against 2.1.280 — the
+        // tool name is taken as the same answer because it is the part that cannot
+        // quietly change: a CLI that stops setting the flag would otherwise downgrade
+        // every question on this box to "a permission prompt for AskUserQuestion".
+        kind: frame.request.requires_user_interaction || frame.request.tool_name === ASK_TOOL
+          ? 'question'
+          : kind,
+        // What it is about — a tool name, or the kind of dialog — and never the input,
+        // which is the file being written or the command being run and belongs to the
+        // conversation, not to a status page.
+        name: frame.request.tool_name || frame.request.dialog_kind || null,
+        at: Date.now(),
+      });
+    }
+  }
+
+  /**
+   * Whether these bytes contain the start of a turn — and, on the way past, the
+   * answer to a question this session was waiting on.
    *
    * Line-buffered and parsed, rather than matched as a substring the way the
    * output side is, because the difference that matters here is between a frame
@@ -318,11 +478,20 @@ class Session {
    * permission response carrying a tool input, say. A substring match on the
    * whole stream would call that a turn and latch the badge on, which is the bug
    * this replaces.
+   *
+   * The answers are read in the same pass for the same reason they are read at all:
+   * this is where the panel's control traffic already arrives, it is a handful of
+   * lines rather than a stream, and every one of them is already being parsed.
    */
   #noteTurnStart(chunk) {
     this.inputBuffer += chunk.toString();
     const lines = this.inputBuffer.split('\n');
     this.inputBuffer = lines.pop() || '';
+
+    // Collected rather than returned from inside the loop: the same batch of lines
+    // that starts a turn can settle the question the last turn was stuck on, and an
+    // early return used to be free only because there was nothing else to look for.
+    let started = false;
 
     if (this.inputBuffer.length > MAX_INPUT_LINE) {
       // A very long line: decide on what has arrived and stop accumulating. A
@@ -330,20 +499,36 @@ class Session {
       // is almost certainly starting anyway ends.
       const looksLikeMessage = this.inputBuffer.includes(USER_MESSAGE);
       this.inputBuffer = '';
-      if (looksLikeMessage) return true;
+      if (looksLikeMessage) started = true;
     }
 
     for (const line of lines) {
-      // Cheap gate before parsing: every frame this cares about contains the
-      // word, and the ones it does not care about are the common case.
-      if (!line.includes('user')) continue;
+      // Cheap gate before parsing: every frame either half cares about contains one
+      // of these words, and the ones neither cares about are the common case. The
+      // second test is skipped entirely while nothing is waiting to be answered.
+      const settles = this.asks.size > 0 && ANSWER_EVENTS.some((type) => line.includes(type));
+      if (!settles && !line.includes('user')) continue;
+      let frame;
       try {
-        if (JSON.parse(line).type === 'user') return true;
+        frame = JSON.parse(line);
       } catch {
-        /* not a frame we can read; not a turn we can claim */
+        continue; // not a frame we can read; not a turn we can claim
       }
+      if (frame.type === 'user') started = true;
+      /*
+       * The answer to a question, or the client giving up on one: either way nobody is
+       * being waited for any more. Both ids are read rather than either assumed — a
+       * response nests it under `response`, a cancel carries it at the top — and an id
+       * that was never asked simply deletes nothing, which is what makes it safe to
+       * read this off a channel the client also uses to ask questions of its own.
+       */
+      if (!settles) continue;
+      const settled = frame.type === 'control_response'
+        ? frame.response?.request_id
+        : (frame.type === 'control_cancel_request' ? frame.request_id : null);
+      if (settled) this.asks.delete(settled);
     }
-    return false;
+    return started;
   }
 
   #send(client, frame) {
@@ -513,26 +698,48 @@ function statusSnapshot() {
   const now = Date.now();
   return [...sessions.values()]
     .filter((session) => !session.exited)
-    .map((session) => ({
-      cwd: session.cwd,
-      // Null until the CLI's init event names it — a conversation that has never
-      // been spoken to has no id to report. See #sniffSessionId.
-      sessionId: session.sessionId,
-      working: session.turnInFlight,
-      clients: session.clients.size,
-      idleMs: now - session.lastActivity,
-      // How long since anyone attached, left, or wrote — the clock the reaper
-      // actually runs on, so that "why is this still here" has an answer that
-      // matches the decision. `idleMs` is since the CLI last wrote a byte, which
-      // is a different question and answers nothing about lifetime.
-      attendedMs: now - session.attendedAt,
-      // How long since anyone said anything to this conversation, as opposed to
-      // since the CLI last wrote a byte. Null if nobody ever has. This is what
-      // tells "the conversation being used" from "a conversation being read
-      // back": resuming one produces output without anyone typing.
-      spokeMs: session.spokeAt === null ? null : now - session.spokeAt,
-      pid: session.proc.pid,
-    }));
+    .map((session) => {
+      /*
+       * The oldest unanswered question, when there are several: three tools in one
+       * assistant turn are three prompts, and the useful number is how long this has
+       * been stuck rather than what it asked most recently. `asks` is keyed in the
+       * order the questions were asked, so the first one out is the oldest.
+       */
+      const [asked] = session.asks.values();
+      return {
+        cwd: session.cwd,
+        // Null until the CLI's init event names it — a conversation that has never
+        // been spoken to has no id to report. See #sniffSessionId.
+        sessionId: session.sessionId,
+        working: session.turnInFlight,
+        /*
+         * The third state, and the one nothing outside this process can see: Claude is
+         * working, and what it is working on is you. `working` stays true beside it —
+         * the turn really is in flight — so a reader that has never heard of this gets
+         * the answer it always got, and one that has can say which kind of wait it is.
+         *
+         * `permission` or `question`, what it is about, and how long it has been
+         * sitting there. Null all round when nothing is waiting, which is the normal
+         * state of a conversation and of every session on a CLI old enough not to ask.
+         */
+        awaiting: asked?.kind ?? null,
+        awaitingName: asked?.name ?? null,
+        awaitingMs: asked ? now - asked.at : null,
+        clients: session.clients.size,
+        idleMs: now - session.lastActivity,
+        // How long since anyone attached, left, or wrote — the clock the reaper
+        // actually runs on, so that "why is this still here" has an answer that
+        // matches the decision. `idleMs` is since the CLI last wrote a byte, which
+        // is a different question and answers nothing about lifetime.
+        attendedMs: now - session.attendedAt,
+        // How long since anyone said anything to this conversation, as opposed to
+        // since the CLI last wrote a byte. Null if nobody ever has. This is what
+        // tells "the conversation being used" from "a conversation being read
+        // back": resuming one produces output without anyone typing.
+        spokeMs: session.spokeAt === null ? null : now - session.spokeAt,
+        pid: session.proc.pid,
+      };
+    });
 }
 
 /**

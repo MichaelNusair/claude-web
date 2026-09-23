@@ -253,6 +253,25 @@ async function brokerSessions(deps, table, brokerPid) {
       // manager, never this — but shown, because it is the question the page is
       // most often opened to answer.
       working: known ? known.working : null,
+      /*
+       * What it is waiting for a person to answer, when it is waiting for one:
+       * `'permission'` for a tool approval, `'question'` for an `AskUserQuestion`,
+       * plus what it is about and how long it has been sitting there.
+       *
+       * This is the half of `working` that made the badge worth so little. A
+       * conversation stopped at a permission prompt is working by every definition the
+       * broker can defend, and nothing will happen in it until somebody clicks — which
+       * is the one thing a page full of "working" rows could not tell you. Only the
+       * broker sees it: the prompt goes out on the CLI's stdout and the answer comes
+       * back up its stdin, and neither is written to the transcript.
+       *
+       * Null for all three when nothing is waiting, when the broker could not be asked,
+       * and when it is too old to have an opinion — the same conflation `working` makes
+       * above, and safe for the same reason: no client acts on this, it only reads.
+       */
+      awaiting: known ? known.awaiting ?? null : null,
+      awaitingName: known ? known.awaitingName ?? null : null,
+      awaitingMs: known ? known.awaitingMs ?? null : null,
       clients: known ? known.clients : null,
       rssKb: proc.rssKb,
       ageSeconds: proc.ageSeconds,
@@ -365,6 +384,32 @@ function findings({ units, chat, broker, tmux, memory, disk }) {
       level: 'error',
       text: `${procs.length} processes are resuming session ${sessionId.slice(0, 8)}…`,
       detail: 'they append to one transcript and will diverge; stop all but the one you are using',
+    });
+  }
+
+  /*
+   * Waiting on a person. Not a fault, and the only finding here that is not — it is
+   * the thing this page could not say at all before, and the answer to the question
+   * that brings someone to it: which of these rows is actually moving. A conversation
+   * parked on a permission prompt is indistinguishable from a busy one by every other
+   * number we have, and it will sit there until it is clicked, so the wait is the
+   * headline. Raised out of `info` once it has been long enough that whoever started
+   * it has plainly walked away.
+   */
+  const waiting = broker.filter((s) => s.awaiting);
+  if (waiting.length) {
+    const longest = waiting.reduce((a, b) => ((b.awaitingMs ?? 0) > (a.awaitingMs ?? 0) ? b : a));
+    const minutes = Math.round((longest.awaitingMs ?? 0) / 60_000);
+    const how = minutes >= 1 ? `${minutes} minute${minutes === 1 ? '' : 's'}` : null;
+    out.push({
+      level: minutes >= 30 ? 'warn' : 'info',
+      text: waiting.length === 1
+        ? 'a conversation is waiting for an answer from you'
+        : `${waiting.length} conversations are waiting for an answer from you`,
+      detail: [
+        how && (waiting.length === 1 ? `it has sat there ${how}` : `the longest has sat there ${how}`),
+        'answer it in the editor panel; nothing moves in it until you do',
+      ].filter(Boolean).join(' — '),
     });
   }
 

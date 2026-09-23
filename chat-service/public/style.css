@@ -625,6 +625,11 @@ html, body {
 }
 .pill.hot { background: var(--accent-dim); color: #fff; }
 .pill.warn { background: rgba(224, 82, 82, .16); color: var(--error); }
+/* The one badge here that is a request rather than a report: that conversation moves
+   again when somebody answers it and not before, so it has to outrank `hot`, which
+   only means busy. Amber because that is already what "waiting on a person" looks
+   like on the phone — `.cmo-ask` in pwa/mobile-overlay.js is this colour. */
+.pill.ask { background: #e6a23c; color: #1b1408; }
 
 /* Destructive, so it looks it — but not a full-width red button, because on this
    page most rows are healthy and the button is not the point of the row. */

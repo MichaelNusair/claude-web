@@ -103,6 +103,74 @@ process.stdin.on('data', (c) => {
       }, 40).unref();
       continue;
     }
+    // A question put to whoever is driving, which is what the CLI does with
+    // \`--permission-prompt-tool stdio\`: a control_request on STDOUT, and then nothing
+    // until a control_response comes back. These frames are the real ones, captured
+    // from claude 2.1.280 — a plain approval, and the one whose tool IS the question.
+    if (text === 'ask-permission' || text === 'ask-question' || text === 'ask-slowly'
+      || text === 'ask-unflagged') {
+      const frame = JSON.stringify(text === 'ask-question' || text === 'ask-unflagged'
+        ? {
+          type: 'control_request',
+          request_id: text === 'ask-unflagged' ? 'Q2' : 'Q1',
+          request: {
+            subtype: 'can_use_tool',
+            tool_name: 'AskUserQuestion',
+            display_name: 'AskUserQuestion',
+            input: { questions: [{ question: 'Tabs or spaces?', header: 'Indentation' }] },
+            tool_use_id: 'toolu_q',
+            // The same frame without the flag, for the variant: what the CLI would
+            // send if it ever stopped marking these, and the one field it cannot stop
+            // sending is the name of the tool.
+            ...(text === 'ask-unflagged' ? {} : { requires_user_interaction: true }),
+          },
+        }
+        : {
+          type: 'control_request',
+          request_id: text === 'ask-slowly' ? 'P2' : 'P1',
+          request: {
+            subtype: 'can_use_tool',
+            tool_name: 'Bash',
+            display_name: 'Bash',
+            input: { command: 'rm -rf /nowhere', description: 'Delete nothing' },
+            permission_suggestions: [{ type: 'setMode', mode: 'acceptEdits', destination: 'session' }],
+            tool_use_id: 'toolu_p',
+          },
+        }) + '\\n';
+      // One byte at a time for the slow variant, so the frame is split inside its own
+      // name and the broker has to bridge the seam to see it at all.
+      if (text !== 'ask-slowly') {
+        process.stdout.write(frame);
+        continue;
+      }
+      let j = 0;
+      const drip = setInterval(() => {
+        if (j >= frame.length) { clearInterval(drip); return; }
+        process.stdout.write(frame[j]);
+        j += 1;
+      }, 2);
+      continue;
+    }
+    // A frame that NESTS one of those, unescaped, at a level that is not the top.
+    // Valid JSON, not a question, and the case a substring match gets wrong — which
+    // matters because a conversation reading this very file back would contain one.
+    if (text === 'ask-inside-a-message') {
+      process.stdout.write(JSON.stringify({
+        type: 'user',
+        message: { role: 'user', content: 'quoting the wire format at you' },
+        quoted: { type: 'control_request', request_id: 'NOPE', request: { subtype: 'can_use_tool', tool_name: 'Bash' } },
+      }) + '\\n');
+      continue;
+    }
+    // The model saying something after a question was asked — the backstop for a
+    // question the CLI abandoned without telling anyone.
+    if (text === 'move-on') {
+      process.stdout.write(JSON.stringify({
+        type: 'assistant',
+        message: { role: 'assistant', content: [{ type: 'text', text: 'never mind, I found another way' }] },
+      }) + '\\n');
+      continue;
+    }
     // The same event, one byte per write, so the broker sees it split across
     // chunks. The real CLI does this whenever a flush lands mid-token.
     if (text === 'end-turn-slowly') {
@@ -625,6 +693,99 @@ async function main() {
   await sleep(400);
   ok((await mineNow())?.working === false, 'and that turn ends the same way every other one does');
   fs.rmSync(trigger, { force: true });
+
+  section('It can say when Claude is waiting for YOU, which "working" cannot:');
+  /*
+   * The state "working" has always covered for, and the reason the badge is worth
+   * looking at at all. A permission prompt and an `AskUserQuestion` are both a turn in
+   * flight — the flag is right — and both mean nothing whatsoever will happen until a
+   * person clicks something. Measured on the transcripts on this box: 71 answered
+   * questions, a median wait of three minutes, a longest of 5.9 hours, and three
+   * conversations sitting on an unanswered one, every minute of it reported as work in
+   * progress. The prompt is on stdout and the answer comes back up stdin, so this
+   * daemon is the only thing that sees either.
+   */
+  const answer = (id) => send(a, `${JSON.stringify({
+    type: 'control_response',
+    response: { subtype: 'success', request_id: id, response: { behavior: 'allow' } },
+  })}\n`);
+
+  say(a, 'ask-permission');
+  await sleep(400);
+  const prompted = await mineNow();
+  ok(prompted?.working === true, 'a conversation stopped at a permission prompt is still working');
+  ok(prompted?.awaiting === 'permission', 'and now says what it is working on is an answer from you');
+  ok(prompted?.awaitingName === 'Bash', 'named by the tool it is asking about, never by its input');
+  ok(typeof prompted?.awaitingMs === 'number', 'with how long it has been sitting there, so a stuck one can be found');
+
+  answer('P1');
+  await sleep(300);
+  const clicked = await mineNow();
+  ok(clicked?.awaiting === null, 'clicking an answer clears the wait');
+  ok(clicked?.working === true, 'and leaves the turn as in flight as it was — the tool now runs');
+
+  // The question worth telling from a prompt: this one is a decision, not a click, and
+  // the CLI marks it as such rather than leaving it to be guessed from the tool name.
+  say(a, 'ask-question');
+  await sleep(400);
+  const asking = await mineNow();
+  ok(asking?.awaiting === 'question', 'a question is reported as a question, not as a permission prompt');
+  ok(asking?.awaitingName === 'AskUserQuestion', 'and names the tool that asked it');
+
+  say(a, 'end-turn');
+  await sleep(400);
+  const abandoned = await mineNow();
+  ok(abandoned?.working === false, 'a turn that gives up on its question ends like any other');
+  ok(abandoned?.awaiting === null, 'and takes the question with it, rather than asking forever');
+
+  /*
+   * The same frame with the flag missing, on the cleared slate the turn above left so
+   * that it is this frame being read and not the one before it. It is a question
+   * because of what asked: a CLI that stopped marking these would otherwise turn every
+   * question on this box back into a permission prompt — for a tool called
+   * AskUserQuestion, which is the badge admitting it does not know what it is showing.
+   */
+  say(a, 'ask-unflagged');
+  await sleep(400);
+  ok((await mineNow())?.awaiting === 'question',
+    'a question that forgot to say it needs a person is still a question');
+  answer('Q2');
+  await sleep(300);
+  ok((await mineNow())?.awaiting === null, 'and is answered like any other');
+
+  // A prompt dribbled out a byte at a time is split inside its own name, so nothing
+  // that looks at one chunk can see it. The symptom of missing it is the badge this
+  // whole section exists to fix, silently back to saying "working".
+  say(a, 'ask-slowly');
+  await sleep(900);
+  ok((await mineNow())?.awaiting === 'permission', 'a prompt split across chunks is still seen');
+
+  // The other way a question ends: the client gives up on it. Written as the extension
+  // writes it, with the id at the top level rather than nested under a response.
+  send(a, `${JSON.stringify({ type: 'control_cancel_request', request_id: 'P2' })}\n`);
+  await sleep(300);
+  ok((await mineNow())?.awaiting === null, 'and a cancelled one stops being waited for');
+
+  // The backstop, for a question the CLI abandons without saying so — a dialog it
+  // times out on, a request whose client went away. Neither writes anything up the
+  // stdin this daemon holds, so the model's next word has to be what settles it.
+  say(a, 'ask-permission');
+  await sleep(400);
+  ok((await mineNow())?.awaiting === 'permission', 'a fresh prompt is waiting again');
+  say(a, 'move-on');
+  await sleep(400);
+  const movedOn = await mineNow();
+  ok(movedOn?.awaiting === null, 'the model producing again ends the wait, whoever settled it');
+  ok(movedOn?.working === true, 'and that is a turn in flight, not your turn');
+
+  // Parsed, not matched. A tool result quoting the wire format is escaped inside its
+  // own JSON and cannot match, but a frame that legitimately nests one is not escaped
+  // — and reading this file back into a conversation produces exactly that.
+  say(a, 'ask-inside-a-message');
+  await sleep(400);
+  ok((await mineNow())?.awaiting === null, 'a message that merely nests one of these frames is not one');
+  say(a, 'end-turn');
+  await sleep(300);
 
   section('A process nobody ever spoke to is not parked for twelve hours:');
   // The panel spawns TWO claudes per page load — a probe with no `--resume` that

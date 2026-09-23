@@ -111,7 +111,21 @@ function makeState() {
     // process table records.
     live: [
       { pid: 901, cwd: `${ROOT}/demo`, sessionId: 'dup-session', working: false, clients: 1 },
-      { pid: 905, cwd: `${ROOT}/demo`, sessionId: 'fresh-session', working: true, clients: 2 },
+      // Mid-turn and stopped dead: the CLI asked to run Bash and nobody has clicked
+      // the button. `working` stays true because the turn really is in flight — and
+      // that is why this had to be reported separately. A page of rows all badged
+      // "working" cannot tell you which of them is waiting on you, and that is the
+      // question someone opens this page with.
+      {
+        pid: 905,
+        cwd: `${ROOT}/demo`,
+        sessionId: 'fresh-session',
+        working: true,
+        clients: 2,
+        awaiting: 'permission',
+        awaitingName: 'Bash',
+        awaitingMs: 8 * 60 * 1000,
+      },
     ],
     signals: [],
     killedSessions: [],
@@ -311,6 +325,15 @@ const overview = await admin.overview();
   check('and is not mistaken for a probe', !fresh.probe);
   check('the broker also says whether it is working', fresh.working === true && fresh.clients === 2,
     JSON.stringify({ working: fresh.working, clients: fresh.clients }));
+  // The half of "working" that made the badge nearly worthless: this turn is in
+  // flight and will not move until a person answers it. Carried through as the
+  // broker said it, including `working`, which is still true.
+  check('and whether it is working on an answer from you', fresh.awaiting === 'permission'
+    && fresh.awaitingName === 'Bash' && fresh.awaitingMs === 8 * 60 * 1000,
+    JSON.stringify({ awaiting: fresh.awaiting, name: fresh.awaitingName, ms: fresh.awaitingMs }));
+  check('a conversation nobody is asking anything of says nothing about waiting',
+    broker[0].awaiting === null && broker[0].awaitingMs === null,
+    JSON.stringify({ awaiting: broker[0].awaiting, ms: broker[0].awaitingMs }));
   check('a resumed one keeps the id argv gave it', broker[0].sessionId === 'dup-session', String(broker[0].sessionId));
   check('and is asked for one client, not two', broker[0].clients === 1 && broker[0].working === false);
 
@@ -594,8 +617,18 @@ const $ = (sel) => w.document.querySelector(sel);
   const freshRow = brokerRows.find((r) => r.textContent.includes('fresh-se'));
   check('a fresh conversation shows its id, not "no session"', Boolean(freshRow),
     $('#surface-broker').textContent);
-  check('and what the broker said about it', freshRow?.textContent.includes('working')
+  check('and what the broker said about it', freshRow?.textContent.includes('needs you · Bash')
     && freshRow?.textContent.includes('2 attached'), freshRow?.textContent);
+  // Not both. The row is working and waiting at once, both true, and a row that says
+  // so twice makes the reader decide which badge to believe — see brokerRow.
+  check('a row waiting on you does not also badge "working"',
+    !freshRow?.querySelector('.pill.hot') && Boolean(freshRow?.querySelector('.pill.ask')),
+    freshRow?.innerHTML);
+  check('and says how long it has been sitting there', freshRow?.textContent.includes('waiting 8m'),
+    freshRow?.textContent);
+  check('the wait is a finding too, where the page is read top-down',
+    overview.findings.some((f) => f.text.includes('waiting for an answer from you')),
+    overview.findings.map((f) => f.text).join(' | '));
 
   // Banded by project, because the state this page is opened in is one project's
   // panel eight sessions deep next to another's.
@@ -669,7 +702,11 @@ console.log('\nThe page asks before forcing anything:');
   await w.__adminForTest.stopAll('broker');
   check('one question for the whole surface', confirmed.length === 1, `${confirmed.length} questions`);
   check('it says how many', confirmed[0]?.includes('all 5 editor panel sessions'), confirmed[0]);
-  check('and what is live among them', confirmed[0]?.includes('1 working right now')
+  // A waiting conversation is named as waiting, not as working: of the two refusals
+  // this question exists to carry, it is the one you can act on instead. "Working
+  // right now" is a machine you would be interrupting; "waiting for an answer" is one
+  // that will still be there after you answer it.
+  check('and what is live among them', confirmed[0]?.includes('1 waiting for an answer from you')
     && confirmed[0]?.includes('1 open on a device'), confirmed[0]);
   check('a turn in flight is named as the cost', confirmed[0]?.includes('cannot be recovered'), confirmed[0]);
   check('every session is stopped', posts.length === 5, `${posts.length} posts`);
