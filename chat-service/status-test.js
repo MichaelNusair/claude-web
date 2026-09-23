@@ -682,6 +682,15 @@ fs.writeFileSync(SLEEPER, 'setTimeout(() => {}, 120000);\n');
 const unbrokered = spawn(FAKE_CLAUDE, [SLEEPER, `--resume=${SESSION}`], { stdio: 'ignore' });
 unbrokered.unref();
 brokerReply = { ok: true, v: 1, sessions: [] };
+/*
+ * A beat between the two clocks being compared, because they are only a fraction of a
+ * millisecond apart otherwise: `/proc/<pid>` is stamped as the spawn returns and the
+ * entry's timestamp is written on the next line, and measured here the process came
+ * out 0.4ms *after* the moment the writer read. Passing on that margin is luck — it
+ * passed on this box and failed on the deploy box, which is the same thing. What the
+ * test means to set up is a process that plainly predates the mid-turn entry.
+ */
+await new Promise((resolve) => setTimeout(resolve, 1000));
 writeConvo(TRANSCRIPT, title('The one on screen', SESSION), assistant('let me look', 'tool_use'));
 
 /*
