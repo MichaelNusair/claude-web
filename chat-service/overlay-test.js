@@ -1156,7 +1156,7 @@ const finalMessage = [
   '',
   '**Fixed** the guard in `pwa/mobile-overlay.js` — it now reads the mic button’s',
   'class instead of `recognition`, which the recorder path never sets. See',
-  '/workspace/projects/claude-web/chat-service/auth.js:42-51 and the note in',
+  '/workspace/projects/triplec/chat-service/auth.js:42-51 and the note in',
   '[AGENTS.md](https://claude.example.com/AGENTS.md).',
   '',
   '```js',

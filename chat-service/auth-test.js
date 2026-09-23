@@ -52,11 +52,11 @@ async function startServer(env) {
       PORT: String(PORT),
       // Cookies would otherwise be Secure-only and never sent over plain HTTP.
       CW_INSECURE_COOKIES: '1',
-      PROJECTS_ROOT: '/tmp/claude-web-test-projects',
+      PROJECTS_ROOT: '/tmp/triplec-test-projects',
       // So a test run cannot touch the real VAPID keypair or device list. Nothing
       // here should reach them — every push route is checked unauthenticated — but
       // "should" is what the hole this file exists for was made of.
-      CW_PUSH_DIR: '/tmp/claude-web-test-push',
+      CW_PUSH_DIR: '/tmp/triplec-test-push',
       ...env,
     },
     stdio: ['ignore', 'pipe', 'pipe'],

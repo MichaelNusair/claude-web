@@ -568,8 +568,8 @@ section('The preview, which is all a lock screen shows:');
 section('The title, which is one line and gets truncated from the end:');
 {
   ok(
-    notificationTitle('claude-web', 'fixing the notification tap') === 'personal: claude-web · fixing the notification tap',
-    `the title reads ${JSON.stringify(notificationTitle('claude-web', 'fixing the notification tap'))}`,
+    notificationTitle('triplec', 'fixing the notification tap') === 'personal: triplec · fixing the notification tap',
+    `the title reads ${JSON.stringify(notificationTitle('triplec', 'fixing the notification tap'))}`,
   );
   // A conversation with no name yet — Claude Code writes `ai-title` a turn or two in,
   // so the first notification of a conversation usually has none.

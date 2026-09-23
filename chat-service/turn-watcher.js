@@ -187,7 +187,7 @@ async function projectsByDir() {
  * the order the title is built in decides what survives: the deployment and the
  * project are the words that place the notification, and the conversation's name is
  * the one that can afford to be cut. 64 is measured against the widest of these
- * titles ("personal: claude-web · …") on a 390px phone rather than chosen.
+ * titles — "<deployment>: <project> · …" — on a 390px phone rather than chosen.
  */
 const TITLE_CHARS = 64;
 
@@ -197,7 +197,7 @@ const TITLE_CHARS = 64;
  * Widest to narrowest, because that is the order in which the words stop being
  * ambiguous. Two deployments can be running this repository (see deploymentName in
  * manifest.js) and every project has several conversations in it, so a title reading
- * "Claude finished · claude-web" answered neither "whose box" nor "which of the four
+ * "Claude finished · triplec" answered neither "whose box" nor "which of the four
  * things I left running". `appTitle` supplies the first two, exactly as it does for a
  * home-screen icon, so a phone showing both deployments' icons and both deployments'
  * notifications names them the same way in both places.

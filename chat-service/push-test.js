@@ -172,7 +172,7 @@ function decryptAsBrowser(payload, { uaPrivate, uaPublic, authSecret }) {
 
 section('A real payload, with a real random salt, comes back out:');
 {
-  const message = JSON.stringify({ title: 'Claude finished · claude-web', body: 'Deployed. 144/144 checks passed.' });
+  const message = JSON.stringify({ title: 'Claude finished · triplec', body: 'Deployed. 144/144 checks passed.' });
   const sealed = push.encryptPayload(message, RECIPIENT);
   ok(
     decryptAsBrowser(sealed, { uaPrivate: V.uaPrivate, uaPublic: V.uaPublic, authSecret: V.authSecret }) === message,
@@ -229,7 +229,7 @@ section('Refuses what a push service would silently drop:')
 
 section('A Topic is always legal, whatever it is made from:');
 {
-  const long = push.topicFor('/workspace/projects/claude-web|9f0c1b2a-3d4e-5f60-7182-93a4b5c6d7e8');
+  const long = push.topicFor('/workspace/projects/triplec|9f0c1b2a-3d4e-5f60-7182-93a4b5c6d7e8');
   ok(/^[A-Za-z0-9_-]{1,32}$/.test(long), `topicFor produced ${long}, which a push service answers 400 to`);
   ok(push.topicFor('a') === push.topicFor('a'), 'the same conversation gets a different topic each time, so notifications stack');
   ok(push.topicFor('a') !== push.topicFor('b'), 'two conversations share a topic, so one replaces the other');
@@ -368,8 +368,8 @@ await once(server, 'listening');
 const base = `http://127.0.0.1:${server.address().port}`;
 const at = (p) => ({ endpoint: `${base}${p}`, keys: { p256dh: V.uaPublic, auth: V.authSecret } });
 {
-  const payload = { title: 'Claude finished · claude-web', body: 'All three features are in.' };
-  const topic = push.topicFor('/workspace/projects/claude-web|abc');
+  const payload = { title: 'Claude finished · triplec', body: 'All three features are in.' };
+  const topic = push.topicFor('/workspace/projects/triplec|abc');
   const result = await push.sendPush(at('/ok/1'), payload, { topic });
   ok(result.ok && result.status === 201 && !result.gone, `a 201 was not reported as sent: ${JSON.stringify(result)}`);
 

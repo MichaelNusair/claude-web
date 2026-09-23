@@ -21,8 +21,8 @@ import { promisify } from 'util';
 
 const execFileAsync = promisify(execFile);
 
-const root = await mkdtemp(join(tmpdir(), 'claude-web-projects-'));
-const remotes = await mkdtemp(join(tmpdir(), 'claude-web-remotes-'));
+const root = await mkdtemp(join(tmpdir(), 'triplec-projects-'));
+const remotes = await mkdtemp(join(tmpdir(), 'triplec-remotes-'));
 
 // session-manager reads these at import time, so they must be set first. A
 // committer identity too: the module's own `git commit` inherits this process's
