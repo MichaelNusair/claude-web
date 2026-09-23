@@ -128,6 +128,10 @@ html, body {
   cursor: pointer;
 }
 .wide { width: 100%; margin-top: 20px; }
+/* A control with nothing to act on yet — Mute before the microphone has been granted.
+   Dimmed rather than hidden: a sheet that reflows while a call is connecting moves Hang
+   up out from under a thumb already on its way down. */
+.wide[disabled] { opacity: .45; cursor: default; }
 
 /* --- tab bar --- */
 .tabbar {

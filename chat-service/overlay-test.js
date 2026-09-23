@@ -3471,6 +3471,8 @@ await settle(30);
             const track = {
               kind: 'audio',
               stopped: 0,
+              // Live tracks start enabled, and muting is what turns this off.
+              enabled: true,
               stop() {
                 this.stopped += 1;
               },
@@ -3923,6 +3925,127 @@ await settle(30);
     `the credential was printed: ${JSON.stringify(b.logs.filter((l) => l.includes('ek_')))}`,
     !b.logs.some((l) => l.includes('ek_')),
   );
+
+  // ------------------------------------------------- muting, without hanging up
+  /*
+   * Why this is a control of its own rather than "hang up and start another one": the
+   * session is minted with semantic turn detection and `interrupt_response` on, so
+   * anything the phone hears cuts off the sentence being explained — and a second
+   * session costs another of the day's forty. So mute has to silence the microphone
+   * while keeping the line, which means `enabled = false` on the track and emphatically
+   * not `stop()`. Both halves are asserted, because stopping the track would look
+   * exactly like muting for about one second and then be unrecoverable.
+   */
+  const muteBtn = () => b.doc.getElementById('cmo-talk-mute');
+  ok('a live line offers no way to mute the microphone', muteBtn());
+  ok(
+    'the microphone starts out muted, so the first thing said into it goes nowhere',
+    b.tracks().length > 0 && b.tracks().every((t) => t.enabled === true),
+  );
+
+  b.tap('cmo-talk-mute');
+  await settle(20);
+  ok(
+    'muting left the microphone sending, so every word in the room still reaches the far end',
+    b.tracks().every((t) => t.enabled === false),
+  );
+  ok(
+    'muting stopped the track instead of disabling it — that closes the microphone, so ' +
+      'the line cannot be unmuted and talking again costs another of the day’s sessions',
+    b.tracks().every((t) => t.stopped === 0),
+  );
+  ok(
+    'muting closed the connection, which is hanging up by another name',
+    peer.closed === 0 && b.peers.length === 1,
+  );
+  ok(
+    'muting closed the event channel, so the transcript stops where the mute did',
+    peer.channels[0].closed === 0,
+  );
+  ok(
+    'muting took the far end’s audio away too — being able to listen is the whole ' +
+      'reason to mute rather than hang up',
+    Boolean(b.audios.find((a) => a.srcObject)),
+  );
+  ok(
+    `the sheet still claims to be listening while muted: ${JSON.stringify(b.text('cmo-talk-state'))}`,
+    /^muted/i.test(b.text('cmo-talk-state')),
+  );
+  ok(
+    `the sheet does not say the line is still open while muted: ` +
+      `${JSON.stringify(b.text('cmo-talk-state'))} — muting instead of hanging up and ` +
+      'then pocketing the phone is the one mistake this button makes possible',
+    /still open/i.test(b.text('cmo-talk-state')),
+  );
+  ok(
+    `the control does not say how to undo itself: ${JSON.stringify(muteBtn()?.textContent)}`,
+    muteBtn()?.textContent === 'Unmute',
+  );
+  ok(
+    'a screen reader is not told the toggle is on',
+    muteBtn()?.getAttribute('aria-pressed') === 'true',
+  );
+
+  b.tap('cmo-talk-mute');
+  await settle(20);
+  ok(
+    'unmuting did not give the microphone back, so mute is a one-way door',
+    b.tracks().every((t) => t.enabled === true),
+  );
+  ok(
+    `the sheet still says muted after unmuting: ${JSON.stringify(b.text('cmo-talk-state'))}`,
+    /^listening$/i.test(b.text('cmo-talk-state')),
+  );
+  ok(
+    `the control did not go back: ${JSON.stringify(muteBtn()?.textContent)}`,
+    muteBtn()?.textContent === 'Mute' && muteBtn()?.getAttribute('aria-pressed') === 'false',
+  );
+
+  {
+    /*
+     * And it is not sticky. A conversation that opened muted because the last one ended
+     * that way is one you talk into for ten seconds before finding out — with the day's
+     * count already spent on it.
+     */
+    const again = bootTalk();
+    await settle(60);
+    await again.openStatus();
+    again.tap('cmo-talk');
+    await settle(60);
+    again.tap('cmo-talk-mute');
+    await settle(20);
+    ok(
+      'mute did nothing on a second conversation',
+      again.mics[0].tracks.every((t) => t.enabled === false),
+    );
+    again.tap('cmo-talk-end');
+    await settle(20);
+    ok(
+      `the control is still offered with no line to mute: ` +
+        `${JSON.stringify(again.doc.getElementById('cmo-talk-mute')?.textContent)}`,
+      again.doc.getElementById('cmo-talk-mute')?.disabled === true &&
+        again.doc.getElementById('cmo-talk-mute')?.textContent === 'Mute',
+    );
+    await again.openStatus();
+    again.tap('cmo-talk');
+    await settle(60);
+    ok('the second conversation never opened', again.mics.length === 2);
+    ok(
+      'a new conversation inherited the last one’s mute — it is listening to nothing and ' +
+        'says it is listening',
+      again.mics[1].tracks.every((t) => t.enabled === true),
+    );
+    ok(
+      `the new line’s sheet says: ${JSON.stringify(again.text('cmo-talk-state'))}`,
+      /^listening$/i.test(again.text('cmo-talk-state')),
+    );
+    ok(
+      `the control did not reset: ${JSON.stringify(again.doc.getElementById('cmo-talk-mute')?.textContent)}`,
+      again.doc.getElementById('cmo-talk-mute')?.textContent === 'Mute',
+    );
+    again.tap('cmo-talk-end');
+    await settle(20);
+  }
 
   // ------------------------------------------------------------- hanging up
   b.tap('cmo-talk-end');

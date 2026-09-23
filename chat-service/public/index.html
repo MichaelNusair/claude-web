@@ -262,6 +262,10 @@
     </div>
     <div id="talk-transcript" class="talk-transcript" aria-live="polite"></div>
     <p class="hint" id="talk-note"></p>
+    <!-- Mute above Hang up, and never styled like it: this is the one reached for in a
+         hurry while the voice is mid-sentence, and the button under it ends a session
+         that counts against the day. Disabled until there is a microphone to mute. -->
+    <button type="button" id="btn-talk-mute" class="wide subtle" aria-pressed="false" disabled>Mute</button>
     <button type="button" id="btn-talk-end" class="wide danger">Hang up</button>
     <button type="button" data-close-talk class="wide subtle">Close</button>
   </div>

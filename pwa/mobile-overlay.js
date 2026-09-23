@@ -223,6 +223,10 @@
     font: 600 15px inherit; cursor: pointer;
   }
   .cmo-action.cmo-alt { background: #3a3a38; color: #f5f4ef; }
+  /* A control with nothing to act on yet — Mute before the microphone has been
+     granted. Dimmed rather than hidden: a row that reflows while a call is connecting
+     moves Hang up out from under a thumb already on its way down. */
+  .cmo-action[disabled] { opacity: 0.45; }
   .cmo-hint { color: #a3a099; font-size: 12.5px; margin: 10px 0 0; }
   .cmo-hint a { color: #d97757; }
   .cmo-status { color: #d97757; font-size: 13px; margin: 8px 0 0; min-height: 18px; }
@@ -4303,6 +4307,12 @@
     channel: null,      // the `oai-events` channel, which carries both transcripts
     mic: null,          // the MediaStream, kept so its tracks can actually be stopped
     audio: null,        // the element playing the far end, made once and reused
+    /*
+     * Muted, which is not one of the ways out: the microphone is still open and the
+     * minute is still being billed, the far end is simply being sent silence. See
+     * `setTalkMute` for why that is the useful thing rather than stopping the track.
+     */
+    muted: false,
     started: 0,
     timer: null,
     /*
@@ -4344,6 +4354,40 @@
   }
 
   /**
+   * Mute, which is not the same thing as stopping the microphone.
+   *
+   * `enabled = false` keeps the track and the session and sends silence in place of the
+   * room; stopping it would close the microphone and there would be no way back into
+   * this conversation — a second one costs another session against the day's count. So
+   * while muted the recording indicator stays lit, correctly, and the minute is still
+   * being billed. Hanging up is still the only thing that closes the line, which is why
+   * nothing here reports otherwise.
+   *
+   * It is worth a button because of how the session is minted: turn detection is
+   * semantic with `interrupt_response` on (chat-service/realtime.js), so anything the
+   * phone hears — a cough, someone else's sentence, a podcast in the room — cuts off the
+   * explanation mid-word. Mute is how a long answer gets listened to in a noisy place.
+   */
+  function setTalkMute(muted) {
+    talk.muted = Boolean(muted);
+    for (const track of talk.mic?.getTracks?.() || []) track.enabled = !talk.muted;
+    paintTalkMute();
+    // Only once there is a line: before that the state line is saying how the
+    // connection is going, which is the more useful of the two.
+    if (talking()) paintTalkState(talkStateText());
+  }
+
+  /**
+   * What the state line says while a line is up — "Listening" is a lie when muted.
+   *
+   * It says the line is still open as well, in the same breath, because the mistake this
+   * button makes possible is muting instead of hanging up and putting the phone in a
+   * pocket. What actually closes it then is the ten-minute timer.
+   */
+  const talkStateText = () =>
+    talk.muted ? 'Muted — it cannot hear you, and the line is still open' : 'Listening';
+
+  /**
    * Start one, from inside the tap.
    *
    * `text` is the message as it was written, fences and all. `prompt` is what was asked
@@ -4370,6 +4414,14 @@
 
     const generation = ++talk.generation;
     talk.lines = [];
+    /*
+     * Unmuted, always: a conversation that opened muted because the last one ended that
+     * way is one you talk into for ten seconds before finding out. `endTalk` clears it
+     * first — this is the second line of defence, and the one that matters, because the
+     * mute is applied to a stream that no longer exists by then: a stale `true` here
+     * would draw "Unmute" over a microphone that is in fact live.
+     */
+    talk.muted = false;
     openTalkSheet();
     paintTalkState('Asking for a line…');
     paintTalkTranscript();
@@ -4392,6 +4444,9 @@
         return;
       }
       talk.mic = mic;
+      // There is something to mute from here, which is before the line is up: the room
+      // is already being heard while the credential is still being minted.
+      paintTalkMute();
 
       const res = await fetch('/api/realtime/token', {
         method: 'POST',
@@ -4460,7 +4515,7 @@
     };
     pc.onconnectionstatechange = () => {
       if (generation !== talk.generation) return;
-      if (pc.connectionState === 'connected') paintTalkState('Listening');
+      if (pc.connectionState === 'connected') paintTalkState(talkStateText());
       if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
         endTalk();
         paintTalkState('The line dropped');
@@ -4506,7 +4561,7 @@
       }
     }, 1000);
 
-    paintTalkState('Listening');
+    paintTalkState(talkStateText());
     paintTalkClock();
     /*
      * What it costs and when it stops, on the sheet while it runs. This is the one
@@ -4620,15 +4675,18 @@
     talk.pc = null;
     talk.channel = null;
     talk.mic = null;
+    talk.muted = false;
     talk.started = 0;
     paintTalkState('Hung up');
     paintTalkClock();
+    paintTalkMute();
     paintTalkBar();
   }
 
   /*
    * The sheet, which is the whole of this feature's screen: what it is not, what it is
-   * doing, how long it has been doing it, what was said, and two ways to end it.
+   * doing, how long it has been doing it, what was said, a way to stop talking without
+   * stopping the line, and two ways to end it.
    *
    * One string of static HTML with nothing from outside this file in it — the rule on
    * this surface — and everything else written through textContent afterwards. A
@@ -4646,15 +4704,48 @@
       <p class="cmo-hint" id="cmo-talk-clock"></p>
       <div class="cmo-talk-log" id="cmo-talk-log"></div>
       <div class="cmo-row">
+        <button class="cmo-action cmo-alt" id="cmo-talk-mute" aria-pressed="false" disabled>Mute</button>
         <button class="cmo-action" id="cmo-talk-end">Hang up</button>
         <button class="cmo-action cmo-alt" id="cmo-talk-close">Close</button>
       </div>
       <p class="cmo-hint" id="cmo-talk-note"></p>`,
       { keepTalking: true },
     );
+    /*
+     * Mute first in the row, and never styled like Hang up.
+     *
+     * It is the control reached for in a hurry, mid-sentence, while something is being
+     * said out loud that the room should not answer — and the button beside it ends a
+     * session that counts against the day. Two taps that mean different things must not
+     * look like each other.
+     */
+    panel
+      .querySelector('#cmo-talk-mute')
+      .addEventListener('click', () => setTalkMute(!talk.muted));
     // Hang up and stay: the transcript is worth reading after the line has gone.
     panel.querySelector('#cmo-talk-end').addEventListener('click', () => endTalk());
     panel.querySelector('#cmo-talk-close').addEventListener('click', closeSheet);
+    paintTalkMute();
+  }
+
+  /**
+   * The mute control, which is enabled exactly while there is a microphone to mute.
+   *
+   * `aria-pressed` rather than a changed colour alone: this is a toggle, and a screen
+   * reader on a phone is the case where "did that do anything" is hardest to answer.
+   */
+  function paintTalkMute() {
+    const btn = panel.querySelector('#cmo-talk-mute');
+    if (!btn) return;
+    btn.disabled = !talk.mic;
+    btn.textContent = talk.muted ? 'Unmute' : 'Mute';
+    btn.setAttribute('aria-pressed', talk.muted ? 'true' : 'false');
+    btn.setAttribute(
+      'aria-label',
+      talk.muted
+        ? 'Unmute the microphone — the line is still open'
+        : 'Mute the microphone, without ending the conversation',
+    );
   }
 
   function paintTalkState(text) {

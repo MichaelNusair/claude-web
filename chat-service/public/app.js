@@ -3830,6 +3830,11 @@ const talk = {
   mic: null,          // MediaStream, so its tracks can actually be stopped
   audio: null,        // the element playing the far end
   control: null,      // the button that opened it, which is also its Stop
+  /*
+   * Muted, which is not a way out: the microphone stays open and the minute is still
+   * billed, the far end is just sent silence. See `setTalkMute`.
+   */
+  muted: false,
   started: 0,
   timer: null,
   generation: 0,
@@ -3843,6 +3848,48 @@ function talkReady() {
 /** Whether a conversation is up, or on its way up. */
 function talking() {
   return Boolean(talk.pc);
+}
+
+/**
+ * Mute, which is not the same thing as stopping the microphone.
+ *
+ * `enabled = false` keeps the track and the session and sends silence in place of the
+ * room; stopping it would close the microphone with no way back into this conversation,
+ * and a second one costs another session against the day's count. So while muted the
+ * recording indicator stays lit, correctly, and the minute is still billed — hanging up
+ * is the only thing that closes the line.
+ *
+ * Worth a button because of how the session is minted: turn detection is semantic with
+ * `interrupt_response` on (chat-service/realtime.js), so anything the microphone hears
+ * cuts the explanation off mid-word. This is how a long answer gets heard out in a room
+ * with other people in it.
+ */
+function setTalkMute(muted) {
+  talk.muted = Boolean(muted);
+  for (const track of talk.mic?.getTracks?.() || []) track.enabled = !talk.muted;
+  paintTalkMute();
+  // Only with a line up: before that, the status line is reporting the connection,
+  // which is the more useful of the two things it could say.
+  if (talking()) paintTalkStatus(talkStateText());
+}
+
+/**
+ * What the status line says while a line is up — "Listening" is a lie when muted.
+ *
+ * And that the line is still open, in the same breath: the mistake this button makes
+ * possible is muting instead of hanging up and then walking away from it.
+ */
+const talkStateText = () =>
+  talk.muted ? 'Muted — it cannot hear you, and the line is still open' : 'Listening';
+
+/** The mute control, enabled exactly while there is a microphone to mute. */
+function paintTalkMute() {
+  const btn = $('#btn-talk-mute');
+  if (!btn) return;
+  btn.disabled = !talk.mic;
+  btn.textContent = talk.muted ? 'Unmute' : 'Mute';
+  // A toggle, so it says so to a screen reader rather than only changing its label.
+  btn.setAttribute('aria-pressed', talk.muted ? 'true' : 'false');
 }
 
 /**
@@ -3864,6 +3911,14 @@ async function startTalking(text, { prompt = '', control = null } = {}) {
   const generation = ++talk.generation;
   talk.control = control;
   talk.lines = [];
+  /*
+   * Never inherited from the last conversation: one that opens muted is one you talk
+   * into for ten seconds before finding out. `endTalking` clears it first — this is the
+   * second line of defence, and the one that matters, because a stale `true` would
+   * label the button "Unmute" over a microphone that is live: the mute was applied to a
+   * stream that has been stopped since.
+   */
+  talk.muted = false;
   openTalkSheet();
   paintTalkStatus('Asking for a line…');
   paintTalkTranscript();
@@ -3884,6 +3939,9 @@ async function startTalking(text, { prompt = '', control = null } = {}) {
       return;
     }
     talk.mic = mic;
+    // Mutable from here, which is before the line is up: the room is already being heard
+    // while the credential is being minted.
+    paintTalkMute();
 
     const res = await api('/api/realtime/token', {
       method: 'POST',
@@ -3941,7 +3999,7 @@ async function connectTalk(minted, generation) {
   };
   pc.onconnectionstatechange = () => {
     if (generation !== talk.generation) return;
-    if (pc.connectionState === 'connected') paintTalkStatus('Listening');
+    if (pc.connectionState === 'connected') paintTalkStatus(talkStateText());
     if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
       endTalking();
       paintTalkStatus('The line dropped');
@@ -3984,7 +4042,7 @@ async function connectTalk(minted, generation) {
     }
   }, 1000);
 
-  paintTalkStatus('Listening');
+  paintTalkStatus(talkStateText());
   paintTalkClock();
   const spent = minted.budget;
   $('#talk-note').textContent = [
@@ -4084,9 +4142,11 @@ function endTalking() {
   talk.channel = null;
   talk.mic = null;
   talk.control = null;
+  talk.muted = false;
   talk.started = 0;
   paintTalkStatus('Hung up');
   paintTalkClock();
+  paintTalkMute();
   paintReadControls();
 }
 
@@ -4144,6 +4204,7 @@ function promptBefore(el) {
   return '';
 }
 
+$('#btn-talk-mute')?.addEventListener('click', () => setTalkMute(!talk.muted));
 $('#btn-talk-end')?.addEventListener('click', () => endTalking());
 /*
  * Closing the panel hangs up too. A hidden panel over a live session is a pocket

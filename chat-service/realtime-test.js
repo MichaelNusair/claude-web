@@ -20,6 +20,7 @@
  *
  * Run: node chat-service/realtime-test.js
  */
+import { execFileSync } from 'child_process';
 import { readFile } from 'fs/promises';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
@@ -34,7 +35,6 @@ import {
   VOICES,
   MAX_MINUTES,
 } from './realtime.js';
-import { azureRealtime, resetOpenAi } from './openai.js';
 
 let checks = 0;
 let failures = 0;
@@ -199,11 +199,19 @@ section('Sessions per day, which is the only real bound:');
 // --------------------------------------------------------------------------
 section('Minting a credential:');
 {
+  /*
+   * An OpenAI-only box, said rather than assumed. `azureFor` defaults to the real
+   * one, which reads the environment *and* the voice secret — so on a box that has
+   * Azure configured (this one, and production) Azure wins the provider choice and
+   * every assertion below about OpenAI's endpoint, key and body shape is answered by
+   * a request that was never made. These checks are about the OpenAI path; they have
+   * to pin the provider to keep being about it.
+   */
   const api = fakeOpenAi();
   const sessions = new SessionBudget({ dailySessions: 5 });
   const minted = await mintSession(
     { text: MESSAGE, prompt: PROMPT, voice: 'cedar' },
-    { fetchImpl: api.fetchImpl, keyFor: key, sessions },
+    { fetchImpl: api.fetchImpl, keyFor: key, azureFor: noAzure, sessions },
   );
 
   ok(minted.value === 'ek_testtesttest', 'the browser gets the ephemeral secret');
@@ -250,7 +258,7 @@ section('Minting a credential:');
   const api2 = fakeOpenAi();
   await mintSession(
     { text: MESSAGE, voice: 'Ruth' },
-    { fetchImpl: api2.fetchImpl, keyFor: key, sessions },
+    { fetchImpl: api2.fetchImpl, keyFor: key, azureFor: noAzure, sessions },
   );
   ok(api2.last.body.session.audio.output.voice === VOICE, 'an unknown voice becomes the default rather than a 400', api2.last.body.session.audio.output.voice);
   ok(VOICES.includes(VOICE), 'and the default is one the realtime models accept');
@@ -263,7 +271,7 @@ section('Refusing, before anything is spent:');
 
   const quiet = fakeOpenAi();
   await refuses('nothing to talk about is a 400', 400, () =>
-    mintSession({ text: '   ' }, { fetchImpl: quiet.fetchImpl, keyFor: key, sessions }));
+    mintSession({ text: '   ' }, { fetchImpl: quiet.fetchImpl, keyFor: key, azureFor: noAzure, sessions }));
   ok(quiet.calls.length === 0, 'and OpenAI was never called, so it cost nothing');
   ok(sessions.state().sessions === 0, 'and the day was not charged');
 
@@ -271,7 +279,7 @@ section('Refusing, before anything is spent:');
   await refuses(
     'a box with no key says so, with what to do about it',
     503,
-    () => mintSession({ text: MESSAGE }, { fetchImpl: keyless.fetchImpl, keyFor: noKey, sessions }),
+    () => mintSession({ text: MESSAGE }, { fetchImpl: keyless.fetchImpl, keyFor: noKey, azureFor: noAzure, sessions }),
     /openaiApiKey/,
   );
   ok(keyless.calls.length === 0, 'and does not call OpenAI without one');
@@ -279,9 +287,9 @@ section('Refusing, before anything is spent:');
   // The budget must stop the call, not merely notice it afterwards.
   const spent = new SessionBudget({ dailySessions: 1 });
   const once = fakeOpenAi();
-  await mintSession({ text: MESSAGE }, { fetchImpl: once.fetchImpl, keyFor: key, sessions: spent });
+  await mintSession({ text: MESSAGE }, { fetchImpl: once.fetchImpl, keyFor: key, azureFor: noAzure, sessions: spent });
   await refuses('the day’s limit refuses the next one', 429, () =>
-    mintSession({ text: MESSAGE }, { fetchImpl: once.fetchImpl, keyFor: key, sessions: spent }));
+    mintSession({ text: MESSAGE }, { fetchImpl: once.fetchImpl, keyFor: key, azureFor: noAzure, sessions: spent }));
   ok(once.calls.length === 1, 'and refuses it before the call, not after', `${once.calls.length} calls made`);
 
   // OpenAI's own statuses, remapped: a 401 travelling through as a 401 would read
@@ -289,20 +297,20 @@ section('Refusing, before anything is spent:');
   const rejected = fakeOpenAi({ status: 401 });
   const fresh = new SessionBudget({ dailySessions: 5 });
   await refuses('a rejected key is not answered as a 401', 403, () =>
-    mintSession({ text: MESSAGE }, { fetchImpl: rejected.fetchImpl, keyFor: key, sessions: fresh }), /key/i);
+    mintSession({ text: MESSAGE }, { fetchImpl: rejected.fetchImpl, keyFor: key, azureFor: noAzure, sessions: fresh }), /key/i);
   ok(fresh.state().sessions === 0, 'and a failed mint is refunded, so a bad key cannot eat the day');
 
   const throttled = fakeOpenAi({ status: 429 });
   await refuses('OpenAI throttling stays a 429', 429, () =>
-    mintSession({ text: MESSAGE }, { fetchImpl: throttled.fetchImpl, keyFor: key, sessions: fresh }));
+    mintSession({ text: MESSAGE }, { fetchImpl: throttled.fetchImpl, keyFor: key, azureFor: noAzure, sessions: fresh }));
 
   const broken = fakeOpenAi({ status: 503 });
   await refuses('OpenAI failing is a 502 from here', 502, () =>
-    mintSession({ text: MESSAGE }, { fetchImpl: broken.fetchImpl, keyFor: key, sessions: fresh }));
+    mintSession({ text: MESSAGE }, { fetchImpl: broken.fetchImpl, keyFor: key, azureFor: noAzure, sessions: fresh }));
 
   const empty = fakeOpenAi({ body: { expires_at: 1 } });
   await refuses('a response with no secret in it is a 502, not an undefined handed to a browser', 502, () =>
-    mintSession({ text: MESSAGE }, { fetchImpl: empty.fetchImpl, keyFor: key, sessions: fresh }));
+    mintSession({ text: MESSAGE }, { fetchImpl: empty.fetchImpl, keyFor: key, azureFor: noAzure, sessions: fresh }));
   ok(fresh.state().sessions === 0, 'and none of those were charged', JSON.stringify(fresh.state()));
 
   const dead = {
@@ -311,7 +319,7 @@ section('Refusing, before anything is spent:');
     },
   };
   await refuses('an unreachable OpenAI is a 502 with the reason in it', 502, () =>
-    mintSession({ text: MESSAGE }, { fetchImpl: dead.fetchImpl, keyFor: key, sessions: fresh }), /ENOTFOUND/);
+    mintSession({ text: MESSAGE }, { fetchImpl: dead.fetchImpl, keyFor: key, azureFor: noAzure, sessions: fresh }), /ENOTFOUND/);
 }
 
 // --------------------------------------------------------------------------
@@ -554,45 +562,67 @@ section('Which vendor, and on whose money:');
  */
 section('What counts as a configured Azure resource:');
 {
-  const saved = {
-    endpoint: process.env.AZURE_REALTIME_ENDPOINT,
-    key: process.env.AZURE_REALTIME_KEY,
-    deployment: process.env.AZURE_REALTIME_DEPLOYMENT,
-  };
-  const set = async (endpoint, keyValue, deployment) => {
-    if (endpoint === null) delete process.env.AZURE_REALTIME_ENDPOINT;
-    else process.env.AZURE_REALTIME_ENDPOINT = endpoint;
-    if (keyValue === null) delete process.env.AZURE_REALTIME_KEY;
-    else process.env.AZURE_REALTIME_KEY = keyValue;
-    if (deployment === null) delete process.env.AZURE_REALTIME_DEPLOYMENT;
-    else process.env.AZURE_REALTIME_DEPLOYMENT = deployment;
-    resetOpenAi();
-    return azureRealtime();
+  /*
+   * In a child process with no secret ARN in its environment, because `azureRealtime`
+   * falls back to the voice secret when the environment does not describe a resource.
+   * On a box that has that secret — this one, and production — every "…is refused"
+   * below would be answered by the real credential instead: the refusal it asserts
+   * would have happened, then been overwritten by a resource, and the check would
+   * fail while the code was right. Unsetting it in-process is not enough; the module
+   * reads the ARN once, at import.
+   */
+  const shaped = (endpoint, keyValue, deployment) => {
+    const env = { ...process.env };
+    delete env.OPENAI_SECRET_ARN;
+    delete env.WHISPER_SECRET_ARN;
+    for (const [name, value] of [
+      ['AZURE_REALTIME_ENDPOINT', endpoint],
+      ['AZURE_REALTIME_KEY', keyValue],
+      ['AZURE_REALTIME_DEPLOYMENT', deployment],
+    ]) {
+      if (value === null) delete env[name];
+      else env[name] = value;
+    }
+    return execFileSync(
+      process.execPath,
+      [
+        '--input-type=module',
+        '-e',
+        "import { azureRealtime } from './openai.js';" +
+          'const r = await azureRealtime();' +
+          "process.stdout.write(r ? r.endpoint : '');",
+      ],
+      { cwd: new URL('.', import.meta.url).pathname, env, encoding: 'utf8' },
+    ).trim();
   };
 
   const GOOD = 'https://res.openai.azure.com';
+  const REFUSED = '';
+  ok(shaped(GOOD, 'k', 'dep') === GOOD, 'all three present is a resource', shaped(GOOD, 'k', 'dep'));
   ok(
-    (await set(GOOD, 'k', 'dep'))?.endpoint === GOOD,
-    'all three present is a resource',
-  );
-  ok(
-    (await set(`${GOOD}/`, 'k', 'dep'))?.endpoint === GOOD,
+    shaped(`${GOOD}/`, 'k', 'dep') === GOOD,
     'a trailing slash is trimmed, so the appended path cannot become a double slash',
   );
   ok(
-    (await set('http://res.openai.azure.com', 'k', 'dep')) === null,
+    shaped('http://res.openai.azure.com', 'k', 'dep') === REFUSED,
     'http is refused outright rather than sending the key in clear',
   );
   ok(
-    (await set(`${GOOD}/openai/v1`, 'k', 'dep')) === null,
+    shaped(`${GOOD}/openai/v1`, 'k', 'dep') === REFUSED,
     'and so is an endpoint with a path, which would silently build the wrong URL',
   );
-  ok((await set(GOOD, 'k', null)) === null, 'a missing deployment is not configured');
-  ok((await set(GOOD, null, 'dep')) === null, 'nor is a missing key');
-  ok((await set(null, 'k', 'dep')) === null, 'nor is a missing endpoint');
-  ok((await set(GOOD, '   ', 'dep')) === null, 'nor is a key of spaces');
+  ok(shaped(GOOD, 'k', null) === REFUSED, 'a missing deployment is not configured');
+  ok(shaped(GOOD, null, 'dep') === REFUSED, 'nor is a missing key');
+  ok(shaped(null, 'k', 'dep') === REFUSED, 'nor is a missing endpoint');
+  ok(shaped(GOOD, '   ', 'dep') === REFUSED, 'nor is a key of spaces');
 
-  await set(saved.endpoint ?? null, saved.key ?? null, saved.deployment ?? null);
+  /*
+   * And the fallback itself, which the checks above deliberately switch off: a box
+   * with nothing in its environment and nothing to read must come back with no
+   * resource rather than throwing, since `realtimeStatus` calls this on every page
+   * load.
+   */
+  ok(shaped(null, null, null) === REFUSED, 'a box with neither environment nor secret has no resource');
 }
 
 // --------------------------------------------------------------------------

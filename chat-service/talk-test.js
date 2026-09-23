@@ -122,7 +122,7 @@ function boot({ realtime = REALTIME, speech = null, webrtc = true, minted = MINT
   const tracks = [];
   const mic = { denied: false, streams: 0 };
   const makeTrack = (kind = 'audio') => {
-    const track = { kind, stopped: false, stop() { this.stopped = true; } };
+    const track = { kind, stopped: false, enabled: true, stop() { this.stopped = true; } };
     tracks.push(track);
     return track;
   };
@@ -753,6 +753,103 @@ console.log('\nThe offer goes wherever the box says, not to a vendor baked into 
   h.close();
 }
 
+// --- 9. muting, without hanging up ------------------------------------------
+/*
+ * Mute exists because of how the session is minted: semantic turn detection with
+ * `interrupt_response` on, so a cough or somebody else's sentence cuts off the
+ * explanation mid-word — and hanging up and starting again spends another of the day's
+ * forty. So it has to disable the track and keep everything else, and the failure worth
+ * testing for is the one that looks identical for a second: stopping the track, which
+ * ends the microphone and cannot be undone.
+ */
+console.log('\nMute silences the microphone and keeps the line:');
+{
+  const { h } = await conversation();
+  const click = (el) => el?.dispatchEvent(new h.w.MouseEvent('click', { bubbles: true }));
+  click(h.talkBtn());
+  await settle();
+  h.peer().connect();
+  await settle();
+
+  const mute = () => h.$('#btn-talk-mute');
+  check('a live line offers no way to mute the microphone', Boolean(mute()));
+  check('the mute control is disabled while a line is up', !mute().disabled);
+  check(
+    'the microphone starts out muted, so the first thing said into it goes nowhere',
+    h.tracks.length > 0 && h.tracks.every((t) => t.enabled === true),
+  );
+
+  click(mute());
+  await settle();
+  check(
+    'muting left the microphone sending — everything the room says still reaches the far end',
+    h.tracks.every((t) => t.enabled === false),
+  );
+  check(
+    'muting stopped the track rather than disabling it, which closes the microphone: '
+      + 'there is no unmuting after that, only another session against the day',
+    h.tracks.every((t) => !t.stopped),
+  );
+  check('muting closed the connection, which is hanging up by another name', !h.peer().closed);
+  check('muting closed the event channel, so the transcript stops where the mute did', !h.peer().channels[0].closed);
+  check(
+    'muting took the far end’s audio with it — being able to listen is the reason to '
+      + 'mute rather than hang up',
+    h.audios.some((a) => a.srcObject),
+  );
+  check(
+    `the panel still claims to be listening while muted: ${JSON.stringify(h.$('#talk-status').textContent)}`,
+    /^muted/i.test(h.$('#talk-status').textContent),
+  );
+  check(
+    'the panel does not say the line is still open while muted — muting instead of '
+      + 'hanging up and then walking away is the one mistake this button makes possible',
+    /still open/i.test(h.$('#talk-status').textContent),
+  );
+  check(
+    `the control does not say how to undo itself: ${JSON.stringify(mute().textContent)}`,
+    mute().textContent === 'Unmute',
+  );
+  check('a screen reader is not told the toggle is on', mute().getAttribute('aria-pressed') === 'true');
+
+  click(mute());
+  await settle();
+  check('unmuting did not give the microphone back, so mute is a one-way door', h.tracks.every((t) => t.enabled));
+  check(
+    `the panel still says muted after unmuting: ${JSON.stringify(h.$('#talk-status').textContent)}`,
+    /^listening$/i.test(h.$('#talk-status').textContent),
+  );
+  check(
+    `the control did not go back: ${JSON.stringify(mute().textContent)}`,
+    mute().textContent === 'Mute' && mute().getAttribute('aria-pressed') === 'false',
+  );
+
+  // Hang up muted, then start another: a line that opens muted is one you talk into for
+  // ten seconds before finding out, with the day's count already spent on it.
+  click(mute());
+  await settle();
+  click(h.$('#btn-talk-end'));
+  await settle();
+  check('hanging up while muted left a track live', h.tracks.every((t) => t.stopped));
+  check(
+    `the control is still offered with no line to mute: ${JSON.stringify(mute().textContent)}`,
+    mute().disabled && mute().textContent === 'Mute',
+  );
+  click(h.talkBtn());
+  await settle();
+  h.peer().connect();
+  await settle();
+  const fresh = h.tracks.filter((t) => !t.stopped);
+  check('the second conversation never opened', fresh.length > 0);
+  check('a new conversation inherited the last one’s mute', fresh.every((t) => t.enabled === true));
+  check(
+    `the new line says: ${JSON.stringify(h.$('#talk-status').textContent)}`,
+    /^listening$/i.test(h.$('#talk-status').textContent),
+  );
+  check('nothing threw', h.thrown.length === 0, h.thrown.join('; '));
+  h.close();
+}
+
 // --- results ---------------------------------------------------------------
 await settle(60);
 check(
@@ -774,5 +871,7 @@ console.log(
   + 'frame to our own box for the life of it — it cannot reach Claude because there '
   + 'is no path to. Both halves of what is said are on screen, a partial line looks '
   + 'partial, and every way out — Hang up, closing the panel, a dropped line, a '
-  + 'refusal, hanging up mid-connect — stops the microphone.',
+  + 'refusal, hanging up mid-connect — stops the microphone. Mute is the one thing '
+  + 'that does not: it disables the track, says so, says the line is still open, and '
+  + 'is never inherited by the next conversation.',
 );
