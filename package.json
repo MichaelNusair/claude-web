@@ -1,9 +1,14 @@
 {
-  "name": "claude-web",
+  "name": "triplec",
   "version": "3.0.0",
-  "description": "Self-hosted Claude Code as a chat app and web IDE, on your own AWS account",
+  "description": "TripleC — Claude Code on a machine of its own: a chat app and web IDE that a session outlives the device it started on. Self-host it, or have it managed.",
   "type": "module",
   "license": "MIT",
+  "homepage": "https://triplec.host",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/MichaelNusair/triplec.git"
+  },
   "private": true,
   "engines": {
     "node": ">=20"

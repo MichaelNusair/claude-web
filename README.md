@@ -1,20 +1,30 @@
-# claude-web
+# TripleC
 
-Claude Code as a chat app you can install on your phone, running on your own AWS
-account. Send a message, Claude works on your repo, you get an answer. The full
-VS Code editor is still there at `/editor/` when you're at a desk and want files,
-diffs, and a terminal.
+**Claude, Code, Cloud.** Claude Code as a chat app you can install on your phone,
+running on a machine of its own. Send a message, Claude works on your repo, you
+get an answer. The full VS Code editor is still there at `/editor/` when you're at
+a desk and want files, diffs, and a terminal.
 
-Your sessions live in the cloud, so the conversation you start on a laptop is the
-one you pick up on a phone — mid-task, with context intact.
+Your sessions live on the server, not in a terminal on a laptop, so the
+conversation you start at a desk is the one you pick up on a phone — mid-task,
+with context intact, and still running while both are shut. The cloud is the third
+C, and the part this project adds; everything above it is Anthropic's CLI, running
+unmodified.
 
 ```bash
-git clone https://github.com/MichaelNusair/claude-web.git
-cd claude-web
-cp claude-web.config.example.json claude-web.config.json
-$EDITOR claude-web.config.json     # domainName + hostedZoneName
+git clone https://github.com/MichaelNusair/triplec.git
+cd triplec
+cp triplec.config.example.json triplec.config.json
+$EDITOR triplec.config.json     # domainName + hostedZoneName
 ./deploy.sh
 ```
+
+**Two ways to run it, and the same MIT-licensed commit either way.** Self-hosting
+is free and always will be — nothing is held back from this repository, there is
+no licence key, and you pay AWS rather than us. Or we run it for you on a hostname
+of yours: see [docs/MANAGED.md](docs/MANAGED.md), which is also where the awkward
+questions are answered, including the fact that the managed service costs $0 today
+because we have not started charging for it.
 
 You need an AWS account, a Route53 hosted zone, and Bedrock model access. Full
 walkthrough in [docs/DEPLOY.md](docs/DEPLOY.md).
@@ -359,7 +369,7 @@ that survives everything else actually needs. It touches nothing on the server.
 
 Opus 5 on Bedrock, `--permission-mode bypassPermissions`, `--effort max`. All
 three are overridable per-chat in the settings sheet, and the deployment-wide
-defaults live in `claude-web.config.json`. Changes apply to new chats — an
+defaults live in `triplec.config.json`. Changes apply to new chats — an
 existing conversation keeps the flags it started with, because they're process
 arguments.
 
@@ -398,7 +408,7 @@ npm run test:auth
 
 Full threat model, what it does and does not defend against, and how to reduce the
 blast radius: [docs/SECURITY.md](docs/SECURITY.md). Found a hole? Please report it
-[privately](https://github.com/MichaelNusair/claude-web/security/advisories/new).
+[privately](https://github.com/MichaelNusair/triplec/security/advisories/new).
 
 ## Install as an app
 
@@ -450,7 +460,7 @@ and history survive a stop or a teardown.
 ## The landing page
 
 [`landing/`](landing/) is the static marketing site — the page at
-<https://claude.strikelabs.tech>. It deploys as its own stack (private S3 behind
+<https://triplec.host>. It deploys as its own stack (private S3 behind
 CloudFront) with no shared resources and no route to the workspace, so public
 traffic never touches the machine holding your GitHub token. Optional; skip it
 entirely if you're self-hosting for yourself.

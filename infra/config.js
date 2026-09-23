@@ -6,7 +6,7 @@
  * config file or the environment. The stack no longer contains anyone's account
  * id, so the repository can be published and deployed by anyone.
  *
- * Precedence: environment variable > claude-web.config.json > default.
+ * Precedence: environment variable > triplec.config.json > default.
  * Environment wins so CI can override a single value without editing a file.
  *
  * Validation is deliberately loud and specific. Someone deploying this for the
@@ -22,12 +22,38 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = join(__dirname, '..');
 
 /**
+ * The config file, under the current name and the one this project used to have.
+ *
+ * Both are honoured, and that is not tidiness — it is the difference between a
+ * rename and an outage. A deployment's config file is gitignored, so it lives only
+ * on the machines that deploy: the operator's checkout and whatever box is named in
+ * `deployFrom`. A rename in this repository cannot reach either of them, so if this
+ * function only knew the new name, the next deploy would find no config, fall back
+ * to defaults, and either refuse on a missing domain or — far worse — synthesize a
+ * *differently named stack* and start building a second copy of production
+ * alongside the first.
+ *
+ * So: new deployments are told to use `triplec.config.json`, existing ones keep
+ * working untouched, and nobody has to be told to go and rename a file.
+ */
+const CONFIG_NAMES = ['triplec.config.json', 'claude-web.config.json'];
+
+/**
  * Resolved per call rather than once at import, so the path is read from the
  * environment as it is when the config is actually loaded — which is what makes
  * this testable and lets a caller point at an alternate file.
+ *
+ * `TRIPLEC_CONFIG` is the name to use; `CLAUDE_WEB_CONFIG` is still read because a
+ * second deployment is selected with it (see "More than one deployment" in
+ * docs/DEPLOY.md) and those invocations live in people's shell history, not here.
  */
-function configPath() {
-  return process.env.CLAUDE_WEB_CONFIG || join(REPO_ROOT, 'claude-web.config.json');
+export function configPath() {
+  const fromEnv = process.env.TRIPLEC_CONFIG || process.env.CLAUDE_WEB_CONFIG;
+  if (fromEnv) return fromEnv;
+  const found = CONFIG_NAMES.map((name) => join(REPO_ROOT, name)).find((path) => existsSync(path));
+  // Nothing on disk: return the current name, so the "no config" message names the
+  // file someone should be creating rather than the one they should not.
+  return found || join(REPO_ROOT, CONFIG_NAMES[0]);
 }
 
 const DEFAULTS = {
@@ -43,7 +69,13 @@ const DEFAULTS = {
   /** Existing certificate to reuse. A DNS-validated one is created when empty. */
   certificateArn: '',
   region: 'us-east-1',
-  stackName: 'ClaudeWebStack',
+  /**
+   * The CloudFormation stack name, which is also this deployment's identity: change
+   * it on a running deployment and CloudFormation does not rename anything, it
+   * builds a second one. Deployments made before the rename pin the old name in
+   * their own config file and are unaffected by this default.
+   */
+  stackName: 'TripleCStack',
   /** Named AWS profile for the CLI/CDK. Empty uses the default credential chain. */
   awsProfile: '',
 
@@ -158,8 +190,8 @@ const DEFAULTS = {
     iconDir: 'pwa-icons',
   },
 
-  gitUserName: 'Claude Web',
-  gitUserEmail: 'claude-web@example.invalid',
+  gitUserName: 'TripleC',
+  gitUserEmail: 'triplec@example.invalid',
 
   /**
    * The machine full deploys are driven from — `./deploy-remote.sh` reads this.
@@ -216,7 +248,7 @@ const DEFAULTS = {
    */
   security: {
     enabled: false,
-    stackName: 'ClaudeWebSecurityStack',
+    stackName: 'TripleCSecurityStack',
     /** Multi-region trail with log file validation, into a private bucket. */
     cloudTrail: true,
     /** See the one-per-region warning above. */
@@ -226,14 +258,36 @@ const DEFAULTS = {
   },
 
   landing: {
-    /** e.g. "claude.example.com". Empty disables the whole landing stack. */
+    /** e.g. "triplec.example.com". Empty disables the whole landing stack. */
     domainName: '',
+    /**
+     * The Route53 zone `domainName` belongs to, when that is not the zone the
+     * workspace lives in. Empty means "the same zone", which is the common case.
+     *
+     * This exists because a marketing site and a private workspace are not usually
+     * two names in one domain. The workspace is a machine someone reaches at a
+     * hostname nobody else needs to know; the site is the product's name, bought
+     * for the purpose. Before this setting the landing hostname had to sit inside
+     * `hostedZoneName`, which meant the public page advertised a subdomain of the
+     * same zone as the private box — and the only way to move it was to move the
+     * workspace too.
+     *
+     * Give `hostedZoneId` as well to skip the lookup; a cross-zone deploy is
+     * exactly when `fromLookup` is most likely to resolve the wrong thing, because
+     * both zones answer to the same account.
+     */
+    hostedZoneName: '',
+    hostedZoneId: '',
     /**
      * CloudFront requires its certificate in us-east-1, regardless of where the
      * rest of the deployment lives. Empty creates a DNS-validated one there.
+     *
+     * Leave it empty when the site is in a zone of its own: a certificate for the
+     * workspace's domain does not cover a different domain, and CloudFront answers
+     * a hostname its certificate does not name with a TLS error rather than a page.
      */
     certificateArn: '',
-    stackName: 'ClaudeWebLandingStack',
+    stackName: 'TripleCLandingStack',
 
     /**
      * Visitor analytics for the landing page. Off unless a key is set.
@@ -257,22 +311,48 @@ const DEFAULTS = {
   },
 };
 
-/** Environment overrides, flattened. */
-const ENV_MAP = {
-  CLAUDE_WEB_DOMAIN: 'domainName',
-  CLAUDE_WEB_HOSTED_ZONE: 'hostedZoneName',
-  CLAUDE_WEB_HOSTED_ZONE_ID: 'hostedZoneId',
-  CLAUDE_WEB_CERT_ARN: 'certificateArn',
-  CLAUDE_WEB_REGION: 'region',
-  CLAUDE_WEB_STACK_NAME: 'stackName',
-  AWS_PROFILE: 'awsProfile',
-  CLAUDE_WEB_AUTH_MODE: 'authMode',
-  CLAUDE_WEB_INSTANCE_TYPE: 'instanceType',
-  CLAUDE_WEB_DEFAULT_MODEL: 'defaultModel',
-  CLAUDE_WEB_PERMISSION_MODE: 'permissionMode',
-  CLAUDE_WEB_GIT_USER_NAME: 'gitUserName',
-  CLAUDE_WEB_GIT_USER_EMAIL: 'gitUserEmail',
+/**
+ * Environment overrides, flattened, without their prefix.
+ *
+ * Each is read as `TRIPLEC_<SUFFIX>` and, failing that, as `CLAUDE_WEB_<SUFFIX>`.
+ * The old prefix is not deprecated-and-ignored but deprecated-and-honoured: these
+ * variables are typed at a prompt and pasted into CI, so dropping one turns a
+ * deliberate override into a silent fallback to the default — a deploy that goes
+ * green having ignored the one value it was told to change.
+ */
+const ENV_SUFFIXES = {
+  DOMAIN: 'domainName',
+  HOSTED_ZONE: 'hostedZoneName',
+  HOSTED_ZONE_ID: 'hostedZoneId',
+  CERT_ARN: 'certificateArn',
+  REGION: 'region',
+  STACK_NAME: 'stackName',
+  AUTH_MODE: 'authMode',
+  INSTANCE_TYPE: 'instanceType',
+  DEFAULT_MODEL: 'defaultModel',
+  PERMISSION_MODE: 'permissionMode',
+  GIT_USER_NAME: 'gitUserName',
+  GIT_USER_EMAIL: 'gitUserEmail',
 };
+
+/** The prefixes, weakest first. Exported so a test can assert both still work. */
+export const ENV_PREFIXES = ['CLAUDE_WEB_', 'TRIPLEC_'];
+
+/**
+ * Every variable name that maps to a setting, new prefix and old, plus the strays.
+ *
+ * Insertion order is load-bearing: `loadConfig` walks these in order and assigns as
+ * it goes, so the last prefix to mention a key is the one that wins. Hence weakest
+ * first — with both set, the current name decides.
+ */
+export const ENV_MAP = Object.fromEntries([
+  ...ENV_PREFIXES.flatMap((prefix) =>
+    Object.entries(ENV_SUFFIXES).map(([suffix, key]) => [`${prefix}${suffix}`, key]),
+  ),
+  // Not ours to prefix: this is the AWS CLI's own variable and reading it is how a
+  // deployment inherits the profile the operator is already using.
+  ['AWS_PROFILE', 'awsProfile'],
+]);
 
 /**
  * What a deployment may call itself, as one pattern both ends share.
@@ -349,17 +429,17 @@ export function loadConfig() {
     if (process.env[envVar]) config[key] = process.env[envVar];
   }
 
-  // Booleans and numbers survive a round trip through the environment.
-  if (process.env.CLAUDE_WEB_ADMIN_ACCESS) {
-    config.instanceAdminAccess = process.env.CLAUDE_WEB_ADMIN_ACCESS === 'true';
-  }
+  // Booleans and numbers survive a round trip through the environment. Both
+  // prefixes, for the reason given above ENV_SUFFIXES.
+  const adminAccess = process.env.TRIPLEC_ADMIN_ACCESS ?? process.env.CLAUDE_WEB_ADMIN_ACCESS;
+  if (adminAccess) config.instanceAdminAccess = adminAccess === 'true';
 
   // --- Validation ----------------------------------------------------------
   if (!config.domainName) {
     fail(
-      'domainName is required. Set it in claude-web.config.json (copy ' +
-        'claude-web.config.example.json) or pass CLAUDE_WEB_DOMAIN. This is the ' +
-        'hostname you will open in a browser, e.g. "claude.example.com".',
+      'domainName is required. Set it in triplec.config.json (copy ' +
+        'triplec.config.example.json) or pass TRIPLEC_DOMAIN. This is the ' +
+        'hostname you will open in a browser, e.g. "code.example.com".',
     );
   }
   if (!/^[a-z0-9.-]+\.[a-z]{2,}$/i.test(config.domainName)) {
@@ -495,14 +575,40 @@ export function loadConfig() {
     if (!/^[a-z0-9.-]+\.[a-z]{2,}$/i.test(config.landing.domainName)) {
       fail(
         `landing.domainName "${config.landing.domainName}" is not a hostname. ` +
-          'Expected e.g. "claude.example.com", or leave it empty to skip the landing site.',
+          'Expected e.g. "triplec.example.com", or leave it empty to skip the landing site.',
       );
     }
-    if (!config.landing.domainName.endsWith(config.hostedZoneName)) {
+    // The zone the site's record goes into: its own if it has one, else the
+    // workspace's. `landingZone` below is what the stack reads, so this check and
+    // the resource it guards cannot end up looking at different zones.
+    const landingZone = config.landing.hostedZoneName || config.hostedZoneName;
+    if (!config.landing.domainName.endsWith(landingZone)) {
       fail(
         `landing.domainName "${config.landing.domainName}" is not inside ` +
-          `hostedZoneName "${config.hostedZoneName}". The alias record and ` +
-          'certificate validation both need it to be.',
+          `"${landingZone}". The alias record and certificate validation both need ` +
+          'it to be. Either set landing.hostedZoneName to the zone that owns the ' +
+          'marketing domain, or use a hostname inside the workspace zone.',
+      );
+    }
+    if (config.landing.hostedZoneId && !config.landing.hostedZoneName) {
+      fail(
+        'landing.hostedZoneId is set but landing.hostedZoneName is empty. The id ' +
+          'alone is not enough: a Route53 record needs the zone name too, and ' +
+          'taking it from the workspace zone would build the record in the right ' +
+          'zone under the wrong name.',
+      );
+    }
+    // A certificate names the hostnames it covers, and CloudFront serves a name its
+    // certificate does not name as a TLS error rather than a page — which looks
+    // like DNS or like CloudFront still deploying, not like the wrong ARN.
+    if (config.landing.certificateArn && config.landing.hostedZoneName &&
+        config.landing.hostedZoneName !== config.hostedZoneName) {
+      console.warn(
+        `[config] landing.domainName "${config.landing.domainName}" is in a zone of ` +
+          'its own, but landing.certificateArn reuses an existing certificate. Make ' +
+          'sure that certificate actually covers this hostname — if it was issued ' +
+          `for "${config.hostedZoneName}" it does not, and the site will answer with ` +
+          'a TLS error. Leaving certificateArn empty issues a matching one.',
       );
     }
     if (config.landing.domainName === config.domainName) {
@@ -574,7 +680,7 @@ export function loadConfig() {
     if (!String(config.deployFrom.repoPath).startsWith('/')) {
       fail(
         'deployFrom.repoPath must be the absolute path of the repository checkout on ' +
-          `${config.deployFrom.instanceId}, e.g. "/home/ec2-user/claude-web". Got ` +
+          `${config.deployFrom.instanceId}, e.g. "/home/ec2-user/triplec". Got ` +
           `${JSON.stringify(config.deployFrom.repoPath)}.`,
       );
     }

@@ -76,7 +76,9 @@ a:hover { color: var(--accent); }
 .nav nav a.ghost:hover { border-color: var(--accent); color: var(--accent); }
 
 .wordmark { font-weight: 650; letter-spacing: -.02em; font-size: 17px; }
-.wordmark .dim { color: var(--text-faint); font-weight: 500; }
+/* Claude, Code, Cloud — and the cloud is the one this project adds, so it is the
+   C that gets the accent. */
+.wordmark .mark { color: var(--accent); }
 
 /* ── Hero ─────────────────────────────────────────────────────────────── */
 .hero {
@@ -118,6 +120,13 @@ h1 .accent { color: var(--accent); }
 .btn:hover { border-color: var(--accent); color: var(--accent); }
 .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
 .btn.primary:hover { background: var(--accent-soft); border-color: var(--accent-soft); color: #241a15; }
+
+/* The signup's control is a <summary>, which brings a disclosure triangle and a
+   list-item display mode with it. Both have to go for it to read as a button —
+   the second one in two spellings, because Safari still wants the pseudo-element. */
+summary.btn { cursor: pointer; list-style: none; text-align: center; }
+summary.btn::-webkit-details-marker { display: none; }
+summary.btn::marker { content: ''; }
 
 /* Click-to-copy install command. */
 .copy {
@@ -248,6 +257,43 @@ h2.small { font-size: 1.3rem; color: var(--text-dim); margin-bottom: 28px; }
 .card li strong { color: var(--text); font-weight: 600; }
 .card .muted { margin-top: 16px; font-size: 13.5px; color: var(--text-faint); }
 
+/* ── Pricing ──────────────────────────────────────────────────────────── */
+.plan-eyebrow {
+  margin: 0 0 4px; font-size: 12px; letter-spacing: .1em; text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.price {
+  margin: 0 0 14px; font-size: 2.1rem; font-weight: 660;
+  letter-spacing: -.03em; line-height: 1.1;
+}
+/* The qualifier goes under the number rather than beside it, because it is the
+   more load-bearing half: "$0" on its own is a claim this page cannot make, and
+   one set in smaller type on the same line is the oldest trick in pricing. */
+.price span {
+  display: block; margin-top: 4px;
+  font-size: 13px; font-weight: 450; letter-spacing: 0; color: var(--text-faint);
+}
+
+.card.featured {
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+  background: color-mix(in srgb, var(--accent) 6%, var(--bg-raised));
+}
+.card.featured .price { color: var(--accent); }
+
+.signup { margin-top: 26px; }
+/* Full width so the sentence on it stays one line's worth of thought, and so the
+   two routes inside line up under it. */
+.signup .btn { display: block; width: 100%; }
+/* Both of these are <p> inside .card, which sets `margin: 0` at equal weight —
+   hence the doubled class, rather than a lost argument with specificity. */
+.signup .signup-routes { display: flex; flex-direction: column; gap: 10px; margin: 16px 0 0; }
+.card .signup-note { margin: 10px 0 0; font-size: 13px; color: var(--text-faint); text-align: center; }
+
+.signup-done { margin-top: 18px; padding-top: 18px; border-top: 1px solid var(--border); }
+.signup-done p { color: var(--text-dim); font-size: 14.5px; }
+.signup-done strong { color: var(--text); }
+
 /* ── Code blocks ──────────────────────────────────────────────────────── */
 pre {
   margin: 0 0 34px; padding: 22px;
@@ -262,15 +308,22 @@ pre code { font-size: inherit; }
 .shell code { color: var(--text); }
 .shell .c { color: var(--text-faint); }
 
-/* ── Security band ────────────────────────────────────────────────────── */
-.security .warn {
+/* ── Callouts ─────────────────────────────────────────────────────────── */
+/* Shared by the security band and by the note under pricing saying that nobody is
+   being charged yet. Both are claims a visitor would be right to be sceptical
+   about, so both are stated in the page at full size rather than in small print. */
+.warn {
   margin: 0 0 30px; padding: 20px 22px;
   background: color-mix(in srgb, var(--accent) 9%, var(--bg-raised));
   border: 1px solid color-mix(in srgb, var(--accent) 42%, var(--border));
   border-left-width: 3px;
   border-radius: var(--radius);
 }
-.security .warn p { margin: 0; color: var(--text); max-width: var(--measure); font-size: 15.2px; }
+.warn p { margin: 0; color: var(--text); max-width: var(--measure); font-size: 15.2px; }
+/* The pricing one closes its section rather than opening it, and its sentence is
+   long enough that the narrow measure above would leave a very tall box. */
+.plain-warn { margin: 30px 0 0; }
+.plain-warn p { max-width: 82ch; }
 .security .more { margin: 30px 0 0; color: var(--text-dim); font-size: 14.8px; }
 
 /* ── Footer ───────────────────────────────────────────────────────────── */

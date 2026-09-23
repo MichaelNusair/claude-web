@@ -77,5 +77,5 @@ Match the surrounding code. A few conventions that are load-bearing here:
 ## Reporting a vulnerability
 
 Please don't open a public issue. Use a
-[GitHub security advisory](https://github.com/MichaelNusair/claude-web/security/advisories/new)
+[GitHub security advisory](https://github.com/MichaelNusair/triplec/security/advisories/new)
 instead. See [docs/SECURITY.md](docs/SECURITY.md).

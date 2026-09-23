@@ -93,7 +93,7 @@ export function assertAuthConfig() {
           'The load balancer only proves the caller has an account with your identity ' +
           'provider — with Google, that is every Google account in existence. This ' +
           'service hands out a shell, so it refuses to start without knowing which ' +
-          'identities are yours. Set oidc.allowedEmails in claude-web.config.json.',
+          'identities are yours. Set oidc.allowedEmails in triplec.config.json.',
       );
     }
     return;

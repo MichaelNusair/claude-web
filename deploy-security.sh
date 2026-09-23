@@ -19,7 +19,7 @@ if [ "$CFG_SECURITY_ENABLED" != "true" ]; then
   cat >&2 <<'NOSEC'
 Audit stack not enabled.
 
-Add a "security" section to claude-web.config.json:
+Add a "security" section to triplec.config.json:
 
   "security": {
     "enabled": true,
@@ -69,7 +69,7 @@ This account already has a GuardDuty detector in $REGION: $EXISTING
 
 AWS allows only one, and CDK cannot adopt an existing one, so this deploy would
 fail. Detection is already on — set "guardDuty": false in the security section of
-claude-web.config.json and re-run. Nothing is lost by doing so.
+triplec.config.json and re-run. Nothing is lost by doing so.
 EOF
     exit 1
   fi

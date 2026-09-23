@@ -126,7 +126,7 @@ const { transcribe, spokenLanguage, voiceStatus } = await import('./transcribe.j
 
 /** A multipart body shaped like the one the mic button sends. */
 const upload = (audio = Buffer.from('not really audio')) => {
-  const boundary = '----claudewebtest';
+  const boundary = '----triplectest';
   const head = Buffer.from(
     `--${boundary}\r\nContent-Disposition: form-data; name="audio"; filename="a.wav"\r\n` +
       'Content-Type: audio/wav\r\n\r\n',

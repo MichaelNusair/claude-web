@@ -4,7 +4,7 @@
  * Progressive enhancement: without it the command is still fully visible and
  * selectable, so the page never depends on this running.
  *
- * Announces each copy as a `claude-web:copy` DOM event, which analytics.js
+ * Announces each copy as a `triplec:copy` DOM event, which analytics.js
  * listens for. A DOM event rather than a call, so neither file imports the other
  * and either can be absent: nothing here checks whether anyone is listening.
  */
@@ -50,7 +50,7 @@
   function announce(button, command, method) {
     if (typeof window.CustomEvent !== 'function') return;
     button.dispatchEvent(
-      new CustomEvent('claude-web:copy', {
+      new CustomEvent('triplec:copy', {
         bubbles: true,
         detail: { command: command, method: method },
       }),

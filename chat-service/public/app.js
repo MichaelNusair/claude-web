@@ -135,7 +135,7 @@ function saveOpenPanes() {
  * The saved tabs, collapsed to one per project.
  *
  * The collapse is also what upgrades a device that saved tabs under the old
- * per-conversation model: two claude-web chats become one claude-web tab showing
+ * per-conversation model: two TripleC chats become one TripleC tab showing
  * the later of them. Nothing is lost that mattered — the other conversation is
  * still running on the box and still in the list — and the alternative is a strip
  * with the same project on it twice, which is the thing this replaced.
@@ -910,7 +910,7 @@ function basename(cwd) {
  * One tab per project, always — so this is find-or-create, and tapping a project
  * you already have open is a switch rather than a second tab. With no conversation
  * named, an existing window keeps the one it is showing (which is what "go to
- * claude-web" means) and a new window starts a new chat.
+ * TripleC" means) and a new window starts a new chat.
  */
 function openProject({ cwd, project, sessionId, title, fresh = false }) {
   const existing = panes.get(paneKey(cwd));

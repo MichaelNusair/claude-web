@@ -45,16 +45,29 @@ done
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-# Everything account-specific comes from claude-web.config.json (see
-# claude-web.config.example.json). infra/config.js is the single source of truth
-# for defaults and validation, so this reads through it rather than parsing the
-# JSON again and drifting from it.
-if [ ! -f "$ROOT/claude-web.config.json" ] && [ -z "${CLAUDE_WEB_DOMAIN:-}" ]; then
+# Everything account-specific comes from triplec.config.json (see
+# triplec.config.example.json). infra/config.js is the single source of truth for
+# defaults and validation, so this reads through it rather than parsing the JSON
+# again and drifting from it.
+#
+# Including the *name* of the file, which is why this asks config.js where the
+# config is rather than testing for a filename. A deployment made before the
+# rename to TripleC still has its settings in claude-web.config.json, on a machine
+# this repository cannot reach — config.js still loads either name, and a check
+# here that knew only the new one would tell those deployments they have no
+# configuration at all.
+CONFIG_FILE="$(node --input-type=module -e "
+import { configPath } from 'file://$ROOT/infra/config.js';
+import { existsSync } from 'fs';
+const found = configPath();
+process.stdout.write(existsSync(found) ? found : '');
+" 2>/dev/null || true)"
+if [ -z "$CONFIG_FILE" ] && [ -z "${TRIPLEC_DOMAIN:-}" ] && [ -z "${CLAUDE_WEB_DOMAIN:-}" ]; then
   cat >&2 <<'NOCONFIG'
 No configuration found.
 
-  cp claude-web.config.example.json claude-web.config.json
-  $EDITOR claude-web.config.json      # set domainName and hostedZoneName
+  cp triplec.config.example.json triplec.config.json
+  $EDITOR triplec.config.json      # set domainName and hostedZoneName
 
 You need an AWS account, a Route53 hosted zone you control, and Bedrock model
 access enabled in your region. See docs/DEPLOY.md.
@@ -95,7 +108,7 @@ if ! IDENTITY="$(aws sts get-caller-identity --query Arn --output text "${AWS_AR
     echo "Cannot use these AWS credentials:"
     echo "  $IDENTITY"
     [ -n "$PROFILE" ] &&
-      echo "  awsProfile in claude-web.config.json is \"$PROFILE\". Clear it to fall back to" &&
+      echo "  awsProfile in $(basename "$CONFIG_FILE") is \"$PROFILE\". Clear it to fall back to" &&
       echo "  the default credential chain (on the instance, that is its own role)."
   } >&2
   exit 1
@@ -659,7 +672,7 @@ aws s3 cp dist/payload.tar.gz "s3://$TRANSFER_BUCKET/$PAYLOAD_KEY" \
 CMD_ID="$(aws ssm send-command \
   --instance-ids "$INSTANCE_ID" \
   --document-name AWS-RunShellScript \
-  --comment "claude-web payload" \
+  --comment "TripleC payload" \
   --cli-input-json "$(python3 - "$TRANSFER_BUCKET" "$PAYLOAD_KEY" "$REGION" <<'PY'
 import json, sys
 bucket, key, region = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -697,6 +710,23 @@ cmds = [
   # heredoc inside a command substitution — a nested heredoc is exactly the shape
   # that breaks it.
   "bash /opt/claude-web/claude-broker/install.sh",
+  # Both extensions changed publisher with the rename to TripleC, and a VS Code
+  # extension's identity is publisher.name — so installing the new .vsix does not
+  # replace the old one, it sits down next to it. Two copies of the voice
+  # extension means the command registers twice and the overlay applies twice, on
+  # a box where nothing would say which copy answered.
+  #
+  # Uninstalling by the old id is therefore part of shipping the rename, not
+  # tidying after it. `|| true` because on every box provisioned after the rename
+  # there is nothing there to remove, and that is not an error.
+  "sudo -u coder HOME=/home/coder /usr/bin/code-server"
+  " --user-data-dir /workspace/code-server-data"
+  " --extensions-dir /workspace/code-server-ext"
+  " --uninstall-extension claude-web.claude-voice || true",
+  "sudo -u coder HOME=/home/coder /usr/bin/code-server"
+  " --user-data-dir /workspace/code-server-data"
+  " --extensions-dir /workspace/code-server-ext"
+  " --uninstall-extension claude-web.claude-mobile-shell || true",
   "sudo -u coder HOME=/home/coder /usr/bin/code-server"
   " --user-data-dir /workspace/code-server-data"
   " --extensions-dir /workspace/code-server-ext"

@@ -3,7 +3,7 @@
   "displayName": "Claude Mobile Shell",
   "description": "Opens the Claude Code panel full-screen and strips VS Code chrome for phone use",
   "version": "1.0.0",
-  "publisher": "claude-web",
+  "publisher": "triplec",
   "private": true,
   "engines": {
     "vscode": "^1.94.0"

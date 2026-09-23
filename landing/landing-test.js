@@ -7,13 +7,22 @@
  * exactly like a page nobody visited. Nothing in a browser will tell you, and no
  * deploy will fail.
  *
- * Four ways that has to go wrong, and one check each:
+ * Five ways that has to go wrong, and one check each:
  *
  *   - the page stops loading the script, or a new page never starts
  *   - the script and the CSP disagree, so every request is refused
  *   - the script and CloudFront disagree about the proxy path, so every request
  *     is a 404 against the marketing page
  *   - the copy button stops announcing copies the script is listening for
+ *   - the signup stops announcing the one event this page exists to produce
+ *
+ * Two more sections check things that are not analytics but fail the same silent
+ * way. The page runs session replay with masking off, which is only defensible
+ * while there is nothing on it to type into — so an input appearing is a privacy
+ * regression with no symptom, and is a failure here. And every host the page
+ * points at is checked against an allowlist, because this is the one file in the
+ * repository that is published to strangers: a private hostname reaching it would
+ * look like an ordinary link.
  *
  * It runs the real analytics.js — twice, once holding its committed placeholders
  * and once stamped the way a deploy stamps it — in a hand-built stub of the four
@@ -49,10 +58,21 @@ const ok = (cond, label) => {
 };
 const section = (name) => console.log(`\n${name}`);
 
+/**
+ * The page as a browser parses it.
+ *
+ * Comments are stripped for the markup checks below and *not* for the hostname
+ * ones, which is the distinction that matters: a comment is published to anyone
+ * who views source, so a private hostname in one still counts — but the sentence
+ * in index.html explaining why there is no <form> is not a form.
+ */
+const markup = (html) => html.replace(/<!--[\s\S]*?-->/g, '');
+
 const index = read('index.html');
 const notFound = read('404.html');
 const analytics = read('analytics.js');
 const copy = read('copy.js');
+const signup = read('signup.js');
 
 // ---------------------------------------------------------------------------
 section('Every page the site serves reports itself:');
@@ -121,7 +141,8 @@ const stamped = renderAnalytics(analytics, {
   ok(env.sdk.registered.length === 1, 'and every event carries this visitor\'s display traits');
 
   const events = Object.keys(env.documentListeners).concat(Object.keys(env.windowListeners));
-  ok(events.includes('claude-web:copy'), 'it listens for a copied command');
+  ok(events.includes('triplec:copy'), 'it listens for a copied command');
+  ok(events.includes('triplec:signup'), 'and for the managed signup, which is the page\'s only conversion');
   ok(events.includes('click'), 'for clicks off the site');
   ok(events.includes('scroll'), 'for how far down the page they got');
   ok(events.includes('visibilitychange') && events.includes('pagehide'), 'and for the visit ending');
@@ -136,18 +157,88 @@ const stamped = renderAnalytics(analytics, {
     exit && 'max_scroll_percent' in exit.properties && 'copied_command' in exit.properties,
     'including how far they read and whether they took the command',
   );
+  ok(exit && 'signup_intent' in exit.properties, 'and whether they asked for the managed service');
+
+  // Fired by hand, because the stub has no <details> to open: what matters is that
+  // the listener is wired to a capture of its own, under a name a funnel can use.
+  env.documentListeners['triplec:signup'][0]({ detail: { plan: 'managed' }, target: null });
+  const intent = env.sdk.captures.find((c) => c.event === 'managed_signup_intent');
+  ok(Boolean(intent), 'opening the signup reports the intent as its own event');
+  ok(intent && intent.properties.plan === 'managed', 'naming which plan was asked for');
+  ok(
+    intent && 'seconds' in intent.properties && 'sections_viewed' in intent.properties,
+    'and how much of the page they had read before deciding',
+  );
 }
 
 // ---------------------------------------------------------------------------
 section('The copy button and the listener are two files with no shared code:');
 // ---------------------------------------------------------------------------
-ok(copy.includes("'claude-web:copy'"), 'copy.js announces a copy');
-ok(analytics.includes("'claude-web:copy'"), 'analytics.js listens for the same name');
+ok(copy.includes("'triplec:copy'"), 'copy.js announces a copy');
+ok(analytics.includes("'triplec:copy'"), 'analytics.js listens for the same name');
 for (const key of ['command', 'method']) {
   ok(
     new RegExp(`${key}:`).test(copy) && analytics.includes(`detail.${key}`),
     `both halves agree the event carries "${key}"`,
   );
+}
+
+// ---------------------------------------------------------------------------
+section('The signup reports itself, and works without the script that reports it:');
+// ---------------------------------------------------------------------------
+ok(index.includes('src="/signup.js"'), 'index.html loads signup.js');
+ok(signup.includes("'triplec:signup'"), 'signup.js announces the intent');
+ok(analytics.includes("'triplec:signup'"), 'analytics.js listens for the same name');
+ok(/detail: \{ plan:/.test(signup) && analytics.includes('detail.plan'), 'both halves agree it carries "plan"');
+ok(/<details class="signup" data-signup="/.test(index), 'the panel is a native <details>, which the browser opens on its own');
+ok(
+  !/\bhidden\b/.test(index.slice(index.indexOf('class="signup"'), index.indexOf('</details>'))),
+  'so the ways to reach us are not hidden behind JavaScript running',
+);
+ok(
+  !/\.open\s*=|removeAttribute|classList/.test(signup),
+  'and signup.js only reports: it never opens the panel, so a blocker cannot break the signup',
+);
+ok(/panel\.open/.test(signup), 'it reports on opening only, not on folding the panel back up');
+
+// ---------------------------------------------------------------------------
+section('Nothing on the page is private, which is what unmasked replay assumes:');
+// ---------------------------------------------------------------------------
+// analytics.js turns masking off and says in its own header that the day an input
+// appears is the day to revisit it. This is that day arriving as a failed build
+// rather than as a recording of somebody's email address.
+for (const [name, html] of Object.entries({ 'index.html': index, '404.html': notFound })) {
+  ok(
+    !/<(input|textarea|select|form)\b/i.test(markup(html)),
+    `${name} has no field or form for a visitor to type into`,
+  );
+}
+
+// ---------------------------------------------------------------------------
+section('The one published page points only where it means to:');
+// ---------------------------------------------------------------------------
+// This is the single artefact in the repository that strangers read, so a hostname
+// belonging to somebody's private deployment would be an ordinary-looking link
+// with nothing to flag it. Checked as an allowlist rather than a search for the
+// hostnames to avoid, because naming those here would publish them too.
+{
+  const ALLOWED_HOSTS = ['triplec.host', 'github.com'];
+  for (const [name, html] of Object.entries({ 'index.html': index, '404.html': notFound })) {
+    const hosts = [...new Set([...html.matchAll(/https?:\/\/([^/"'\s>]+)/g)].map((m) => m[1]))];
+    const strangers = hosts.filter((host) => !ALLOWED_HOSTS.includes(host));
+    ok(strangers.length === 0, `${name} links only to ${ALLOWED_HOSTS.join(' and ')}${strangers.length ? ` — found ${strangers.join(', ')}` : ''}`);
+
+    const mail = [...new Set([...html.matchAll(/mailto:([^"?]+)/g)].map((m) => m[1]))];
+    const offBrand = mail.filter((address) => !address.endsWith('@triplec.host'));
+    ok(offBrand.length === 0, `${name} shows no address off the brand's own domain${offBrand.length ? ` — found ${offBrand.join(', ')}` : ''}`);
+  }
+
+  // A rename that reached the buttons but not the clone command would hand a
+  // visitor a URL that 404s, and the page would look entirely correct.
+  const slugs = [...new Set([...index.matchAll(/github\.com\/([\w.-]+\/[\w.-]+)/g)].map((m) => m[1].replace(/\.git$/, '')))];
+  ok(slugs.length === 1, `every link and the clone command name one repository (${slugs.join(', ')})`);
+  ok(index.includes(`data-copy="git clone https://github.com/${slugs[0]}.git"`), 'and that is the repository the copy button hands over');
+  ok(index.includes('<meta property="og:url" content="https://triplec.host/">'), 'and a share of it resolves to the site itself');
 }
 
 // ---------------------------------------------------------------------------

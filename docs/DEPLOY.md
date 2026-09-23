@@ -38,11 +38,11 @@ message will fail with `AccessDeniedException`:
 ## Deploy
 
 ```bash
-git clone https://github.com/MichaelNusair/claude-web.git
-cd claude-web
+git clone https://github.com/MichaelNusair/triplec.git
+cd triplec
 
-cp claude-web.config.example.json claude-web.config.json
-$EDITOR claude-web.config.json     # set domainName and hostedZoneName
+cp triplec.config.example.json triplec.config.json
+$EDITOR triplec.config.json     # set domainName and hostedZoneName
 
 ./deploy.sh
 ```
@@ -93,12 +93,12 @@ infrastructure:
 
 **Everything else runs on a second machine.** Anything under `infra/lib/` changes AWS
 resources and needs a full deploy. Nominate a machine for it — your laptop, CI, or a
-small instance kept for the job — and record it in `claude-web.config.json`:
+small instance kept for the job — and record it in `triplec.config.json`:
 
 ```json
 "deployFrom": {
   "instanceId": "i-0123456789abcdef0",
-  "repoPath": "/home/ec2-user/claude-web",
+  "repoPath": "/home/ec2-user/triplec",
   "user": "ec2-user"
 }
 ```
@@ -126,7 +126,7 @@ What the deploy box needs:
 - The SSM agent running (`aws ssm describe-instance-information` should list it), and
   an instance role or credentials that can deploy the stack.
 - A clone of this repository at `repoPath`, owned by `user`, with its own
-  `claude-web.config.json`. That file is gitignored, so copy it across by hand.
+  `triplec.config.json`. That file is gitignored, so copy it across by hand.
 - `node` (20 or newer), `npm` and `git`. It runs the full test suite before shipping,
   so it needs to be able to install dependencies.
 
@@ -148,25 +148,27 @@ singletons, owned by whichever deployment created them.
 A deployment is a config file, so a second deployment is a second config file:
 
 ```bash
-cp claude-web.config.json claude-web.work.config.json
-$EDITOR claude-web.work.config.json      # domainName, stackName, deployFrom.repoPath
+cp triplec.config.json triplec.work.config.json
+$EDITOR triplec.work.config.json      # domainName, stackName, deployFrom.repoPath
 
-CLAUDE_WEB_CONFIG=$PWD/claude-web.work.config.json ./deploy-remote.sh
-CLAUDE_WEB_CONFIG=$PWD/claude-web.work.config.json ./deploy.sh --app-only
+TRIPLEC_CONFIG=$PWD/triplec.work.config.json ./deploy-remote.sh
+TRIPLEC_CONFIG=$PWD/triplec.work.config.json ./deploy.sh --app-only
 ```
 
-`claude-web.*.config.json` is gitignored like `claude-web.config.json` itself, and
-`CLAUDE_WEB_CONFIG` is read by `infra/config.js`, which every script and the CDK app
-load their settings through.
+`triplec.*.config.json` is gitignored like `triplec.config.json` itself, and
+`TRIPLEC_CONFIG` is read by `infra/config.js`, which every script and the CDK app
+load their settings through. `CLAUDE_WEB_CONFIG` still works and means the same
+thing — see [the note on the old names](#the-names-before-the-rename) — but where
+both are set, `TRIPLEC_CONFIG` wins.
 
 Five things to know, each of which is a mistake someone would otherwise make once:
 
 - **The deploy box needs a second checkout, not a second flag.** `deploy.sh` reads
-  `claude-web.config.json` from the tree it runs in, and `deploy-remote.sh` resets
+  `triplec.config.json` from the tree it runs in, and `deploy-remote.sh` resets
   that tree to `origin/main` every time. So clone the repository again at a second
-  path, drop the second config in it as `claude-web.config.json`, and point
+  path, drop the second config in it as `triplec.config.json`, and point
   `deployFrom.repoPath` there. One machine can drive both; run state on it
-  (`/var/log/claude-web-deploy.<stack>.log` and its `.pid`/`.status` siblings) is
+  (`/var/log/triplec-deploy.<stack>.log` and its `.pid`/`.status` siblings) is
   keyed by stack name, so a deploy of one never overwrites the log or the exit code
   of the other.
 - **In `oidc` mode each hostname is a redirect URI the provider has to know.** The
@@ -201,9 +203,33 @@ Five things to know, each of which is a mistake someone would otherwise make onc
 
 ## Configuration
 
+### The names before the rename
+
+This project was called `claude-web` until September 2026. The rename to **TripleC**
+changed the name of the config file, the environment variables and the default
+stack names — and a config file lives only on the machines that deploy, where no
+commit can reach it. So `infra/config.js` loads either name, and every instruction
+below works under both:
+
+| New | Still accepted | Notes |
+| --- | --- | --- |
+| `triplec.config.json` | `claude-web.config.json` | The new name is preferred when both exist. |
+| `triplec.*.config.json` | `claude-web.*.config.json` | Both patterns are gitignored. |
+| `TRIPLEC_CONFIG` | `CLAUDE_WEB_CONFIG` | Points at a config file by path. |
+| `TRIPLEC_DOMAIN`, `TRIPLEC_STACK_NAME`, … | `CLAUDE_WEB_DOMAIN`, … | `TRIPLEC_*` wins where both are set. |
+| `TripleCStack`, `TripleCLandingStack`, `TripleCSecurityStack` | `ClaudeWebStack`, … | **Defaults only.** See below. |
+
+**Do not rename an existing deployment's config file expecting nothing to happen.**
+`stackName` is the deployment's identity in CloudFormation, and it is read from that
+file: if a deploy cannot find its config it falls back to the new defaults, which
+name a stack that does not exist yet. That does not fail — it *builds a second
+production* beside the first, with its own instance, volume and load balancer. An
+existing deployment should keep whatever `stackName` it already has, whichever
+filename holds it.
+
 Only `domainName` and `hostedZoneName` are required. Everything else has a
 working default — see
-[`claude-web.config.example.json`](../claude-web.config.example.json) for the
+[`triplec.config.example.json`](../triplec.config.example.json) for the
 annotated version and [`infra/config.js`](../infra/config.js) for the authoritative
 defaults and validation.
 
@@ -310,7 +336,7 @@ service refuses to start without it.
 2. Put the client secret in Secrets Manager:
 
    ```bash
-   aws secretsmanager create-secret --name claude-web-oidc \
+   aws secretsmanager create-secret --name triplec-oidc \
      --secret-string '<client-secret>' --region us-east-1
    ```
 
@@ -325,7 +351,7 @@ service refuses to start without it.
        "tokenEndpoint": "https://oauth2.googleapis.com/token",
        "userInfoEndpoint": "https://openidconnect.googleapis.com/v1/userinfo",
        "clientId": "....apps.googleusercontent.com",
-       "clientSecretArn": "arn:aws:secretsmanager:us-east-1:123456789012:secret:claude-web-oidc-AbCdEf",
+       "clientSecretArn": "arn:aws:secretsmanager:us-east-1:123456789012:secret:triplec-oidc-AbCdEf",
        "allowedEmails": ["you@gmail.com"],
        "scope": "openid email"
      }
@@ -410,7 +436,7 @@ integrity-validated, not exportable. The first question after any incident —
 ```
 
 A third stack, and separate for a different reason than the landing site: what it
-creates is account-wide, not app infrastructure. Deleting `ClaudeWebStack` must
+creates is account-wide, not app infrastructure. Deleting `TripleCStack` must
 not delete the record of what that instance did. The trail bucket is `RETAIN`ed
 for the same reason — `cdk destroy` leaves the logs behind rather than deleting
 the evidence of whatever prompted the teardown.
@@ -445,7 +471,7 @@ single small instance.
 ## Optional: the landing page
 
 The repository includes a static marketing site in [`landing/`](../landing/) — the
-page at <https://claude.strikelabs.tech>. You almost certainly don't need this if
+page at <https://triplec.host>. You almost certainly don't need this if
 you are self-hosting for yourself, but it's here and deployable.
 
 It is a deliberately separate stack: its own hostname, a private S3 bucket behind
@@ -549,7 +575,7 @@ Route53 record, and if you create the landing record while the workspace stack
 still owns that name, they will fight over it.
 
 ```bash
-# 1. Give the workspace a new hostname in claude-web.config.json, then:
+# 1. Give the workspace a new hostname in triplec.config.json, then:
 ./deploy.sh              # deletes the old record, creates the new one
 
 # 2. Only now point the landing site at the freed hostname:
@@ -667,7 +693,7 @@ aws secretsmanager delete-secret --secret-id <arn> --force-delete-without-recove
 
 ## Troubleshooting
 
-**`domainName is required`** — no `claude-web.config.json`. Copy the example.
+**`domainName is required`** — no `triplec.config.json`. Copy the example.
 
 **`domainName "x" is not inside hostedZoneName "y"`** — the hostname must be
 within the zone. `claude.example.com` needs zone `example.com`.

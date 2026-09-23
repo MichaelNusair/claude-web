@@ -7,12 +7,19 @@ infra/cdk.out/
 
 # Your deployment's settings: domain, hosted zone, AWS profile, git identity.
 # Ignored so a fork never publishes one person's account details — copy
-# claude-web.config.example.json to create it.
-claude-web.config.json
+# triplec.config.example.json to create it.
+triplec.config.json
 
 # A second deployment is a second config file, named and pointed at with
-# CLAUDE_WEB_CONFIG (see docs/DEPLOY.md). Ignored for exactly the same reason as
+# TRIPLEC_CONFIG (see docs/DEPLOY.md). Ignored for exactly the same reason as
 # the one above, and matched by pattern so adding another cannot be forgotten.
+triplec.*.config.json
+
+# The same two under the name this project used before the rename. Still read by
+# infra/config.js, because a config file lives only on the machines that deploy and
+# no rename in here can reach them — so they must stay ignored for as long as they
+# stay loadable, or the first commit after a rename publishes someone's account.
+claude-web.config.json
 claude-web.*.config.json
 
 # CDK caches Route53/AZ lookups here, and those cache entries embed your AWS

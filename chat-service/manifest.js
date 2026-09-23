@@ -50,6 +50,20 @@ const ICONS = [
 
 const THEME_COLOR = '#141413';
 
+/**
+ * What the app calls itself when a deployment has not been given a name of its own.
+ *
+ * The product's name, and the word every HTML shell writes where it means "this
+ * app" — so it is also the word `applyDeploymentName` substitutes. That is the
+ * reason it is a constant rather than four string literals: a shell that spells the
+ * app's name any other way is a shell the rename silently skips, and the symptom is
+ * a deployment that is named everywhere except one page.
+ *
+ * It must stay in step with `name` in pwa/manifest.webmanifest, which is the base
+ * the chat app's manifest is served from; manifest-test.js asserts that it does.
+ */
+export const APP_NAME = 'TripleC';
+
 /*
  * ---------------------------------------------------------------------------
  * What this deployment calls itself
@@ -64,7 +78,7 @@ const THEME_COLOR = '#141413';
  * name on its own.
  *
  * Empty is the default and means today's behaviour exactly — a project is titled
- * with the project, the chat app is "Claude". A single deployment has nothing to
+ * with the project, the chat app is "TripleC". A single deployment has nothing to
  * tell apart, and a prefix would only spend the twelve characters a phone gives a
  * label under an icon.
  */
@@ -138,9 +152,9 @@ export function chatManifest(base) {
  * The same name, in an HTML shell's title.
  *
  * Three shells reach a browser tab — the chat app, the login page, the box page —
- * and each of them writes "Claude" where it means "this deployment's app". So the
+ * and each of them writes APP_NAME where it means "this deployment's app". So the
  * word is what gets replaced, which leaves each shell's own phrasing intact:
- * "Sign in — Claude" becomes "Sign in — <name>" without the server having to know
+ * "Sign in — TripleC" becomes "Sign in — <name>" without the server having to know
  * that page's sentence.
  *
  * `<meta name="deployment">` is the one addition rather than a replacement: it is
@@ -151,7 +165,7 @@ export function chatManifest(base) {
 export function applyDeploymentName(html) {
   const name = deploymentName();
   if (!name) return html;
-  const rename = (text) => text.replace(/Claude/g, name);
+  const rename = (text) => text.split(APP_NAME).join(name);
   return html
     .replace(/<title>([^<]*)<\/title>/i, (_, title) => `<title>${rename(title)}</title>`)
     .replace(
@@ -224,7 +238,7 @@ export function projectManifest({ project, path }) {
     // change if the folder a project lives in ever moves. Nor when the deployment
     // is renamed, which is why the name below is not in here.
     id: home,
-    name: `${title} — Claude Code`,
+    name: `${title} — ${APP_NAME}`,
     short_name: title,
     description: `Claude Code in ${project}, in a window of its own`,
     start_url: projectStartUrl(project, path),

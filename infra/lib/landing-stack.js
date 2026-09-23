@@ -27,12 +27,24 @@ import {
   posthogOrigins,
 } from '../landing-analytics.js';
 
-export class ClaudeWebLandingStack extends Stack {
+export class TripleCLandingStack extends Stack {
   constructor(scope, id, props) {
     super(scope, id, props);
 
     const config = props.config;
     const domainName = config.landing.domainName;
+
+    /*
+     * The zone this site's hostname belongs to, which is not necessarily the
+     * workspace's. A product's marketing domain is usually a domain, not a
+     * subdomain of the box: `triplec.host`, not `www.the-zone-the-instance-is-in`.
+     * config.js validates that domainName is inside whichever of the two this
+     * resolves to, so the check and the record below read the same value.
+     */
+    const zoneName = config.landing.hostedZoneName || config.hostedZoneName;
+    const zoneId = config.landing.hostedZoneName
+      ? config.landing.hostedZoneId
+      : config.hostedZoneId;
 
     // Analytics is opt-in per deployment. With no key configured this stack is
     // exactly what it was before: one origin, one behaviour, and a CSP that
@@ -56,12 +68,12 @@ export class ClaudeWebLandingStack extends Stack {
     });
 
     // --- Certificate ---------------------------------------------------------
-    const zone = config.hostedZoneId
+    const zone = zoneId
       ? route53.HostedZone.fromHostedZoneAttributes(this, 'Zone', {
-          hostedZoneId: config.hostedZoneId,
-          zoneName: config.hostedZoneName,
+          hostedZoneId: zoneId,
+          zoneName: zoneName,
         })
-      : route53.HostedZone.fromLookup(this, 'Zone', { domainName: config.hostedZoneName });
+      : route53.HostedZone.fromLookup(this, 'Zone', { domainName: zoneName });
 
     // Reuse an existing certificate when given one — a wildcard covering the
     // zone already covers this hostname, so most deployments need nothing new.

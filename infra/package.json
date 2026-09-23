@@ -1,5 +1,5 @@
 {
-  "name": "claude-web-infra",
+  "name": "triplec-infra",
   "version": "1.0.0",
   "type": "module",
   "bin": {

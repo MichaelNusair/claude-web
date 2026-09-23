@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 import { App } from 'aws-cdk-lib';
-import { ClaudeWebStack } from '../lib/stack.js';
-import { ClaudeWebLandingStack } from '../lib/landing-stack.js';
-import { ClaudeWebSecurityStack } from '../lib/security-stack.js';
+import { TripleCStack } from '../lib/stack.js';
+import { TripleCLandingStack } from '../lib/landing-stack.js';
+import { TripleCSecurityStack } from '../lib/security-stack.js';
 import { loadConfig } from '../config.js';
 
 // Configuration is validated before the app is constructed, so a missing domain
@@ -18,7 +18,7 @@ try {
 
 const app = new App();
 
-new ClaudeWebStack(app, config.stackName, {
+new TripleCStack(app, config.stackName, {
   config,
   env: {
     // Account comes from the ambient credentials; only the region is pinned, so
@@ -26,31 +26,31 @@ new ClaudeWebStack(app, config.stackName, {
     account: process.env.CDK_DEFAULT_ACCOUNT,
     region: config.region,
   },
-  description: `Claude Code as a self-hosted web app at ${config.domainName}`,
+  description: `TripleC — Claude Code as a self-hosted web app at ${config.domainName}`,
 });
 
 // The marketing site is opt-in and fully independent: a separate stack, its own
 // hostname, no shared resources with the workspace. `cdk deploy` targets one
 // stack by name, so adding this never changes what a workspace deploy touches.
 if (config.landing.domainName) {
-  new ClaudeWebLandingStack(app, config.landing.stackName, {
+  new TripleCLandingStack(app, config.landing.stackName, {
     config,
     env: {
       account: process.env.CDK_DEFAULT_ACCOUNT,
       // Pinned: CloudFront reads certificates only from us-east-1.
       region: 'us-east-1',
     },
-    description: `Landing page for claude-web at ${config.landing.domainName}`,
+    description: `TripleC landing page at ${config.landing.domainName}`,
     crossRegionReferences: true,
   });
 }
 
 // Audit and threat detection, also opt-in and also its own stack — but unlike the
 // landing site it is separate because of *lifetime* rather than isolation. The
-// trail outlives the workspace it watches: deleting ClaudeWebStack must not also
+// trail outlives the workspace it watches: deleting TripleCStack must not also
 // delete the record of what that instance did while it existed.
 if (config.security.enabled) {
-  new ClaudeWebSecurityStack(app, config.security.stackName, {
+  new TripleCSecurityStack(app, config.security.stackName, {
     config,
     env: {
       account: process.env.CDK_DEFAULT_ACCOUNT,
@@ -58,6 +58,6 @@ if (config.security.enabled) {
       // still live somewhere; the app's own region keeps them next to it.
       region: config.region,
     },
-    description: 'CloudTrail and GuardDuty for the account running claude-web',
+    description: 'CloudTrail and GuardDuty for the account running TripleC',
   });
 }

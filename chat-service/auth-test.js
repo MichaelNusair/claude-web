@@ -191,7 +191,7 @@ const guarded = [
   ['POST', '/api/speak/prepare'],
   ['GET', '/api/speak?id=0123456789abcdef&segment=0'],
   // 44 bytes of silence, and no secret in it — but gated with the rest of the
-  // feature rather than opened. It reveals that this is a claude-web box, the
+  // feature rather than opened. It reveals that this is a TripleC box, the
   // allowlist is the thing this file exists to keep short, and the only caller is
   // a page that is already signed in.
   ['GET', '/api/speak/silence'],

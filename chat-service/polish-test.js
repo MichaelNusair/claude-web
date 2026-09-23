@@ -125,7 +125,7 @@ console.log('\nNever loses the transcript:');
 
   // The vocabulary option is what carries the project names into the prompt. Its
   // effect is not observable from out here, but a bad shape breaking the call is.
-  const withVocab = await polish(raw, { vocabulary: ['claude-web', 'strikelabs'] });
+  const withVocab = await polish(raw, { vocabulary: ['triplec', 'bedrock'] });
   check('project names do not break the call', withVocab.text === raw);
 }
 

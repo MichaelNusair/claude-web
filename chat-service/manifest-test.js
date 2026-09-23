@@ -49,6 +49,7 @@ const {
   appTitle,
   chatManifest,
   applyDeploymentName,
+  APP_NAME,
 } = await import('./manifest.js');
 const { PWA_NAME_PATTERN } = await import('../infra/config.js');
 
@@ -228,12 +229,33 @@ const shells = Object.fromEntries(
   ]),
 );
 
+/*
+ * The rename is a text substitution, so it can only find a name the page actually
+ * spells. Every shell has to write APP_NAME where it means "this app", and the
+ * manifest has to agree with it — otherwise a named deployment comes out named on
+ * two pages out of three, or its icon keeps the product's name while its tab does
+ * not. Neither is visible from the deployment that has no name, which is the one
+ * every test above this line is about.
+ */
+for (const [file, html] of Object.entries(shells)) {
+  ok(
+    html.includes(APP_NAME),
+    `public/${file} never writes "${APP_NAME}", so applyDeploymentName has nothing to ` +
+      'replace there and a named deployment keeps the product name on that page',
+  );
+}
+ok(
+  base.name === APP_NAME && base.short_name === APP_NAME,
+  `pwa/manifest.webmanifest calls the app "${base.name}" while manifest.js calls it ` +
+    `"${APP_NAME}" — the installed icon and the browser tab would disagree`,
+);
+
 delete process.env.PWA_NAME;
 ok(deploymentName() === '', 'a deployment with no name reports one anyway');
 ok(appTitle('demo') === 'demo', 'an unnamed deployment prefixes titles with something');
 const plain = await manifestForProject('demo');
 ok(plain.short_name === 'demo', 'the home-screen label changed for a deployment with no name');
-ok(plain.name === 'demo — Claude Code', 'the installer label changed for a deployment with no name');
+ok(plain.name === `demo — ${APP_NAME}`, 'the installer label changed for a deployment with no name');
 ok(chatManifest(base) === base, 'the chat manifest is rebuilt when there is no name to put in it');
 ok(
   Object.values(shells).every((html) => applyDeploymentName(html) === html),
@@ -247,7 +269,7 @@ ok(deploymentName() === 'work', 'the deployment name is not read from the enviro
 ok(appTitle('demo') === 'work: demo', 'a project title is not "<name>: <project>"');
 ok(named.short_name === 'work: demo', 'the label under the icon does not say which deployment it opens');
 ok(
-  named.name === 'work: demo — Claude Code',
+  named.name === `work: demo — ${APP_NAME}`,
   'the installer label does not name the deployment, so two deployments offer the same install',
 );
 ok(
@@ -272,7 +294,7 @@ ok(
 );
 
 /*
- * Each shell writes "Claude" where it means "this deployment's app", so the word is
+ * Each shell writes APP_NAME where it means "this deployment's app", so the word is
  * what gets replaced and each page keeps its own phrasing. The meta tag is the one
  * addition: it is how app.js learns the name, so a tab can read "<name>: <project>"
  * once a project is on screen (setTabTitle in public/app.js).
@@ -299,7 +321,7 @@ ok(
 );
 ok(
   metaOf(renamed['index.html'], 'apple-mobile-web-app-title') === 'work',
-  'the iOS home-screen label still says Claude on a named deployment',
+  `the iOS home-screen label still says ${APP_NAME} on a named deployment`,
 );
 ok(
   metaOf(shells['index.html'], 'deployment') === '',

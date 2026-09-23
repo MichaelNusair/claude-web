@@ -6,7 +6,7 @@
  * This one is separate because what it creates is not *app* infrastructure at
  * all: a CloudTrail trail and a GuardDuty detector are account-wide singletons
  * whose lifetime should not be tied to the workspace they were created to watch.
- * Tearing down ClaudeWebStack must not also delete the record of what it did.
+ * Tearing down TripleCStack must not also delete the record of what it did.
  *
  * WHY THIS EXISTS AT ALL
  *
@@ -32,7 +32,7 @@ import * as s3 from 'aws-cdk-lib/aws-s3';
 import * as cloudtrail from 'aws-cdk-lib/aws-cloudtrail';
 import * as guardduty from 'aws-cdk-lib/aws-guardduty';
 
-export class ClaudeWebSecurityStack extends Stack {
+export class TripleCSecurityStack extends Stack {
   constructor(scope, id, props) {
     super(scope, id, props);
 

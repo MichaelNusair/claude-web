@@ -52,7 +52,7 @@ const SUBS_FILE = () => join(PUSH_DIR, 'subscriptions.json');
  * lives in a config file that is deliberately not committed — so the default is
  * inert and overridable.
  */
-const SUBJECT = process.env.CW_PUSH_SUBJECT || 'mailto:claude-web@localhost';
+const SUBJECT = process.env.CW_PUSH_SUBJECT || 'mailto:triplec@localhost';
 
 /** Twelve hours: comfortably inside the 24 the spec allows, and re-signed per send. */
 const TOKEN_TTL_S = 12 * 60 * 60;

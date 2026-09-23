@@ -13,10 +13,17 @@
  * form, no user-supplied content, nothing on screen that is anybody's but the
  * author's. So: full session replay with no masking, autocapture, heatmaps, dead
  * clicks, rage clicks, web vitals, console logs, uncaught exceptions — plus the
- * five custom events that answer what the page actually exists to answer (did
- * they take the command, did they read the security section, how far down did
- * they get, where did they go instead). If a form or a login ever appears here,
- * revisit the masking options below before shipping it.
+ * six custom events that answer what the page actually exists to answer (did they
+ * take the command, did they ask for the managed service, did they read the
+ * security section, how far down did they get, where did they go instead). If a
+ * form or a login ever appears here, revisit the masking options below before
+ * shipping it.
+ *
+ * That last condition is why the managed signup is a disclosure and a mailto
+ * rather than a field to type an address into: it is the one place on the page
+ * where a form was the obvious thing to build. landing-test.js fails the build if
+ * an input appears while the masking below is off, so this stays a decision and
+ * does not quietly become a mistake.
  *
  * Progressive enhancement, like copy.js: the page must work with this file
  * blocked, stale or failing, so nothing here may throw into anything else and
@@ -25,7 +32,7 @@
 (function (window, document) {
   'use strict';
 
-  // Written by deploy-landing.sh from claude-web.config.json (landing.analytics).
+  // Written by deploy-landing.sh from triplec.config.json (landing.analytics).
   // Left as placeholders in git — and in any fork that never configures a key —
   // in which case this file returns below and does nothing at all.
   var TOKEN = '__POSTHOG_PROJECT_TOKEN__';
@@ -46,6 +53,7 @@
     maxScroll: 0,
     sections: [],
     copied: false,
+    signup: false,
     exited: false,
   };
 
@@ -139,13 +147,34 @@
     // copy.js dispatches this on every copy, successful or fallen back to a
     // selection. Autocapture already records the click; this records *which*
     // command and whether the clipboard actually took it.
-    document.addEventListener('claude-web:copy', function (event) {
+    document.addEventListener('triplec:copy', function (event) {
       var detail = event.detail || {};
       state.copied = true;
       ph.capture('command_copied', {
         command: detail.command,
         method: detail.method,
         section: sectionOf(event.target),
+      });
+    });
+
+    // --- Who said yes ----------------------------------------------------------
+    // The one conversion on the page. signup.js dispatches this when the managed
+    // panel is opened, which is the click that means "bill me" — so it is captured
+    // under a name of its own rather than left to autocapture, where it would be an
+    // anonymous <summary> among every other click.
+    //
+    // `seconds` is on it because the interesting question is not how many people
+    // clicked but whether they clicked before or after reading the part that says
+    // nobody is being charged yet.
+    document.addEventListener('triplec:signup', function (event) {
+      var detail = event.detail || {};
+      state.signup = true;
+      ph.capture('managed_signup_intent', {
+        plan: detail.plan,
+        section: sectionOf(event.target),
+        seconds: secondsVisible(),
+        sections_viewed: state.sections.slice(),
+        max_scroll_percent: state.maxScroll,
       });
     });
 
@@ -247,6 +276,7 @@
         sections_viewed: state.sections.slice(),
         sections_viewed_count: state.sections.length,
         copied_command: state.copied,
+        signup_intent: state.signup,
       },
       // The page is going away; a normal XHR would be cancelled with it.
       { transport: 'sendBeacon' },

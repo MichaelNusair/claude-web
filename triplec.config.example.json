@@ -1,17 +1,25 @@
 {
   "$comment": [
-    "Copy this file to claude-web.config.json and edit it, then run ./deploy.sh.",
-    "claude-web.config.json is gitignored so your settings never get committed.",
+    "Copy this file to triplec.config.json and edit it, then run ./deploy.sh.",
+    "triplec.config.json is gitignored so your settings never get committed.",
     "Only domainName and hostedZoneName are required; everything else has a",
     "working default. Every key can also be set as an environment variable —",
-    "see ENV_MAP in infra/config.js. Full reference: docs/DEPLOY.md.",
+    "see ENV_SUFFIXES in infra/config.js, prefixed TRIPLEC_. Reference:",
+    "docs/DEPLOY.md.",
+    "",
+    "Deployments made before the rename keep their claude-web.config.json: that",
+    "name is still read, and the old CLAUDE_WEB_* variables still work too.",
+    "Do not rename an existing one without also renaming the copy on whatever",
+    "machine deployFrom names below — stackName is deployment identity, and a",
+    "deploy that cannot find its config builds a second production, it does not",
+    "fail.",
     "",
     "SECURITY: read docs/SECURITY.md before exposing this to the internet.",
     "Claude runs shell commands on this machine, so the login password is the",
     "boundary between the internet and a shell on your box."
   ],
 
-  "domainName": "claude.example.com",
+  "domainName": "code.example.com",
   "hostedZoneName": "example.com",
 
   "region": "us-east-1",
@@ -135,9 +143,18 @@
     "It must NOT be the same hostname as domainName above — one DNS record",
     "cannot point at both CloudFront and the load balancer.",
     "",
+    "hostedZoneName is for the usual case where the site has a domain of its own",
+    "rather than a subdomain of the workspace's: a product's page is 'triplec.host',",
+    "not a third name next to the private box. Leave it empty to use the zone",
+    "above. Set hostedZoneId alongside it to skip the lookup — worth doing here,",
+    "because both zones answer to the same account.",
+    "",
     "certificateArn must live in us-east-1, the only region CloudFront reads",
     "certificates from. Leave it empty to have one created there for you; a",
-    "wildcard covering your zone can be reused if it is already in us-east-1.",
+    "wildcard covering your zone can be reused if it is already in us-east-1 AND",
+    "actually names this hostname. It does not if the site is in its own zone,",
+    "and CloudFront answers a name its certificate omits with a TLS error, which",
+    "reads as DNS rather than as the wrong ARN.",
     "",
     "Deploy with ./deploy-landing.sh, which is independent of ./deploy.sh.",
     "",
@@ -152,8 +169,10 @@
   ],
   "landing": {
     "domainName": "",
+    "hostedZoneName": "",
+    "hostedZoneId": "",
     "certificateArn": "",
-    "stackName": "ClaudeWebLandingStack",
+    "stackName": "TripleCLandingStack",
     "analytics": {
       "posthogKey": "",
       "region": "us"
@@ -184,7 +203,7 @@
   ],
   "security": {
     "enabled": false,
-    "stackName": "ClaudeWebSecurityStack",
+    "stackName": "TripleCSecurityStack",
     "cloudTrail": true,
     "guardDuty": false,
     "logRetentionDays": 365
@@ -205,7 +224,7 @@
     "deploy survives your browser, your network or the workspace restarting.",
     "",
     "It needs the SSM agent running, a clone of this repository with its own",
-    "claude-web.config.json, and a role that can deploy the stack. Leave",
+    "triplec.config.json, and a role that can deploy the stack. Leave",
     "instanceId empty and ./deploy-remote.sh tells you this is what to set.",
     "",
     "App-only changes never need it: ./deploy.sh --app-only ships those from",
@@ -213,7 +232,7 @@
   ],
   "deployFrom": {
     "instanceId": "",
-    "repoPath": "/home/ec2-user/claude-web",
+    "repoPath": "/home/ec2-user/triplec",
     "user": "ec2-user"
   }
 }

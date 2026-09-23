@@ -27,7 +27,7 @@ set -euo pipefail
 #      unpushed work: silently shipping a *different* tree than the one you are
 #      looking at is worse than making you push.
 #
-# Configure the box in claude-web.config.json under `deployFrom` (instanceId,
+# Configure the box in triplec.config.json under `deployFrom` (instanceId,
 # repoPath, user). Anything with an SSM agent and a role that can deploy the stack
 # will do — a laptop, CI, or a small instance kept for the purpose. docs/DEPLOY.md
 # has the setup.
@@ -53,9 +53,9 @@ eval "$(node infra/print-config.js)"
 # the stack being deployed is in the path.
 RUN_TAG="$(printf '%s' "$CFG_STACK" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9._-')"
 [ -n "$RUN_TAG" ] || RUN_TAG=stack
-LOG_FILE="/var/log/claude-web-deploy.$RUN_TAG.log"
-STATUS_FILE="/var/log/claude-web-deploy.$RUN_TAG.status"
-PID_FILE="/var/log/claude-web-deploy.$RUN_TAG.pid"
+LOG_FILE="/var/log/triplec-deploy.$RUN_TAG.log"
+STATUS_FILE="/var/log/triplec-deploy.$RUN_TAG.status"
+PID_FILE="/var/log/triplec-deploy.$RUN_TAG.pid"
 
 AWS_ARGS=(--region "$CFG_REGION")
 [ -n "$CFG_PROFILE" ] && AWS_ARGS+=(--profile "$CFG_PROFILE")
@@ -65,16 +65,16 @@ if [ -z "$CFG_DEPLOY_INSTANCE" ]; then
 No deploy box configured.
 
 A full deploy must not run on the instance the stack manages, so it needs a second
-machine. Add one to claude-web.config.json:
+machine. Add one to triplec.config.json:
 
   "deployFrom": {
     "instanceId": "i-0123456789abcdef0",
-    "repoPath": "/home/ec2-user/claude-web",
+    "repoPath": "/home/ec2-user/triplec",
     "user": "ec2-user"
   }
 
 It needs the SSM agent running, a clone of this repository with its own
-claude-web.config.json, and a role that can deploy the stack. See docs/DEPLOY.md.
+triplec.config.json, and a role that can deploy the stack. See docs/DEPLOY.md.
 
 If the change is app-only — anything under chat-service, pwa, the extensions or
 infra/userdata — you do not need this at all:
@@ -173,7 +173,7 @@ ssm_run() {
   cmd_id="$(aws ssm send-command \
     --instance-ids "$CFG_DEPLOY_INSTANCE" \
     --document-name AWS-RunShellScript \
-    --comment "claude-web deploy-remote" \
+    --comment "TripleC deploy-remote" \
     --timeout-seconds 120 \
     --cli-input-json "$(python3 -c 'import json,sys; print(json.dumps({"Parameters": {"commands": [sys.stdin.read()]}}))' <<<"$script")" \
     --query Command.CommandId --output text "${AWS_ARGS[@]}")"

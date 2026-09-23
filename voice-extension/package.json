@@ -3,7 +3,7 @@
   "displayName": "Claude Voice Dictation",
   "description": "Hold-to-talk voice dictation that inserts transcribed text at the cursor",
   "version": "1.0.0",
-  "publisher": "claude-web",
+  "publisher": "triplec",
   "private": true,
   "engines": {
     "vscode": "^1.94.0"

@@ -18,10 +18,10 @@ if [ -z "$CFG_LANDING_DOMAIN" ]; then
   cat >&2 <<'NOLANDING'
 No landing site configured.
 
-Add a "landing" section to claude-web.config.json:
+Add a "landing" section to triplec.config.json:
 
   "landing": {
-    "domainName": "claude.example.com"
+    "domainName": "triplec.example.com"
   }
 
 It must be a different hostname from the workspace — one DNS record cannot point

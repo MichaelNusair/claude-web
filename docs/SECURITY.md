@@ -70,7 +70,7 @@ secure except the one actually serving traffic.
 So: the process that spawns `claude` is the process that checks the credential.
 A proxy misconfiguration can now break the app, but it cannot open it.
 
-Two modes, set by `authMode` in `claude-web.config.json`.
+Two modes, set by `authMode` in `triplec.config.json`.
 
 ### `password` (default)
 
@@ -383,7 +383,7 @@ modified, diff it against your remotes before trusting it.
 ## Reporting a vulnerability
 
 Please report security issues privately rather than opening a public issue:
-open a [GitHub security advisory](https://github.com/MichaelNusair/claude-web/security/advisories/new).
+open a [GitHub security advisory](https://github.com/MichaelNusair/triplec/security/advisories/new).
 
 Include what you can reach, what you can do with it, and how you got there.
 Findings that let an unauthenticated caller reach the chat API, or that let one

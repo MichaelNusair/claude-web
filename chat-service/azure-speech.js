@@ -263,7 +263,7 @@ export async function speakAzure(text, voiceName, { fetchImpl = fetch, config: g
         'X-Microsoft-OutputFormat': TTS_FORMAT,
         // Azure asks for one, and a resource's metrics are easier to read when the
         // caller says what it is.
-        'User-Agent': 'claude-web',
+        'User-Agent': 'TripleC',
       },
       body: ssmlFor(text, voiceName),
       signal: AbortSignal.timeout(TIMEOUT_MS),
@@ -364,7 +364,7 @@ export async function hearAzure(audio, language, { fetchImpl = fetch, config: gi
         'Ocp-Apim-Subscription-Key': config.key,
         'Content-Type': 'audio/wav; codecs=audio/pcm; samplerate=16000',
         Accept: 'application/json',
-        'User-Agent': 'claude-web',
+        'User-Agent': 'TripleC',
       },
       body: audio,
       signal: AbortSignal.timeout(TIMEOUT_MS),

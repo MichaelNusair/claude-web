@@ -37,5 +37,6 @@ The short version, if you read nothing else:
   process — never in nginx, never in the load balancer alone.
 - Run `npm run test:auth` before finishing any change to auth, routing, or the
   stack. `deploy.sh` runs it too and refuses to deploy if it fails.
-- Never commit `claude-web.config.json` or `infra/cdk.context.json`; both carry
-  account-specific details.
+- Never commit `triplec.config.json` (or `claude-web.config.json`, which
+  `infra/config.js` still loads for deployments made before the rename) or
+  `infra/cdk.context.json`; all of them carry account-specific details.

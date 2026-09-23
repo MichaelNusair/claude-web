@@ -21,7 +21,7 @@ const APP_PORT = 8080;
 // the load balancer and recover the real client IP for login throttling.
 const VPC_CIDR = '10.0.0.0/16';
 
-export class ClaudeWebStack extends Stack {
+export class TripleCStack extends Stack {
   /**
    * @param {object} props.config Result of loadConfig() — see infra/config.js.
    *   Nothing about a particular AWS account is hardcoded in this file.

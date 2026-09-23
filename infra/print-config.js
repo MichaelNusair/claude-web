@@ -3,7 +3,7 @@
  * Print the validated configuration as shell assignments, for `eval` in
  * deploy.sh and migrate.sh.
  *
- * Exists so the shell scripts never parse claude-web.config.json themselves.
+ * Exists so the shell scripts never parse triplec.config.json themselves.
  * Two parsers for one file drift, and the one in a shell script would skip the
  * validation in config.js — which is where the useful error messages live.
  *

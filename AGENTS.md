@@ -1,7 +1,7 @@
 # Notes for AI agents
 
 You are probably here because someone asked you to help them deploy, operate, or
-modify claude-web. This file is the orientation you need. `CLAUDE.md` points here;
+modify TripleC. This file is the orientation you need. `CLAUDE.md` points here;
 so does the README.
 
 Read [docs/SECURITY.md](docs/SECURITY.md) before changing anything under
@@ -31,7 +31,7 @@ Work in this repository is done when all three of these are true, in this order:
 ```bash
 npm test                       # all of it, not just the part you touched
 git add -A && git commit       # see the message rules below
-git push origin main           # the open-source repo: github.com/MichaelNusair/claude-web
+git push origin main           # the open-source repo: github.com/MichaelNusair/triplec
 ./deploy-remote.sh             # runs the real deploy on the deploy box, from
                                # origin/main. It re-runs the tests there and
                                # refuses to ship if any of them fail.
@@ -60,10 +60,12 @@ a comment:
   it is the right tool when the change is only app payload: `chat-service`, `pwa`,
   either extension, or `infra/userdata/bootstrap.sh`. It changes no AWS resources.
   Anything under `infra/lib` needs the deploy box.
-- **Ship the deployment whose config is `claude-web.config.json`, and only that
-  one.** This account can run more than one: a deployment is a config file, and a
-  second one is a second config file selected with `CLAUDE_WEB_CONFIG=…` —
-  `ls claude-web.*.config.json` is how you find out, since they are all gitignored.
+- **Ship the deployment whose config is the plain `triplec.config.json`, and only
+  that one.** This account can run more than one: a deployment is a config file, and
+  a second one is a second config file selected with `TRIPLEC_CONFIG=…` —
+  `ls triplec.*.config.json claude-web.*.config.json` is how you find out, since
+  they are all gitignored. (Both spellings, because this box predates the rename:
+  see ["The names before the rename"](#the-names-before-the-rename).)
   Everything here is shared by all of them — one repository, one `origin/main`, one
   deploy box, one suite — so a change to `chat-service`, `pwa` or `infra/lib` *is* a
   change to every deployment, and the others will drift until someone ships them.
@@ -74,7 +76,7 @@ a comment:
   shipped. ["More than one deployment"](docs/DEPLOY.md#more-than-one-deployment) has
   the mechanics, including why the deploy box needs a checkout per deployment.
 
-The box is named in `claude-web.config.json` under `deployFrom` (gitignored, so it
+The box is named in `triplec.config.json` under `deployFrom` (gitignored, so it
 is per-deployment and never committed). Anyone running the open-source repo should
 do the same — any second machine with an SSM agent and a role that can deploy the
 stack will do, including a laptop or CI. [docs/DEPLOY.md](docs/DEPLOY.md) has the
@@ -109,8 +111,8 @@ Five things that are still true while you do it:
   works in this repository at a time, so run `git status` and `git log HEAD..origin/main`
   first and, if there is work in there that is not yours, say so in the commit message
   and in what you tell the user. Ship it — but named, never quietly. And never commit
-  `claude-web.config.json` or `infra/cdk.context.json` (both gitignored; keep it that
-  way).
+  `triplec.config.json` — under either name — or `infra/cdk.context.json` (all
+  gitignored; keep it that way).
 - **Someone else's file may be mid-edit.** The suite is the arbiter: if `npm test`
   is green with their work in the tree, ship it and say you did. If it is red
   *because* of their work, do not fix it by reverting them and do not weaken the
@@ -428,8 +430,8 @@ migrate.sh               Brings local repos + Claude session history up.
 
 ### Three stacks, deliberately
 
-`ClaudeWebStack` is the workspace — a machine that runs shell commands.
-`ClaudeWebLandingStack` is a public static page. They share no resources, and the
+`TripleCStack` is the workspace — a machine that runs shell commands.
+`TripleCLandingStack` is a public static page. They share no resources, and the
 landing side has no route to the instance. Keep it that way: do not "simplify" by
 serving the marketing page off the workspace's nginx, which would put public
 traffic on the box that holds the GitHub token.
@@ -439,7 +441,7 @@ hostname** — `config.js` rejects that rather than letting CloudFormation find 
 When moving a hostname from one to the other, deploy the stack that is *giving it
 up* first.
 
-`ClaudeWebSecurityStack` is separate for a different reason: a CloudTrail trail and
+`TripleCSecurityStack` is separate for a different reason: a CloudTrail trail and
 a GuardDuty detector are account-wide singletons, not app resources, and their
 lifetime must not be tied to the workspace they watch. Deleting the workspace stack
 must not delete the record of what that instance did — which is also why the trail
@@ -456,7 +458,7 @@ resource. `deploy-security.sh` checks first and explains; keep it that way.
 ### "Help me deploy this"
 
 ```bash
-cp claude-web.config.example.json claude-web.config.json
+cp triplec.config.example.json triplec.config.json
 # set domainName and hostedZoneName
 ./deploy.sh
 ```
@@ -481,7 +483,7 @@ nothing. Most people do not know the option exists.
 from wherever they are — the trap springs on the *second* one, if they run it from
 inside the workspace the stack has just created for them. `deploy.sh` refuses that
 (see the finishing section above), so the thing to set up before they start making
-changes is `deployFrom` in `claude-web.config.json` and `./deploy-remote.sh`. The
+changes is `deployFrom` in `triplec.config.json` and `./deploy-remote.sh`. The
 machine they just deployed from already qualifies; the minimum version of this advice
 is "keep running full deploys from here, not from the workspace".
 
@@ -1667,10 +1669,32 @@ Things that have burned people, in this codebase specifically:
   file's mtime (`ps -eo lstart,args | grep nginx:` versus `ls -l`). Workers older
   than the config mean the config is not running.
 
+## The names before the rename
+
+This project was called `claude-web` until September 2026. The rename to **TripleC**
+is the product's name, the config file, the environment variables and the default
+stack names. Two consequences an agent runs into:
+
+- **This box predates it.** Its settings are still in `claude-web.config.json`, here
+  and on the deploy box, and `infra/config.js` still loads that name — so do not
+  "fix" it by renaming the file. `stackName` is the deployment's identity in
+  CloudFormation and it is read from that file; a deploy that cannot find its config
+  does not fail, it falls back to the new defaults and starts building a second
+  production alongside the first. [docs/DEPLOY.md](docs/DEPLOY.md#the-names-before-the-rename)
+  has the full compatibility table.
+- **Paths on the instance were deliberately *not* renamed.** `/opt/claude-web`,
+  `/etc/claude-web-zshrc` and `/etc/nginx/conf.d/claude-web.conf` keep their names,
+  because a rename there would not replace the old copy — it would leave it in place
+  and add a second one. Two nginx server blocks for the same host is an outage, and a
+  stale `/etc/claude-web-zshrc` that is still sourced is a silent one. They are
+  invisible to anyone using the product, so the trade is not close. Comments and
+  documents that name those paths are naming a real path and are correct as written.
+
 ## Things not to do
 
-- Do not commit `claude-web.config.json` — it holds the user's domain, account
-  profile and git identity. It is gitignored; keep it that way.
+- Do not commit `triplec.config.json`, nor `claude-web.config.json` under the name
+  this project used before the rename — either one holds the user's domain, account
+  profile and git identity. Both are gitignored; keep it that way.
 - Do not commit `infra/cdk.context.json` — CDK caches lookups there and the cache
   embeds the AWS account id.
 - Do not put an account id, hosted zone id, certificate ARN or personal email

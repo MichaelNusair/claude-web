@@ -31,7 +31,7 @@ import { readFileSync } from 'fs';
 import { dirname, join as joinPath } from 'path';
 import { fileURLToPath } from 'url';
 import { JSDOM } from 'jsdom';
-import { applyDeploymentName } from './manifest.js';
+import { APP_NAME, applyDeploymentName } from './manifest.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const publicDir = joinPath(here, 'public');
@@ -844,7 +844,7 @@ console.log('\nSays which deployment and which project a tab is:');
 {
   const h = bootClient();
   await settle();
-  check('an unnamed deployment keeps the title it shipped with', h.w.document.title === 'Claude', h.w.document.title);
+  check('an unnamed deployment keeps the title it shipped with', h.w.document.title === APP_NAME, h.w.document.title);
 
   h.hooks.openConversation({ cwd: DEMO, project: 'demo', sessionId: 'aaa', title: 'the one still running' });
   joinConversation(h.sockets[0], { sessionId: 'aaa' });
@@ -856,7 +856,7 @@ console.log('\nSays which deployment and which project a tab is:');
 
   h.$('#screen-chat [data-back]').click();
   await settle();
-  check('going back to the list restores the app’s own title', h.w.document.title === 'Claude', h.w.document.title);
+  check('going back to the list restores the app’s own title', h.w.document.title === APP_NAME, h.w.document.title);
   check('nothing threw', h.thrown.length === 0, h.thrown.join('; '));
   await finish(h);
 }
@@ -893,7 +893,7 @@ console.log('\nSays which deployment and which project a tab is:');
   h.$('#screen-chat [data-back]').click();
   await settle();
   check(
-    'with no project on screen the title names the deployment, not Claude',
+    'with no project on screen the title names the deployment, not the app',
     h.w.document.title === 'work',
     h.w.document.title,
   );

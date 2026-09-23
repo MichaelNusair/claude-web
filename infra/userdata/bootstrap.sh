@@ -243,7 +243,7 @@ install -d -o "$USER_NAME" -g "$USER_NAME" "$DATA_MNT/shell"
 # is diffed against stack.js (see AGENTS.md) and this value is not one of those:
 # it is substituted here, so adding one would only break that check.
 cat > /etc/claude-web-zshrc <<ZSHRCPATHS
-# Managed by claude-web's bootstrap.sh — rewritten on every deploy.
+# Managed by TripleC's bootstrap.sh — rewritten on every deploy.
 # Put your own settings in ~/.zshrc, below the line that sources this file.
 
 # History on the persistent volume: /home is on the root volume and does not
@@ -479,7 +479,20 @@ sudo -u "$USER_NAME" HOME="/home/$USER_NAME" \
     --install-extension "$EXT_VSIX"
 
 # Voice dictation companion extension (built and shipped by deploy.sh).
+#
+# The uninstall first is the rename to TripleC catching up with an extensions
+# directory on the persistent volume. An extension's identity is publisher.name,
+# both extensions changed publisher, and the volume outlives the instance — so
+# without this a replaced box restores the pre-rename copies and then installs the
+# new ones beside them. Nothing fails; the voice command simply registers twice.
 if [ -f /opt/claude-web/claude-voice.vsix ]; then
+  for old_id in claude-web.claude-voice claude-web.claude-mobile-shell; do
+    sudo -u "$USER_NAME" HOME="/home/$USER_NAME" \
+      /usr/bin/code-server \
+        --user-data-dir "$DATA_MNT/code-server-data" \
+        --extensions-dir "$DATA_MNT/code-server-ext" \
+        --uninstall-extension "$old_id" || true
+  done
   sudo -u "$USER_NAME" HOME="/home/$USER_NAME" \
     /usr/bin/code-server \
       --user-data-dir "$DATA_MNT/code-server-data" \
@@ -625,7 +638,7 @@ perms['defaultMode'] = permission_mode
 current['permissions'] = perms
 # Assigned, not setdefault: this file lives on the persistent data volume, so it
 # survives every deploy. setdefault meant the value written by the *first* deploy
-# won, and effortLevel in claude-web.config.json was silently ignored from then
+# won, and effortLevel in triplec.config.json was silently ignored from then
 # on — a box ran xhigh for three deploys that each reported shipping max. The
 # config is the authoritative answer, the same way defaultMode above is, so a
 # hand-edit here is reset by the next deploy rather than outliving it.

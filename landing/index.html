@@ -3,16 +3,16 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>claude-web — Claude Code on your phone, on your own AWS account</title>
-<meta name="description" content="Self-hosted Claude Code as an installable chat app, plus a full web IDE. One command to deploy into your own AWS account. Open source, MIT licensed.">
+<title>TripleC — Claude Code, in the cloud, on every device</title>
+<meta name="description" content="TripleC runs Claude Code on a machine of its own, so a session outlives the device that started it. MIT licensed to self-host, or managed by us — free while we are not charging.">
 <meta name="theme-color" content="#141413">
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="/style.css">
 
 <meta property="og:type" content="website">
-<meta property="og:title" content="claude-web — Claude Code on your phone, self-hosted">
-<meta property="og:description" content="An installable chat app for Claude Code, running on one EC2 instance in your own AWS account. Open source, MIT licensed.">
-<meta property="og:url" content="https://claude.strikelabs.tech/">
+<meta property="og:title" content="TripleC — Claude Code, in the cloud, on every device">
+<meta property="og:description" content="Sessions that live on a server instead of a laptop: start at a desk, carry on from a phone, and let a long job run while both are closed. Open source, or managed by us.">
+<meta property="og:url" content="https://triplec.host/">
 <meta name="twitter:card" content="summary_large_image">
 </head>
 <body>
@@ -20,69 +20,64 @@
 <a class="skip" href="#main">Skip to content</a>
 
 <header class="nav">
-  <span class="wordmark">claude<span class="dim">-web</span></span>
+  <span class="wordmark">Triple<span class="mark">C</span></span>
   <nav>
     <a href="#how">How it works</a>
+    <a href="#pricing">Pricing</a>
     <a href="#security">Security</a>
-    <a href="#start">Deploy</a>
-    <a class="ghost" href="https://github.com/MichaelNusair/claude-web">GitHub</a>
+    <a href="#start">Self-host</a>
+    <a class="ghost" href="https://github.com/MichaelNusair/triplec">GitHub</a>
   </nav>
 </header>
 
 <main id="main">
 
   <!-- ── Hero ────────────────────────────────────────────────────────── -->
-  <!-- data-section names each band for analytics.js, which reports which of them
-       a visitor actually stopped on. Renaming one renames it in the data. -->
+  <!-- data-section names each band for analytics.js, which reports which of them a
+       visitor actually stopped on. Renaming one renames it in the data. -->
   <section class="hero" data-section="hero">
     <div class="hero-copy">
-      <p class="eyebrow">Open source · MIT · Self-hosted</p>
-      <h1>Claude Code, on your phone.<br><span class="accent">On your own machine.</span></h1>
+      <p class="eyebrow">Open source · MIT · Self-host or managed</p>
+      <h1>Claude Code that doesn't<br><span class="accent">close when you do.</span></h1>
       <p class="lede">
-        Send a message from anywhere. Claude works on your actual repo — reads
-        files, runs tests, commits, opens PRs — and answers. The full VS Code
-        editor is still there when you sit down at a desk.
+        The session lives on a machine of its own, not in a terminal on your
+        laptop. Start something at a desk, follow it from a phone on the way out,
+        and let a long job finish while both are shut. The full VS Code editor is
+        there when you sit back down.
       </p>
 
       <div class="cta">
-        <!-- The visible text must match data-copy exactly: when the clipboard
-             API is unavailable the script selects this node instead, and an
-             abbreviated label would hand over a command that doesn't work. -->
-        <button class="copy" data-copy="git clone https://github.com/MichaelNusair/claude-web.git"
-                aria-label="Copy the git clone command">
-          <code>git clone https://github.com/MichaelNusair/claude-web.git</code>
-          <span class="copy-hint" aria-hidden="true">Copy</span>
-        </button>
-        <a class="btn" href="#start">Deploy it →</a>
+        <a class="btn primary" href="#pricing">Get it managed →</a>
+        <a class="btn" href="#start">Or self-host it</a>
       </div>
 
       <p class="fineprint">
-        Runs on one EC2 instance in your AWS account. Roughly $75/month, less if
-        you stop it when idle.
+        <strong>Three Cs: Claude, Code, Cloud.</strong> The cloud is the part
+        that's ours. Everything above it is Anthropic's CLI, running unmodified.
       </p>
     </div>
 
-    <!-- A drawn mockup rather than a screenshot: no image to go stale, and it
-         stays sharp at every size. -->
+    <!-- A drawn mockup rather than a screenshot: nothing to go stale, and it stays
+         sharp at every size. -->
     <div class="phone-wrap" aria-hidden="true">
       <div class="phone">
         <div class="phone-bar">
           <span class="back">‹</span>
-          <span class="phone-title">bare-metal<em>opus 5 · max</em></span>
+          <span class="phone-title">allocator<em>opus 5 · max</em></span>
           <span class="gear">⚙</span>
         </div>
         <div class="phone-thread">
-          <div class="bubble user">the allocator test is flaky on arm64 — figure out why and fix it</div>
+          <div class="bubble user">the allocator test is flaky on arm64 — find out why and fix it</div>
           <div class="tool">🔎 <span>Grep</span> <code>alignof|posix_memalign</code></div>
-          <div class="tool">📖 <span>Read</span> <code>src/allocator.c</code></div>
+          <div class="tool">📖 <span>Read</span> <code>src/arena.c</code></div>
           <div class="bubble claude">
             Found it. <code>align_up()</code> assumes 8-byte alignment, but
             <code>max_align_t</code> is 16 on aarch64 — so the guard page lands
-            mid-block and only trips when the arena starts odd.
+            mid-block, and it only trips when the arena starts odd.
           </div>
-          <div class="tool">✏️ <span>Edit</span> <code>src/allocator.c</code></div>
+          <div class="tool">✏️ <span>Edit</span> <code>src/arena.c</code></div>
           <div class="tool ok">✅ <span>Bash</span> <code>ctest --output-on-failure</code></div>
-          <div class="bubble claude">42 tests passing, 20 runs clean. Pushed to <code>fix/arm64-align</code>.</div>
+          <div class="bubble claude">42 passing, 20 runs clean. Pushed to <code>fix/arm64-align</code>.</div>
         </div>
         <div class="phone-composer">
           <span class="mic">🎙</span>
@@ -100,26 +95,106 @@
         <h3>It's the real CLI</h3>
         <p>
           Not a reimplementation. Each conversation is one long-lived
-          <code>claude</code> process, so context, working directory and session
-          id all persist — and a follow-up message costs no startup.
+          <code>claude</code> process, so context, working directory and session id
+          all persist — and a follow-up message costs no startup.
         </p>
       </div>
       <div class="card">
-        <h3>Your sessions follow you</h3>
+        <h3>One session, every device</h3>
         <p>
-          History lives on the server, not the device. Start something on a
-          laptop, pick it up on a phone mid-task. Lock your screen and the work
-          keeps running.
+          History and the process both live on the server. A laptop and a phone are
+          two windows onto the same conversation, mid-task, with no handoff step.
+          Lock the screen and the work carries on.
         </p>
       </div>
       <div class="card">
-        <h3>Your code never leaves</h3>
+        <h3>Your code stays put</h3>
         <p>
-          One instance, one persistent volume, your AWS account, your GitHub
-          token. Voice dictation transcribes on the box itself — audio never
-          goes anywhere.
+          One instance, one persistent volume, one GitHub token — in an account that
+          is yours if you self-host, and one customer's alone if we run it. Voice
+          dictation transcribes on the box itself.
         </p>
       </div>
+    </div>
+  </section>
+
+  <!-- ── Pricing / the two ways to run it ────────────────────────────── -->
+  <!-- The commercial half of an open-core project, and the part most likely to be
+       read uncharitably — so it says the awkward things itself: what is free, what
+       is not, who holds the keys, and that no money changes hands yet. -->
+  <section id="pricing" class="section" data-section="pricing">
+    <h2>Two ways to run it</h2>
+    <p class="section-lede">
+      Same code, same MIT licence, same repository. The difference is whose account
+      the machine boots in, and who gets paged when it doesn't.
+    </p>
+
+    <div class="grid-2">
+      <div class="card">
+        <p class="plan-eyebrow">Self-hosted</p>
+        <p class="price">Free<span>and not a trial</span></p>
+        <h3>You run it, in your own AWS account</h3>
+        <ul>
+          <li>All of it is in the repository. Nothing is held back, no feature is gated, there is no licence key to obtain.</li>
+          <li>You pay <strong>AWS</strong>, not us — roughly $75/month for the instance and load balancer left running, plus model usage.</li>
+          <li>Your account, your IAM, your volume, your token. We have no access to it and the app phones nothing home.</li>
+        </ul>
+        <div class="cta">
+          <a class="btn" href="#start">Deploy it yourself →</a>
+        </div>
+      </div>
+
+      <div class="card featured">
+        <p class="plan-eyebrow">Managed</p>
+        <p class="price">$0<span>today — usage-based later</span></p>
+        <h3>We run it, on a hostname of yours</h3>
+        <ul>
+          <li>We deploy an instance in <strong>our</strong> account, one per customer, and point your hostname at it.</li>
+          <li>Upgrades, TLS, backups and the 3am "why is it down" are ours.</li>
+          <li>You can leave with your data and self-host the same commit, because it is the same commit.</li>
+        </ul>
+
+        <!--
+          The signup. Two deliberate choices about what element this is.
+
+          A native <details>, so signup.js is not load-bearing: the browser opens
+          the panel on its own, and the script only reports that it happened. A
+          button that needed JavaScript to reveal the way to reach us would take
+          the one thing this section exists for away from anyone with a blocker on.
+
+          And not a <form>. The page has no field for a visitor to type into, which
+          is the premise session replay here is configured on — see the masking note
+          at the top of analytics.js. Keeping it true is worth more than collecting
+          an address one step earlier.
+        -->
+        <details class="signup" data-signup="managed">
+          <summary class="btn primary">I'm willing to pay by usage — start free</summary>
+          <div class="signup-done">
+            <p>
+              <strong>Noted — thank you.</strong> Provisioning is by hand while we
+              are this small, so the last step is yours: tell us the hostname you
+              want it on, and we'll send back a login.
+            </p>
+            <p class="signup-routes">
+              <a class="btn primary" href="mailto:hello@triplec.host?subject=TripleC%20managed&amp;body=I%27d%20like%20TripleC%20managed.%0A%0AHostname%20I%27d%20like%20it%20on%3A%0AWhat%20I%27ll%20use%20it%20for%3A%0A">Email us</a>
+              <a class="btn" href="https://github.com/MichaelNusair/triplec/issues/new?title=Managed%20signup&amp;body=I%27d%20like%20TripleC%20managed.%20%28This%20issue%20is%20public%20%E2%80%94%20leave%20out%20anything%20you%27d%20rather%20not%20publish.%29">Or open an issue</a>
+            </p>
+          </div>
+        </details>
+        <p class="signup-note">One click. No card, no form, nothing to cancel.</p>
+      </div>
+    </div>
+
+    <div class="warn plain-warn">
+      <p>
+        <strong>We are not charging anyone yet, and that button is not a
+        checkout.</strong> There is no card field, no invoice and no meter running.
+        Clicking it records that you would be willing to pay by usage once there is
+        something to pay; until then the managed service is free, and you can walk
+        away from it owing us nothing. When that changes you will be told first, in
+        advance, with the numbers — and self-hosting stays free regardless, because
+        it is the same MIT-licensed repository either way.
+      </p>
     </div>
   </section>
 
@@ -129,7 +204,8 @@
     <p class="section-lede">
       One EC2 instance behind a load balancer, with a persistent volume that
       survives instance replacement. No Kubernetes, no control plane, nothing to
-      operate.
+      operate. Managed is this same diagram in our account instead of yours — not a
+      different product.
     </p>
 
     <pre class="diagram"><code>your-domain.com
@@ -144,7 +220,7 @@
   ├── chat service
   │     ├── authenticates every request itself   ← the security boundary
   │     ├── one `claude` process per conversation, kept alive
-  │     └── whisper.cpp for voice, on-box, no API key
+  │     └── whisper.cpp for voice, on the box, no API key
   │
   └── /workspace  ← persistent EBS
         ├── projects/   one directory per repo
@@ -164,9 +240,9 @@
       <div class="card">
         <h3>Survives bad networks</h3>
         <p>
-          The server keeps the process alive when your phone locks or the signal
-          drops. Reattaching resumes the same conversation mid-task — including
-          work you started on another device.
+          The server keeps the process alive when a phone locks or the signal drops.
+          Reattaching resumes the same conversation mid-task — including work you
+          started on another device.
         </p>
       </div>
     </div>
@@ -178,20 +254,20 @@
 
     <div class="warn">
       <p>
-        <strong>This is a web page that runs shell commands on a machine you
-        own.</strong> That's the product, not a side effect. Anyone who logs in
-        has a shell. Deploy it as a personal workspace — not a shared service,
-        and not something you hand a password to a stranger for.
+        <strong>This is a web page that runs shell commands on a machine.</strong>
+        That's the product, not a side effect. Anyone who logs in has a shell.
+        Deploy it as one person's workspace — not a shared service, and not
+        something you hand a password to a stranger for.
       </p>
     </div>
 
     <p class="section-lede">
-      Because of that, authentication is enforced <em>inside the process that
-      spawns <code>claude</code></em> — never delegated to nginx or the load
-      balancer alone. That design comes from getting it wrong: an earlier version
-      of this project shipped with the chat API reachable without credentials,
-      because a proxy config described a gate that had never been written and
-      every document repeated the claim.
+      Which is why authentication is enforced <em>inside the process that spawns
+      <code>claude</code></em>, and never delegated to nginx or the load balancer
+      alone. That design comes from getting it wrong: an earlier version of this
+      project shipped with the chat API reachable without credentials, because a
+      proxy config described a gate that had never been written and every document
+      repeated the claim.
     </p>
 
     <div class="grid-2">
@@ -208,58 +284,68 @@
       <div class="card">
         <h3>Checked by machine, not by comment</h3>
         <ul>
-          <li>A test suite boots the real server and asserts every route and the WebSocket upgrade refuse an unauthenticated caller.</li>
+          <li>A test suite boots the real server and asserts that every route and the WebSocket upgrade refuse an unauthenticated caller.</li>
           <li>The deploy script runs it first and <strong>refuses to deploy</strong> on failure.</li>
           <li>After deploying, it curls the live URL and aborts if the API answers without a login.</li>
         </ul>
         <p class="muted">
-          The last time this was only checked by a comment, the comment was
-          wrong for months.
+          The last time this was checked only by a comment, the comment was wrong
+          for months.
         </p>
       </div>
     </div>
 
     <p class="more">
-      Full threat model, what it does and doesn't defend against, and how to cut
-      the blast radius:
-      <a href="https://github.com/MichaelNusair/claude-web/blob/main/docs/SECURITY.md">docs/SECURITY.md</a>.
+      Full threat model, what it does and doesn't defend against, and how to cut the
+      blast radius:
+      <a href="https://github.com/MichaelNusair/triplec/blob/main/docs/SECURITY.md">docs/SECURITY.md</a>.
+      What a managed instance means for the same questions:
+      <a href="https://github.com/MichaelNusair/triplec/blob/main/docs/MANAGED.md">docs/MANAGED.md</a>.
     </p>
   </section>
 
   <!-- ── Get started ─────────────────────────────────────────────────── -->
   <section id="start" class="section" data-section="start">
-    <h2>Deploy it</h2>
+    <h2>Self-host it</h2>
     <p class="section-lede">
-      You need an AWS account, a Route53 hosted zone you control, and Bedrock
-      model access enabled. About 20 minutes, most of it waiting for first boot.
+      You need an AWS account, a Route53 hosted zone you control, and Bedrock model
+      access enabled. About 20 minutes, most of it waiting for first boot.
     </p>
 
-    <pre class="shell"><code><span class="c">1 · clone</span>
-git clone https://github.com/MichaelNusair/claude-web.git
-cd claude-web
+    <div class="cta">
+      <!-- The visible text must match data-copy exactly: when the clipboard API is
+           unavailable the script selects this node instead, and an abbreviated
+           label would hand over a command that doesn't work. deploy-landing.sh
+           checks the two agree before uploading. -->
+      <button class="copy" data-copy="git clone https://github.com/MichaelNusair/triplec.git"
+              aria-label="Copy the git clone command">
+        <code>git clone https://github.com/MichaelNusair/triplec.git</code>
+        <span class="copy-hint" aria-hidden="true">Copy</span>
+      </button>
+    </div>
 
-<span class="c">2 · point it at your domain</span>
-cp claude-web.config.example.json claude-web.config.json
-$EDITOR claude-web.config.json     <span class="c"># domainName + hostedZoneName</span>
+    <pre class="shell"><code><span class="c">1 · point it at your domain</span>
+cp triplec.config.example.json triplec.config.json
+$EDITOR triplec.config.json        <span class="c"># domainName + hostedZoneName</span>
 
-<span class="c">3 · go</span>
+<span class="c">2 · go</span>
 ./deploy.sh</code></pre>
 
     <p class="section-lede">
-      It validates your config, runs the auth tests, deploys the stack, waits for
-      the instance, ships the app, then verifies the live URL requires a login.
+      It validates your config, runs the auth tests, deploys the stack, waits for the
+      instance, ships the app, then verifies that the live URL requires a login.
       Re-running it is safe and keeps your projects and history.
     </p>
 
     <div class="cta">
-      <a class="btn primary" href="https://github.com/MichaelNusair/claude-web">Get it on GitHub</a>
-      <a class="btn" href="https://github.com/MichaelNusair/claude-web/blob/main/docs/DEPLOY.md">Read the deploy guide</a>
+      <a class="btn primary" href="https://github.com/MichaelNusair/triplec">Get it on GitHub</a>
+      <a class="btn" href="https://github.com/MichaelNusair/triplec/blob/main/docs/DEPLOY.md">Read the deploy guide</a>
     </div>
 
     <p class="fineprint">
-      Bringing existing work across? <code>./migrate.sh</code> clones your repos
-      onto the volume and copies your local Claude Code history up, rewriting the
-      paths so past conversations stay resumable.
+      Bringing existing work across? <code>./migrate.sh</code> clones your repos onto
+      the volume and copies your local Claude Code history up, rewriting the paths so
+      past conversations stay resumable.
     </p>
   </section>
 
@@ -269,11 +355,11 @@ $EDITOR claude-web.config.json     <span class="c"># domainName + hostedZoneName
     <div class="grid-3">
       <div class="card plain">
         <h3>Multi-user</h3>
-        <p>One shared password, no per-user permissions, no audit of who did what. It's one person's workspace.</p>
+        <p>One shared password, no per-user permissions, no audit of who did what. It's one person's workspace — and a managed instance is one customer's.</p>
       </div>
       <div class="card plain">
-        <h3>Free</h3>
-        <p>Around $75/month left running, plus Bedrock usage. The load balancer bills whether or not the instance is up.</p>
+        <h3>Free of infrastructure</h3>
+        <p>Self-hosted, it's about $75/month of AWS left running, plus model usage. Managed, that bill is ours for now — which is exactly why "free" has a "for now" attached.</p>
       </div>
       <div class="card plain">
         <h3>Sandboxed</h3>
@@ -286,18 +372,20 @@ $EDITOR claude-web.config.json     <span class="c"># domainName + hostedZoneName
 
 <footer class="footer">
   <div>
-    <span class="wordmark">claude<span class="dim">-web</span></span>
-    <p class="muted">MIT licensed. Not affiliated with Anthropic.</p>
+    <span class="wordmark">Triple<span class="mark">C</span></span>
+    <p class="muted">MIT licensed. Claude and Claude Code are Anthropic's; TripleC is an independent project and not affiliated with Anthropic.</p>
   </div>
   <nav>
-    <a href="https://github.com/MichaelNusair/claude-web">Source</a>
-    <a href="https://github.com/MichaelNusair/claude-web/blob/main/docs/DEPLOY.md">Deploy</a>
-    <a href="https://github.com/MichaelNusair/claude-web/blob/main/docs/SECURITY.md">Security</a>
-    <a href="https://github.com/MichaelNusair/claude-web/issues">Issues</a>
+    <a href="https://github.com/MichaelNusair/triplec">Source</a>
+    <a href="https://github.com/MichaelNusair/triplec/blob/main/docs/DEPLOY.md">Deploy</a>
+    <a href="https://github.com/MichaelNusair/triplec/blob/main/docs/MANAGED.md">Managed</a>
+    <a href="https://github.com/MichaelNusair/triplec/blob/main/docs/SECURITY.md">Security</a>
+    <a href="https://github.com/MichaelNusair/triplec/issues">Issues</a>
   </nav>
 </footer>
 
 <script src="/copy.js" defer></script>
+<script src="/signup.js" defer></script>
 <script src="/analytics.js" defer></script>
 </body>
 </html>
