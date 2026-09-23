@@ -1689,6 +1689,16 @@ stack names. Two consequences an agent runs into:
   stale `/etc/claude-web-zshrc` that is still sourced is a silent one. They are
   invisible to anyone using the product, so the trade is not close. Comments and
   documents that name those paths are naming a real path and are correct as written.
+- **The checkout did move.** It is `/workspace/projects/triplec`, with
+  `/workspace/projects/claude-web` left behind as a symlink to it, because several
+  agent sessions and the conversations in them hold the old path as their working
+  directory. The symlink is not clutter: it is what stops a path that another
+  session is standing in from vanishing, and the project list does not double up
+  because `readdir(withFileTypes)` reports a symlink as not-a-directory — see
+  `listProjects` in chat-service/session-manager.js. The same trick is used for
+  Claude Code's own state: `~/.claude/projects/-workspace-projects-claude-web` is a
+  symlink onto the `-workspace-projects-triplec` directory, so one history and one
+  set of memories serve both spellings of the path.
 
 ## Things not to do
 
