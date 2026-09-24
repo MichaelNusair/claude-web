@@ -251,6 +251,14 @@ so the next dictation starts from nothing. The text it clears is offered back as
 Undo for a few seconds, because the button is one tap from the mic and what is in
 the box is often several minutes of speech.
 
+The editor overlay's Dictate sheet has the same control, for the same reason and
+with the same Undo — **Reset**, beside *Restart mic*. The two are deliberately
+different: Restart gives a recognizer that has stopped hearing you another go and
+keeps every word; Reset is for when the words themselves are the problem. Out there
+it also clears the draft the sheet recovers from, which is what makes dictation
+survive the workbench reloading itself, and is therefore the other thing that can
+hand you a paragraph you thought you had got rid of.
+
 ## Keeping the screen awake
 
 The phone's display sleeps on its idle timer, and this app is used in long

@@ -53,7 +53,7 @@
    *
    * Bump it when this file changes in a way anyone would look for.
    */
-  const OVERLAY_BUILD = '2026-09-24.1';
+  const OVERLAY_BUILD = '2026-09-24.2';
 
   // -------------------------------------------- survive a browser refresh
   /*
@@ -247,6 +247,18 @@
   .cmo-hint { color: #a3a099; font-size: 12.5px; margin: 10px 0 0; }
   .cmo-hint a { color: #d97757; }
   .cmo-status { color: #d97757; font-size: 13px; margin: 8px 0 0; min-height: 18px; }
+  /* Undo, offered in the status line after a reset rather than as a fifth button:
+     the row already wraps onto a second line on a phone, and this one is only
+     reachable for a few seconds after a tap that threw a paragraph away. */
+  .cmo-undo {
+    margin-left: 8px; padding: 3px 9px; border: 1px solid #55524c;
+    border-radius: 999px; background: transparent; color: #f5f4ef;
+    font: 600 12.5px inherit; cursor: pointer;
+  }
+  /* Room for the chip on its own line, kept after it goes: the offer expires on a
+     timer nobody is watching, and the row below must not climb 20px while a thumb
+     is already on its way down to Copy & close. */
+  .cmo-status.cmo-status-undo { min-height: 44px; }
   .cmo-item {
     display: block; width: 100%; text-align: left; padding: 14px 12px;
     background: none; border: none; border-bottom: 1px solid #34342f;
@@ -584,6 +596,22 @@
   let committedText = '';
   let liveText = '';
 
+  /*
+   * Which dictation the work in flight belongs to.
+   *
+   * Reset has to be able to say "nothing that was already running may write text
+   * into this box again", and three things here cannot be called back: an upload
+   * already at /api/transcribe, a cleanup pass already at /api/polish, and a
+   * getUserMedia permission prompt the user has not answered yet. Each of those
+   * continuations captures this counter on the way in and drops its result if the
+   * counter has moved since. Without it, a reset looks like it worked and then the
+   * old words reappear a second later — which is the bug this button exists for.
+   */
+  let dictationGeneration = 0;
+  // The fallback path's recorder and microphone, held so a reset can release them.
+  let activeRecorder = null;
+  let activeStream = null;
+
   /**
    * Append a phrase, dropping leading words that repeat the accumulated tail.
    *
@@ -623,6 +651,35 @@
       recognition = null;
     }
     document.getElementById('cmo-mic')?.classList.remove('cmo-rec');
+  }
+
+  /**
+   * Drop the fallback recorder and hand the microphone back.
+   *
+   * `recorder.stop()` alone is not enough for a reset: `onstop` is where the upload
+   * and the append live, so the handler is unhooked first — the point is to end the
+   * recording, not to transcribe it. The tracks are stopped explicitly because the
+   * recorder releasing its own reference does not turn off the phone's mic light.
+   */
+  function stopRecording() {
+    if (activeRecorder) {
+      try {
+        activeRecorder.ondataavailable = null;
+        activeRecorder.onstop = null;
+        if (activeRecorder.state !== 'inactive') activeRecorder.stop();
+      } catch {
+        /* already finished */
+      }
+      activeRecorder = null;
+    }
+    if (activeStream) {
+      try {
+        activeStream.getTracks().forEach((t) => t.stop());
+      } catch {
+        /* already ended */
+      }
+      activeStream = null;
+    }
   }
 
   /*
@@ -756,6 +813,80 @@
     }
   }
 
+  /*
+   * Start dictation over from nothing.
+   *
+   * The complaint this answers: dictation "remembers something", and clearing the
+   * box by hand and speaking again does not get rid of it. It cannot, because none
+   * of the state that puts the words back is in the box. It is `committedText`
+   * (which openDictation deliberately seeds from the saved draft so a reload does
+   * not lose a paragraph), `liveText`, the draft in localStorage, and whatever is
+   * still in flight to the server. So this releases the microphone, forgets all
+   * four, and leaves the mic off — "Restart mic" then starts from an empty box.
+   *
+   * It is its own button and not a long-press on the mic on purpose: it is reached
+   * when dictation is already not behaving, and the mic is the control that is
+   * already not doing what was expected. What it throws away is offered back as
+   * Undo for a few seconds, because a paragraph of speech exists nowhere else.
+   */
+  const RESET_UNDO_MS = 15000;
+  let resetUndo = null;
+  let resetUndoTimer = null;
+
+  function resetDictation(textarea, status) {
+    dictationGeneration += 1;
+    stopRecognition();
+    stopRecording();
+    committedText = '';
+    liveText = '';
+    clearDictation();
+
+    const wiped = textarea ? textarea.value : '';
+    if (textarea) {
+      textarea.value = '';
+      textarea.focus();
+    }
+
+    clearTimeout(resetUndoTimer);
+    resetUndo = wiped.trim() ? wiped : null;
+    if (!status) return;
+    status.textContent = wiped.trim()
+      ? 'Reset — mic released, transcript forgotten, box cleared.'
+      : 'Reset — mic released, nothing left to forget.';
+    if (!resetUndo) return;
+
+    const undo = document.createElement('button');
+    undo.type = 'button';
+    undo.className = 'cmo-undo';
+    undo.id = 'cmo-undo';
+    undo.textContent = 'Undo';
+    status.classList.add('cmo-status-undo');
+    status.appendChild(undo);
+    undo.addEventListener('click', () => {
+      if (resetUndo === null) return;
+      /*
+       * `committedText` as well as the box, because the recognizer rewrites the
+       * whole textarea from it on every result: restoring only what is on screen
+       * would put the words back and then have the next sentence spoken wipe them
+       * again. The mic stays off and the orphaned uploads stay orphaned — a reset
+       * cannot be taken back, only the text can.
+       */
+      if (textarea) {
+        textarea.value = resetUndo;
+        committedText = resetUndo;
+        saveDictation(textarea.value);
+        textarea.focus();
+      }
+      resetUndo = null;
+      clearTimeout(resetUndoTimer);
+      status.textContent = 'Text restored — tap Restart mic to carry on.';
+    });
+    resetUndoTimer = setTimeout(() => {
+      resetUndo = null;
+      undo.remove();
+    }, RESET_UNDO_MS);
+  }
+
   function openDictation() {
     // Restored into `committedText`, not just the textarea: that is what the
     // recognizer appends to, so dictation carries on from the recovered text
@@ -771,6 +902,8 @@
       <div class="cmo-row">
         <button class="cmo-action" id="cmo-copy">Copy &amp; close</button>
         <button class="cmo-action cmo-alt" id="cmo-again">Restart mic</button>
+        <button class="cmo-action cmo-alt" id="cmo-reset"
+                title="Release the mic, forget the transcript, clear the box">Reset</button>
         <button class="cmo-action cmo-alt" id="cmo-cancel">Cancel</button>
       </div>
       <p class="cmo-hint">Copy puts the text on the clipboard — long-press Claude's
@@ -791,11 +924,19 @@
       clearDictation();
       closeSheet();
     });
+    // Restart keeps the words and gives the recognizer another go — the fix for a
+    // session that has stopped hearing anything. Reset, below, is the other half:
+    // the words are the problem.
     panel.querySelector('#cmo-again').addEventListener('click', () => {
       stopRecognition();
+      stopRecording();
       startDictation(textarea, status);
     });
+    panel.querySelector('#cmo-reset').addEventListener('click', () => {
+      resetDictation(textarea, status);
+    });
     panel.querySelector('#cmo-copy').addEventListener('click', async () => {
+      const gen = dictationGeneration;
       const raw = textarea.value.trim();
       if (!raw) return closeSheet();
 
@@ -817,6 +958,11 @@
       status.textContent = 'Copied — paste into Claude.';
 
       const cleaned = await polishText(raw);
+      // Reset while the cleanup pass was out. The clipboard already has the raw
+      // text and that is the user's, but the box has been deliberately emptied —
+      // putting a punctuated version of the old dictation back into it is exactly
+      // the "it remembers something" the reset was tapped to stop.
+      if (gen !== dictationGeneration) return;
       if (cleaned && cleaned !== raw) {
         // Shown as well as copied: the user is about to paste it, and finding
         // something they did not see arrive in Claude's input is worse than a
@@ -882,6 +1028,9 @@
      * when a session actually ends.
      */
     rec.onresult = (event) => {
+      // A stopped recognizer can still deliver one more result. After a reset that
+      // is a whole phrase landing in a box that was just emptied.
+      if (recognition !== rec) return;
       let sessionFinal = '';
       let interim = '';
       for (let i = 0; i < event.results.length; i++) {
@@ -899,6 +1048,7 @@
     };
 
     rec.onerror = (event) => {
+      if (recognition !== rec) return;
       if (event.error === 'no-speech' || event.error === 'aborted') return;
       if (event.error === 'not-allowed' || event.error === 'service-not-allowed') {
         status.textContent = 'Microphone permission denied.';
@@ -940,6 +1090,7 @@
 
   /** Fallback: record audio and transcribe on the server (whisper.cpp). */
   async function recordAndTranscribe(textarea, status) {
+    const gen = dictationGeneration;
     let stream;
     try {
       stream = await navigator.mediaDevices.getUserMedia({
@@ -949,15 +1100,28 @@
       status.textContent = `Microphone blocked: ${err.message}`;
       return;
     }
+    // The permission prompt is modal and answered by a human, so a reset can land
+    // while it is on screen. Hand the microphone straight back rather than opening
+    // a recording nobody asked for.
+    if (gen !== dictationGeneration) {
+      stream.getTracks().forEach((t) => t.stop());
+      return;
+    }
 
     const chunks = [];
     const types = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4'];
     const mimeType = types.find((t) => MediaRecorder.isTypeSupported(t)) || '';
     const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
     recorder.ondataavailable = (e) => e.data.size > 0 && chunks.push(e.data);
+    activeRecorder = recorder;
+    activeStream = stream;
 
     recorder.onstop = async () => {
       stream.getTracks().forEach((t) => t.stop());
+      if (activeRecorder === recorder) {
+        activeRecorder = null;
+        activeStream = null;
+      }
       status.textContent = 'Transcribing…';
       try {
         const wav = await toWav(new Blob(chunks, { type: recorder.mimeType }));
@@ -972,9 +1136,14 @@
         }
         const data = await res.json();
         if (!res.ok) throw new Error(data.error || 'transcription failed');
+        // An upload cannot be recalled, so the reset's only defence is to refuse
+        // its answer. This is the continuation that made a reset look temporary:
+        // the box emptied, and a sentence arrived in it seconds later.
+        if (gen !== dictationGeneration) return;
         textarea.value = (textarea.value ? textarea.value + ' ' : '') + data.text;
         status.textContent = 'Transcribed.';
       } catch (err) {
+        if (gen !== dictationGeneration) return;
         status.textContent = err.message;
       }
     };

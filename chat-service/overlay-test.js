@@ -3394,6 +3394,421 @@ ok('a tap beside the sheet no longer dismisses it', !sheet.classList.contains('c
   );
 }
 
+// --------------------------------------------- starting dictation over from nothing
+/*
+ * The reported bug: dictation "remembers something", and clearing the box by hand and
+ * speaking again does not get rid of it. It cannot — none of the state that puts the
+ * words back is in the box. It is `committedText` (seeded from the saved draft, so a
+ * reload does not lose a paragraph), the draft itself, and whatever is already on its
+ * way to the server. So Reset has to reach all of them, and the three things below
+ * are the ones a user cannot do for themselves: a phrase the recognizer delivers
+ * after the tap, an upload that cannot be recalled, and a microphone whose permission
+ * prompt is still on screen.
+ *
+ * Its own window, like the talk section: this one has a speech recognizer and a
+ * microphone, and those have to be in place before `w.eval` rather than swapped in
+ * afterwards.
+ */
+{
+  function bootDictation(options = {}) {
+    const state = {
+      transcript: 'the sentence the server sent back',
+      holdMic: false,
+      releaseMic: null,
+      holdTranscribe: false,
+      releaseTranscribe: null,
+      polish: null,
+      holdPolish: false,
+      releasePolish: null,
+    };
+
+    const quiet = new VirtualConsole();
+    quiet.on('jsdomError', () => {});
+    for (const level of ['error', 'warn', 'log', 'info', 'debug']) {
+      quiet.on(level, (m) => {
+        if (level === 'error') fail(`console error in the dictation boot: ${m}`);
+      });
+    }
+    const dom2 = new JSDOM('<!doctype html><html><head></head><body></body></html>', {
+      runScripts: 'outside-only',
+      url: 'https://claude.example.com/editor/?folder=%2Fworkspace%2Fprojects%2Fdemo',
+      virtualConsole: quiet,
+    });
+    const win = dom2.window;
+    win.addEventListener('error', (e) => fail(`uncaught in the dictation boot: ${e.message}`));
+
+    const copies = [];
+    const mics = [];
+    const recorders = [];
+    const recognizers = [];
+    const uploads = [];
+
+    win.fetch = (url, init = {}) => {
+      const target = String(url);
+      if (target.includes('/api/transcribe')) {
+        uploads.push(target);
+        const answer = {
+          ok: true,
+          status: 200,
+          text: () => Promise.resolve(state.transcript),
+          json: () => Promise.resolve({ text: state.transcript }),
+        };
+        if (state.holdTranscribe) {
+          return new Promise((resolve) => {
+            state.releaseTranscribe = () => resolve(answer);
+          });
+        }
+        return Promise.resolve(answer);
+      }
+      if (target.includes('/api/polish')) {
+        const answer = state.polish
+          ? {
+            ok: true,
+            status: 200,
+            text: () => Promise.resolve(''),
+            json: () => Promise.resolve(state.polish),
+          }
+          : { ok: false, status: 503, text: () => Promise.resolve(''), json: () => Promise.resolve({}) };
+        if (state.holdPolish) {
+          return new Promise((resolve) => {
+            state.releasePolish = () => resolve(answer);
+          });
+        }
+        return Promise.resolve(answer);
+      }
+      // Everything else on this page — the project list, the status poll — is
+      // someone else's section. Unreachable is a state the overlay survives.
+      return Promise.resolve({
+        ok: false,
+        status: 503,
+        text: () => Promise.resolve(''),
+        json: () => Promise.resolve({}),
+      });
+    };
+
+    /*
+     * A recognizer that can be told to deliver a phrase, and asked afterwards whether
+     * it was stopped. Both halves matter: the stop is the microphone being handed
+     * back, and delivering a phrase to a stopped recognizer is the case that made a
+     * reset look temporary.
+     */
+    win.SpeechRecognition = class FakeRecognition {
+      constructor() {
+        this.started = 0;
+        this.stopped = 0;
+        recognizers.push(this);
+      }
+      start() {
+        this.started += 1;
+      }
+      stop() {
+        this.stopped += 1;
+      }
+      /** Deliver one phrase, final or interim, shaped the way a browser shapes it. */
+      say(text, isFinal = true) {
+        const alternatives = [{ transcript: text }];
+        alternatives.isFinal = isFinal;
+        this.onresult?.({ results: [alternatives] });
+      }
+      /**
+       * End the session, which mobile Safari does on every brief pause. This is
+       * what moves a phrase out of the live session and into `committedText` — the
+       * state a user cannot see, cannot clear, and finds under the next dictation.
+       */
+      end() {
+        this.onend?.();
+      }
+    };
+
+    Object.defineProperty(win.navigator, 'mediaDevices', {
+      configurable: true,
+      value: {
+        getUserMedia: () => {
+          const track = { kind: 'audio', stopped: 0, stop() { this.stopped += 1; } };
+          const stream = { tracks: [track], getTracks: () => [track] };
+          mics.push(stream);
+          if (state.holdMic) {
+            return new Promise((resolve) => {
+              state.releaseMic = () => resolve(stream);
+            });
+          }
+          return Promise.resolve(stream);
+        },
+      },
+    });
+
+    win.MediaRecorder = class FakeRecorder {
+      static isTypeSupported() {
+        return true;
+      }
+      constructor(stream) {
+        this.stream = stream;
+        this.state = 'inactive';
+        this.mimeType = 'audio/webm';
+        recorders.push(this);
+      }
+      start() {
+        this.state = 'recording';
+      }
+      stop() {
+        this.state = 'inactive';
+        this.ondataavailable?.({ data: { size: 4 } });
+        this.onstop?.();
+      }
+    };
+
+    // Enough of an audio pipeline for toWav: the bytes are never looked at, only
+    // whether the upload happens and what is done with the answer.
+    win.AudioContext = class FakeAudioContext {
+      decodeAudioData() {
+        return Promise.resolve({ duration: 0.01 });
+      }
+      close() {}
+    };
+    win.OfflineAudioContext = class FakeOffline {
+      constructor(channels, length) {
+        this.length = length;
+      }
+      createBufferSource() {
+        return { buffer: null, connect() {}, start() {} };
+      }
+      startRendering() {
+        return Promise.resolve({ getChannelData: () => new Float32Array(this.length) });
+      }
+    };
+
+    Object.defineProperty(win.navigator, 'clipboard', {
+      configurable: true,
+      value: { writeText: (text) => { copies.push(String(text)); return Promise.resolve(); } },
+    });
+
+    if (options.speech === false) delete win.SpeechRecognition;
+
+    try {
+      win.eval(overlayJs);
+    } catch (err) {
+      fail(`mobile-overlay.js threw in the dictation boot — ${err.message}`);
+    }
+
+    const doc2 = win.document;
+    const tap = (id) =>
+      doc2.getElementById(id)?.dispatchEvent(new win.MouseEvent('click', { bubbles: true }));
+
+    return {
+      win,
+      doc: doc2,
+      state,
+      copies,
+      mics,
+      recorders,
+      recognizers,
+      uploads,
+      tap,
+      box: () => doc2.getElementById('cmo-text'),
+      value: () => doc2.getElementById('cmo-text')?.value ?? null,
+      // Scoped to the panel: the FAB has a `#cmo-status` button of its own, and
+      // getElementById answers with whichever came first — which is the button.
+      status: () => doc2.querySelector('#cmo-panel #cmo-status')?.textContent ?? '',
+      live: () => doc2.getElementById('cmo-mic')?.classList.contains('cmo-rec'),
+      open: () => doc2.getElementById('cmo-sheet')?.classList.contains('cmo-open'),
+      draft: () => {
+        try {
+          return JSON.parse(win.localStorage.getItem('cmo-dictation-draft') || 'null')?.text || '';
+        } catch {
+          return '';
+        }
+      },
+      /** Dismiss the sheet the way a tap beside it does — which keeps the draft. */
+      dismiss: () =>
+        doc2
+          .getElementById('cmo-sheet')
+          .dispatchEvent(new win.MouseEvent('click', { bubbles: true })),
+    };
+  }
+
+  // ------------------------------------------------ is the control there at all
+  const d = bootDictation();
+  await settle(40);
+  d.tap('cmo-mic');
+  ok('the mic button did not open a dictation sheet in the boot with a recognizer', d.box());
+  ok(
+    'the dictation sheet offers no way to start over — the reported bug is that ' +
+      'clearing the box by hand does not, and that is the only tool the user has',
+    d.doc.getElementById('cmo-reset'),
+  );
+  ok('opening the sheet did not start the microphone', d.live() && d.recognizers.length === 1);
+
+  // ----------------------------------------- what a reset actually has to reach
+  const spoken = 'the sentence nobody wants to see again';
+  d.recognizers[0].say(spoken);
+  ok(`the recognizer's phrase did not reach the box: ${d.value()}`, d.value() === spoken);
+  // The pause that ends the session and commits the phrase, which is the state the
+  // bug report is about: it is not in the box, so emptying the box does not touch it.
+  d.recognizers[0].end();
+  await settle(500); // the draft write is debounced
+  ok('a dictated phrase left no draft, so this test is not proving anything yet',
+    d.draft() === spoken);
+
+  d.tap('cmo-reset');
+  ok('Reset left the dictated text in the box', d.value() === '');
+  ok('Reset left the draft in storage — it comes back on the next tap', d.draft() === '');
+  ok('Reset did not stop the recognizer, so the microphone is still live',
+    d.recognizers[0].stopped > 0);
+  ok('Reset left the mic button showing a live microphone', !d.live());
+  ok(`Reset said nothing about what it had done: ${d.status()}`, /reset/i.test(d.status()));
+
+  // The first of the three a user cannot do for themselves: a stopped recognizer
+  // still delivers what it had heard.
+  d.recognizers[0].say('a phrase that arrived after the tap');
+  ok(
+    `a phrase delivered after the reset landed in the box anyway: ${d.value()} — this ` +
+      'is exactly the "it remembers something" the button is for',
+    d.value() === '',
+  );
+
+  // And the draft is what survives a reload, so it must not come back either.
+  await settle(500);
+  ok('the phrase that arrived after the reset was written to the draft', d.draft() === '');
+
+  // Starting the mic again has to start from nothing. `committedText` is what the
+  // recognizer prepends to every result, so a reset that leaves it holding the old
+  // paragraph puts the whole thing back on the first word spoken.
+  d.tap('cmo-again');
+  d.recognizers[d.recognizers.length - 1].say('starting again from nothing');
+  ok(
+    `dictating after a reset brought the old text back with it: ${d.value()}`,
+    d.value() === 'starting again from nothing',
+  );
+  d.tap('cmo-reset');
+  d.dismiss();
+  d.tap('cmo-mic');
+  ok(
+    `reopening the sheet after a reset recovered the old words: ${d.value()}`,
+    d.value() === '',
+  );
+
+  // ---------------------------------------------------------- putting it back
+  {
+    const u = bootDictation();
+    await settle(40);
+    u.tap('cmo-mic');
+    const words = 'a paragraph that took two minutes to say';
+    u.recognizers[0].say(words);
+    u.recognizers[0].end();
+    u.tap('cmo-reset');
+    ok(
+      'a reset that threw away a paragraph of speech offered no way back, one tap ' +
+        'from Copy & close',
+      u.doc.getElementById('cmo-undo'),
+    );
+    u.tap('cmo-undo');
+    ok(`Undo did not put the text back: ${u.value()}`, u.value() === words);
+    await settle(500);
+    ok('the restored text was not written down, so a reload loses it', u.draft() === words);
+
+    // Restart mic has to carry on from the restored text. The recognizer rewrites the
+    // whole box from `committedText` on every result, so an Undo that restores only
+    // what is on screen has the next sentence wipe it again.
+    u.tap('cmo-again');
+    u.recognizers[u.recognizers.length - 1].say('and one more sentence');
+    ok(
+      `speaking after Undo replaced the restored text instead of continuing it: ${u.value()}`,
+      u.value() === `${words} and one more sentence`,
+    );
+  }
+
+  // --------------------------------------- an upload that cannot be called back
+  {
+    // No recognizer, so dictation falls to recording and transcribing on the server.
+    const r = bootDictation({ speech: false });
+    await settle(40);
+    r.tap('cmo-mic');
+    await settle(40);
+    ok('the fallback path never opened a microphone', r.mics.length === 1);
+    ok('the fallback path never started recording', r.recorders.length === 1);
+
+    // Mid-recording, which is when the mic light is on and the button is reached for.
+    r.tap('cmo-reset');
+    await settle(40);
+    ok(
+      'Reset left the recorder running — the phone is still listening and the words go ' +
+        'on accumulating',
+      r.recorders[0].state === 'inactive',
+    );
+    ok(
+      'Reset stopped the recorder but not the microphone, so the mic light stays on',
+      r.mics[0].tracks.every((t) => t.stopped > 0),
+    );
+    ok(
+      'Reset uploaded the recording it was told to throw away',
+      r.uploads.length === 0,
+    );
+
+    // And the one that cannot be called back: an upload already on the network.
+    const u2 = bootDictation({ speech: false });
+    await settle(40);
+    u2.tap('cmo-mic');
+    await settle(40);
+    u2.state.holdTranscribe = true;
+    u2.recorders[0].stop();
+    await settle(60);
+    ok('the recording was never uploaded, so this proves nothing', u2.uploads.length === 1);
+
+    u2.tap('cmo-reset');
+    u2.state.releaseTranscribe();
+    await settle(60);
+    ok(
+      `a transcription that arrived after the reset landed in the box: ${u2.value()} — a ` +
+        'reset that undoes itself a second later is the bug, not the fix',
+      u2.value() === '',
+    );
+  }
+
+  // ------------------------------- a permission prompt still waiting on an answer
+  {
+    const p = bootDictation({ speech: false });
+    await settle(40);
+    p.state.holdMic = true;
+    p.tap('cmo-mic');
+    await settle(40);
+    ok('the held microphone request never happened', p.mics.length === 1 && !p.recorders.length);
+    p.tap('cmo-reset');
+    p.state.releaseMic();
+    await settle(60);
+    ok(
+      'a microphone granted after the reset was kept and recorded from — the prompt is ' +
+        'modal and answered by a human, so this is the ordinary case, not a race',
+      p.mics[0].tracks.every((t) => t.stopped > 0) && p.recorders.length === 0,
+    );
+  }
+
+  // -------------------------------------- a cleanup pass still out on the network
+  {
+    const c = bootDictation();
+    await settle(40);
+    c.tap('cmo-mic');
+    const raw = 'the transcript nobody punctuated';
+    c.recognizers[0].say(raw);
+    c.state.polish = { text: 'The transcript nobody punctuated.', changed: true };
+    c.state.holdPolish = true;
+    c.tap('cmo-copy');
+    await settle(40);
+    ok('Copy did not put the raw text on the clipboard inside the tap', c.copies[0] === raw);
+
+    c.tap('cmo-reset');
+    c.state.releasePolish();
+    await settle(60);
+    ok(
+      `a punctuated version of the old dictation was written back after the reset: ${c.value()}`,
+      c.value() === '',
+    );
+    ok(
+      'the sheet closed itself on the back of a copy the user had already reset away',
+      c.open(),
+    );
+  }
+}
+
 // ------------------------------------------ talking a message over out loud
 /*
  * A spoken conversation about the message on the sheet — the editor's half of what
