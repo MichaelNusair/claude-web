@@ -209,6 +209,23 @@
   }
   .cmo-title { font-size: 13px; text-transform: uppercase; letter-spacing: .06em;
     color: #a3a099; margin: 0 0 10px; }
+  /*
+   * Selectable, which nothing on this overlay is by default.
+   *
+   * The workbench sets user-select: none on its own body — reasonable for an editor, where
+   * a drag across the sidebar should not highlight it — and this overlay is appended
+   * to that body, so every block on it inherits the rule. The symptom is that a
+   * long-press or a drag over Claude's answer selects nothing at all and there is no
+   * way to take a line out of it, which is what these sheets are mostly read for.
+   *
+   * Only the blocks that hold text worth keeping say so. The bar, the chip and the
+   * buttons stay unselectable: they live under a thumb, and a long-press that
+   * highlights a button label instead of pressing it is the reason the workbench
+   * turned this off in the first place.
+   */
+  .cmo-said, .cmo-ask-block, .cmo-first, .cmo-talk-line {
+    -webkit-user-select: text; user-select: text;
+  }
   #cmo-text {
     width: 100%; box-sizing: border-box; min-height: 108px;
     background: #272725; color: #f5f4ef;
@@ -399,8 +416,6 @@
     background: #272725; color: #d7d4cc;
     font: 13.5px/1.5 inherit; white-space: pre-wrap; overflow-wrap: anywhere;
     max-height: 26vh; overflow-y: auto;
-    /* Long-press to select is the fallback when the clipboard is refused. */
-    -webkit-user-select: text; user-select: text;
   }
   /*
    * What the spoken conversation is not — the one line on that sheet that must not be
@@ -489,8 +504,32 @@
 
   const panel = sheet.querySelector('#cmo-panel');
   sheet.addEventListener('click', (e) => {
-    if (e.target === sheet) closeSheet();
+    if (e.target !== sheet) return;
+    /*
+     * A drag that selects text in the panel and finishes past its edge arrives here
+     * as a click on the *backdrop* — the two ends of it share no closer ancestor —
+     * and closing on it throws away the selection the drag just made, which is the
+     * one thing the drag was for. A plain tap beside the sheet still dismisses it:
+     * a pointer going down outside a selection collapses it before this fires.
+     */
+    if (selectionInPanel()) return;
+    closeSheet();
   });
+
+  /**
+   * Is somebody part-way through selecting something on the sheet?
+   *
+   * Asked before anything dismisses or redraws it. A redraw replaces the nodes the
+   * selection points at, so the selection goes with them — and this sheet redraws
+   * itself every few seconds while it follows a turn, which is exactly when someone
+   * is reading the answer they want a line out of.
+   */
+  function selectionInPanel() {
+    const selection = window.getSelection?.();
+    if (!selection || selection.isCollapsed) return false;
+    // `contains(null)` is false, which is the answer for a selection with no anchor.
+    return panel.contains(selection.anchorNode) || panel.contains(selection.focusNode);
+  }
 
   /*
    * Which sheet is on screen, counted rather than named.
@@ -2164,6 +2203,13 @@
     if (Date.now() >= sheetFollowUntil) {
       // Redrawn rather than just going still, because the sheet says in words
       // that it is refreshing itself, and that has just stopped being true.
+      // Not over a live selection, though: a sheet whose last line is out of date
+      // is a smaller loss than text somebody was halfway through copying, so this
+      // keeps looking until the selection is let go.
+      if (selectionInPanel()) {
+        sheetPollTimer = setTimeout(pollStatusSheet, SHEET_POLL_MS);
+        return;
+      }
       openStatus({ auto: true });
       return;
     }
@@ -2207,6 +2253,14 @@
     const before = sheetShown;
     const text = status.last?.text || '';
     if (before && before.state === status.state && before.text === text) return;
+    /*
+     * Held while a selection is live. `sheetShown` is deliberately left alone, so
+     * the next look finds the same change still unshown and draws it — and speaks it
+     * — the moment the selection is let go. Nothing is lost but a few seconds, and
+     * what it buys is that copying an answer cannot be interrupted by the sheet
+     * updating underneath it.
+     */
+    if (selectionInPanel()) return;
 
     const said =
       Boolean(text) && Boolean(before) && text !== before.text && status.sessionId === before.sessionId;
@@ -2725,9 +2779,13 @@
           speaking ? 'Stop' : 'Read aloud'
         }</button>` : ''}
         ${canTalk ? '<button class="cmo-action cmo-alt" id="cmo-talk">\u{1F4AC} Talk it over</button>' : ''}
+        ${said ? '<button class="cmo-action cmo-alt" id="cmo-said-copy">Copy</button>' : ''}
         <button class="cmo-action cmo-alt" id="cmo-status-refresh">Refresh</button>
         <button class="cmo-action cmo-alt" id="cmo-status-close">Close</button>
       </div>
+      <!-- Always drawn when there is a Copy, empty until it is pressed: .cmo-status
+           reserves its line, so nothing below moves out from under a thumb. -->
+      ${said ? '<p class="cmo-status" id="cmo-said-copy-note"></p>' : ''}
       ${canSpeak && serverVoiceReady() ? `
         <label class="cmo-voice">Voice
           <select id="cmo-voice" aria-label="Which voice reads the message"></select>
@@ -2810,6 +2868,35 @@
     panel.querySelector('#cmo-notify')?.addEventListener('click', toggleNotify);
     paintAsk(s);
     paintFirstPrompt(s.sessionId);
+
+    /*
+     * The answer, on the clipboard.
+     *
+     * Selecting it by hand works now, but not well here: the message scrolls inside
+     * its own box, and a drag through a scrollable block on a phone scrolls it rather
+     * than extending the selection. So the whole message gets a button, the way the
+     * opening prompt below already has one.
+     *
+     * The markdown, not the rendering. What an answer is copied *into* — a commit
+     * message, a reply, an issue — is text, and the asterisks, backticks and fences
+     * are the part that survives the trip.
+     *
+     * This one does not close the sheet, unlike the prompt's Copy: that text is on its
+     * way into Claude's input, which is behind the sheet, and this text is on its way
+     * out of this machine entirely.
+     */
+    panel.querySelector('#cmo-said-copy')?.addEventListener('click', async () => {
+      const note = panel.querySelector('#cmo-said-copy-note');
+      // The write is the first thing the tap does — iOS refuses a clipboard write
+      // issued after an `await`, the same rule the other two Copy buttons follow.
+      if (!(await copyText(said))) {
+        // Refused: leave the message selected so the platform's own Copy can take it.
+        selectText(saidEl);
+        if (note) note.textContent = 'Press Copy on the selection.';
+        return;
+      }
+      if (note) note.textContent = 'Copied — the message as Claude wrote it, markdown and all.';
+    });
 
     // Ask again, in place. The heartbeat is fifteen seconds and someone reading
     // this sheet has a more specific question than that.

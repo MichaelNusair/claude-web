@@ -3103,6 +3103,129 @@ ok(
 doc.getElementById('cmo-status-close')?.dispatchEvent(new w.MouseEvent('click', { bubbles: true }));
 await settle(30);
 
+// -------------------------------------------- taking the answer off the sheet
+/*
+ * Selecting and copying what Claude said.
+ *
+ * Reading is not all anybody does with an answer: a line of it goes into a commit
+ * message, a path out of it goes into a terminal. None of that was possible here. The
+ * overlay is appended to the workbench's `<body>`, which sets `user-select: none` —
+ * reasonable for an editor, where a drag across the sidebar should not highlight it —
+ * and inherited by every block on the sheet, so a long-press over the message selected
+ * nothing at all.
+ *
+ * jsdom does not inherit `user-select` down the tree, so the first check is that the
+ * block declares itself selectable, not that a selection would work in a browser. That
+ * declaration is the thing that regresses: it is one line, it has no visible effect
+ * until somebody tries to copy something, and it was missing for as long as this sheet
+ * existed.
+ */
+firstPromptReply = null;
+// Markdown, because the markdown is what goes on the clipboard: an answer is copied
+// into something that is itself text, and the fence is the part that survives.
+const takeaway = 'Shipped **it**.\n\n```sh\ngit push origin main\n```';
+const takeawayEl = await openFresh(takeaway);
+/** Select the message, as a long-press or a drag through it does. */
+const selectMessage = () => {
+  const range = doc.createRange();
+  range.selectNodeContents(saidEl());
+  const selection = w.getSelection();
+  selection.removeAllRanges();
+  selection.addRange(range);
+};
+ok(
+  'the message block does not declare itself selectable, so it inherits the workbench’s ' +
+    'body { user-select: none } and no part of an answer can be selected or copied',
+  w.getComputedStyle(takeawayEl).userSelect === 'text',
+);
+
+copied.length = 0;
+const copyNote = () => doc.getElementById('cmo-said-copy-note')?.textContent ?? '';
+// Optional, so a missing button is this failure rather than a crash that takes the
+// rest of the run with it.
+doc.getElementById('cmo-said-copy')?.dispatchEvent(new w.MouseEvent('click', { bubbles: true }));
+await settle(30);
+ok(
+  `Copy put something other than the message Claude wrote on the clipboard: ${JSON.stringify(copied)}`,
+  copied.length === 1 && copied[0] === takeaway,
+);
+ok('Copy did not say it had copied anything', /copied/i.test(copyNote()));
+/*
+ * And it leaves the sheet up, where the opening prompt's Copy closes it. The
+ * difference is where the text is going: a prompt is on its way into Claude's input,
+ * which is behind this sheet, and an answer is on its way out of this machine
+ * entirely — closing then hides the rest of the message being quoted from.
+ */
+await settle(1200);
+ok(
+  'Copy closed the sheet, taking the message away from whoever was quoting from it',
+  sheet.classList.contains('cmo-open'),
+);
+
+/*
+ * A refused clipboard, which is iOS's ordinary behaviour outside a gesture it likes:
+ * the fallback is to leave the message selected so the platform's own Copy can take
+ * it, and to say so. Silence here is the failure — the tap looks like it worked.
+ */
+Object.defineProperty(w.navigator, 'clipboard', {
+  configurable: true,
+  value: { writeText: () => Promise.reject(new Error('refused')) },
+});
+doc.getElementById('cmo-said-copy')?.dispatchEvent(new w.MouseEvent('click', { bubbles: true }));
+await settle(30);
+ok('a refused clipboard write left the sheet claiming it had copied the message', /press copy/i.test(copyNote()));
+ok(
+  'a refused clipboard write left nothing selected, so the platform’s own Copy has ' +
+    'nothing to take',
+  String(w.getSelection() ?? '').includes('git push origin main'),
+);
+Object.defineProperty(w.navigator, 'clipboard', {
+  configurable: true,
+  value: { writeText: (text) => { copied.push(String(text)); return Promise.resolve(); } },
+});
+
+/*
+ * The other half of being able to copy something: the sheet must not pull it out from
+ * under you. This sheet redraws itself every five seconds while it follows a turn, and
+ * a redraw replaces the nodes a selection points at, so a message arriving mid-select
+ * used to end the select. Holding the redraw costs a few seconds of staleness; the
+ * change is not dropped, it is drawn as soon as the selection is let go.
+ */
+const held = 'A second answer, which must wait its turn.';
+selectMessage();
+statusReply = answer(held);
+await settle(6000);
+ok(
+  'a redraw while the message was selected threw the selection away',
+  /git push origin main/.test(saidEl()?.textContent ?? ''),
+);
+w.getSelection()?.removeAllRanges();
+await settle(6000);
+ok(
+  `the change never arrived once the selection was let go: ${JSON.stringify(saidEl()?.textContent)}`,
+  (saidEl()?.textContent ?? '').includes(held),
+);
+
+/*
+ * And the dismissal, for the same reason. A drag that starts in the panel and finishes
+ * past its edge lands as a click on the backdrop, which is the gesture that closes the
+ * sheet — so selecting the last line of a message closed the sheet and lost it.
+ */
+selectMessage();
+sheet.dispatchEvent(new w.MouseEvent('click', { bubbles: true }));
+await settle(30);
+ok(
+  'a drag that finished outside the panel closed the sheet and threw away the selection ' +
+    'it had just made',
+  sheet.classList.contains('cmo-open'),
+);
+// A plain tap beside the sheet still dismisses it: in a browser the pointer going down
+// collapses the selection before the click, which is what this does by hand.
+w.getSelection()?.removeAllRanges();
+sheet.dispatchEvent(new w.MouseEvent('click', { bubbles: true }));
+await settle(30);
+ok('a tap beside the sheet no longer dismisses it', !sheet.classList.contains('cmo-open'));
+
 // ------------------------------------------------- arriving from a notification
 /*
  * A tapped notification, from this end of it.
