@@ -2034,6 +2034,7 @@ $('#btn-stop').addEventListener('click', () => {
  * so you can dictate into the middle of a message and keep going.
  */
 const micBtn = $('#btn-mic');
+const micResetBtn = $('#btn-mic-reset');
 const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
 
 /**
@@ -2102,6 +2103,14 @@ const voice = {
   // `voice` rather than in a closure because sending has to wait for it: the
   // whole point is that the message goes out punctuated.
   polishing: null,
+
+  // Which dictation the state above belongs to. Bumped by `resetDictation`, and
+  // read by everything that resumes after an `await` — a phrase being
+  // transcribed, a cleanup pass, a `getUserMedia` still sitting on a permission
+  // prompt. None of those can be cancelled, so a reset that only cleared the
+  // fields would be quietly undone a second later when one of them landed and
+  // wrote its result into a dictation that no longer exists.
+  generation: 0,
 };
 
 function setMicState(state) {
@@ -2280,9 +2289,27 @@ function alertDictationStopped() {
 
 const dictationBar = $('#dictation-bar');
 const dictationText = $('#dictation-text');
+const dictationUndo = $('#btn-dictation-undo');
 const dictationResume = $('#btn-dictation-resume');
 const dictationDismiss = $('#btn-dictation-dismiss');
 let listeningTicker = null;
+
+// What a reset cleared out of the composer, while Undo is still on offer, and the
+// timer that withdraws it. One slot only: a second reset means the first was not
+// the mistake.
+let resetUndo = null;
+let resetUndoTimer = null;
+// Long enough to read the bar and change your mind, short enough that the offer is
+// not still standing over a dictation done since.
+const RESET_UNDO_MS = 15000;
+
+/** Withdraw the Undo offer, because the bar is about to say something else. */
+function clearResetOffer() {
+  clearTimeout(resetUndoTimer);
+  resetUndoTimer = null;
+  resetUndo = null;
+  dictationUndo.classList.add('hidden');
+}
 
 function renderListening() {
   if (!voice.active) return;
@@ -2307,6 +2334,7 @@ function renderListening() {
  */
 function showDictationDraining(reason) {
   clearInterval(listeningTicker);
+  clearResetOffer();
   dictationBar.className = `dictation-bar ${reason ? 'stopped' : 'listening'}`;
   dictationResume.classList.add('hidden');
   dictationDismiss.classList.add('hidden');
@@ -2316,6 +2344,7 @@ function showDictationDraining(reason) {
 }
 
 function showListening() {
+  clearResetOffer();
   dictationBar.className = 'dictation-bar listening';
   dictationResume.classList.add('hidden');
   dictationDismiss.classList.add('hidden');
@@ -2327,6 +2356,7 @@ function showListening() {
 /** The banner the user finds when they pick the phone back up. */
 function showDictationStopped(reason) {
   clearInterval(listeningTicker);
+  clearResetOffer();
   dictationBar.className = 'dictation-bar stopped';
   dictationText.textContent = `Dictation stopped — ${reason}. What you said so far is kept.`;
   dictationResume.classList.remove('hidden');
@@ -2335,9 +2365,34 @@ function showDictationStopped(reason) {
 
 function hideDictationBar() {
   clearInterval(listeningTicker);
+  clearResetOffer();
   dictationBar.className = 'dictation-bar hidden';
   dictationResume.classList.add('hidden');
   dictationDismiss.classList.add('hidden');
+}
+
+/**
+ * What a reset did, and the way back from it.
+ *
+ * No modifier class on the bar: this is an acknowledgement rather than a state, so
+ * it gets neither the blinking dot that means a live microphone nor the red tint
+ * that means something was taken away.
+ */
+function showDictationReset(wiped) {
+  clearInterval(listeningTicker);
+  clearResetOffer();
+  dictationBar.className = 'dictation-bar';
+  dictationResume.classList.add('hidden');
+  dictationDismiss.classList.remove('hidden');
+  dictationText.textContent = wiped.trim()
+    ? 'Dictation reset — mic released, transcript forgotten, box cleared.'
+    : 'Dictation reset — mic released, transcript forgotten.';
+  if (wiped.trim()) {
+    resetUndo = wiped;
+    dictationUndo.classList.remove('hidden');
+  }
+  // Clears the offer with it, so the text is not restorable once the bar is gone.
+  resetUndoTimer = setTimeout(hideDictationBar, wiped.trim() ? RESET_UNDO_MS : 4000);
 }
 
 /**
@@ -2440,6 +2495,9 @@ async function startLiveDictation() {
   let restarts = [];
 
   rec.onresult = (event) => {
+    // A recognizer that has been replaced or reset still delivers one last result;
+    // writing it would put the old dictation's words back into the box.
+    if (voice.recognition !== rec) return;
     let finals = '';
     let interim = '';
     for (let i = 0; i < event.results.length; i++) {
@@ -2453,6 +2511,7 @@ async function startLiveDictation() {
   };
 
   rec.onerror = (event) => {
+    if (voice.recognition !== rec) return;
     // no-speech and aborted are normal; anything else means fall back.
     if (event.error === 'no-speech' || event.error === 'aborted') return;
     console.warn('speech recognition error:', event.error);
@@ -2468,7 +2527,9 @@ async function startLiveDictation() {
   };
 
   rec.onend = () => {
-    if (voice.active) {
+    // Not `voice.active` alone: a reset leaves this recognizer's own `abort` to
+    // fire, and restarting here would put the microphone straight back on.
+    if (voice.recognition === rec && voice.active) {
       // Mobile Safari ends the session on brief pauses; restart to keep going.
       // Commit this session's finals first — the new session starts with an
       // empty `results` list, so anything not banked here is lost.
@@ -2503,14 +2564,23 @@ async function startLiveDictation() {
 }
 
 async function startRecordingDictation() {
+  const gen = voice.generation;
+  let stream;
   try {
-    voice.stream = await navigator.mediaDevices.getUserMedia({
+    stream = await navigator.mediaDevices.getUserMedia({
       audio: { echoCancellation: true, noiseSuppression: true },
     });
   } catch (err) {
     toast(`Microphone blocked: ${err.message}`);
     return;
   }
+  // Reset while the permission prompt was up: the mic was granted to a dictation
+  // that no longer exists, so hand it straight back.
+  if (gen !== voice.generation) {
+    stream.getTracks().forEach((t) => t.stop());
+    return;
+  }
+  voice.stream = stream;
 
   voice.anchor = nextDictationAnchor();
   voice.committed = '';
@@ -2612,7 +2682,96 @@ function stopVoice({ reason = null } = {}) {
   if (wasActive && !reason && !draining) polishDictation();
 }
 
+/**
+ * Release everything dictation holds, and forget everything it heard.
+ *
+ * Stopping dictation deliberately *keeps* state: the transcript is in the box, the
+ * anchor says where it was written, a phrase may still be being transcribed, an
+ * interruption may be waiting to be resumed. That is right nearly always — all of
+ * it is text the user spoke and wants.
+ *
+ * It is wrong when a piece of it outlives the dictation it belonged to, because
+ * then it reappears underneath the next one, and clearing the composer by hand
+ * does not help: none of the state that puts it back is in the composer. This is
+ * the escape hatch for that, and it is deliberately total rather than clever —
+ * hardware released, engines dismantled, every field back to where it starts, the
+ * composer and its saved draft cleared, and everything already in flight orphaned
+ * by way of `voice.generation`, which is the half a reset cannot do by assignment.
+ *
+ * The text it clears is offered back as Undo, because several minutes of speech is
+ * what tends to be in there and this button sits next to the mic.
+ */
+function resetDictation() {
+  // Before anything else: from here on, every continuation still holding the old
+  // generation knows its dictation is gone and writes nothing.
+  voice.generation += 1;
+
+  voice.active = false;
+  // A start that is still awaiting the permission prompt is now orphaned rather
+  // than merely un-flagged, so clearing this cannot let it through.
+  voice.starting = false;
+
+  if (voice.recognition) {
+    try {
+      // abort, not stop: stop delivers one last result, which is exactly the text
+      // being thrown away here.
+      if (voice.recognition.abort) voice.recognition.abort();
+      else voice.recognition.stop();
+    } catch {
+      /* already stopped */
+    }
+    voice.recognition = null;
+  }
+
+  if (voice.recorder) {
+    try {
+      if (voice.recorder.state !== 'inactive') voice.recorder.stop();
+    } catch {
+      /* already stopped */
+    }
+    // Dropped before `onstop` runs, so the recording is discarded rather than
+    // transcribed: transcribing it is what the user just asked not to happen.
+    voice.recorder = null;
+  }
+
+  // Both the graph and the bare recorder path hold a microphone stream, and the
+  // indicator in the phone's status bar stays lit until the tracks are stopped.
+  teardownAudioGraph();
+  voice.stream?.getTracks().forEach((t) => t.stop());
+  voice.stream = null;
+
+  voice.chunks = [];
+  voice.queue = [];
+  voice.pumping = false;
+  voice.finalText = '';
+  voice.committed = '';
+  voice.anchor = 0;
+  voice.dropped = 0;
+  voice.pendingReason = null;
+  voice.resumeFromEnd = false;
+  voice.polishing = null;
+  voice.startedAt = 0;
+  // The engine choice is remade too: a fallback that was forced by one failed
+  // recognizer should not outlive the dictation that hit it.
+  voice.mode = pickDictationMode();
+
+  setMicState('idle');
+
+  const wiped = input.value;
+  input.value = '';
+  autosize();
+  // Written through rather than debounced, and this is the half that makes the
+  // reset survive a reload: a draft left on disk comes back on the next visit to
+  // this chat, which is the haunting the button exists to end.
+  writeDraft();
+  // The mic is no longer a reason to hold the screen. The app being open still may
+  // be, so reconcile rather than release.
+  syncWakeLock();
+  showDictationReset(wiped);
+}
+
 async function transcribeRecording() {
+  const gen = voice.generation;
   voice.stream?.getTracks().forEach((t) => t.stop());
   voice.stream = null;
 
@@ -2633,6 +2792,9 @@ async function transcribeRecording() {
     form.append('audio', blob, blob.type === 'audio/wav' ? 'recording.wav' : 'recording.webm');
     const res = await api('/api/transcribe', { method: 'POST', body: form });
     const data = await res.json();
+    // Reset while this was uploading: the recording belongs to a dictation that has
+    // been thrown away, so the transcript goes nowhere.
+    if (gen !== voice.generation) return;
     if (!res.ok) throw new Error(data.error || 'transcription failed');
 
     writeDictation(cleanTranscript(data.text || ''));
@@ -2769,6 +2931,11 @@ function joinPhrases(acc, phrase) {
  */
 async function pumpDictationQueue() {
   if (voice.pumping) return;
+  // The dictation these phrases belong to. A reset cannot cancel a request already
+  // sent, so the answer to it has to be dropped on arrival instead — otherwise a
+  // phrase from the dictation just thrown away lands in the composer a second
+  // later, which is the thing the reset was for.
+  const gen = voice.generation;
   voice.pumping = true;
   try {
     while (voice.queue.length) {
@@ -2778,7 +2945,9 @@ async function pumpDictationQueue() {
         const form = new FormData();
         form.append('audio', wavFromSamples(samples, voice.sampleRate), 'phrase.wav');
         const res = await api('/api/transcribe', { method: 'POST', body: form });
+        if (gen !== voice.generation) return;
         const data = await res.json().catch(() => ({}));
+        if (gen !== voice.generation) return;
         if (!res.ok) throw new Error(data.error || 'transcription failed');
         const phrase = cleanTranscript(data.text || '');
         if (phrase) {
@@ -2799,8 +2968,13 @@ async function pumpDictationQueue() {
       renderListening();
     }
   } finally {
-    voice.pumping = false;
-    if (!voice.active) finishDictation();
+    // Only if this pump is still the current one. A reset already cleared the flag
+    // and may have started a fresh dictation with a pump of its own, and clearing
+    // it from under that one would let a second pump run beside it.
+    if (gen === voice.generation) {
+      voice.pumping = false;
+      if (!voice.active) finishDictation();
+    }
   }
 }
 
@@ -2887,6 +3061,7 @@ function polishDictation() {
 }
 
 async function runPolish() {
+  const gen = voice.generation;
   const raw = voice.committed;
   // Two words cannot be mispunctuated into anything worth a round trip.
   if (!polishWanted || raw.trim().split(/\s+/).filter(Boolean).length < 3) return;
@@ -2911,6 +3086,7 @@ async function runPolish() {
     // have been edited: either way the polished version is of something that is
     // no longer there. Only the span up to `end` is checked, so carrying on
     // typing after a dictation — the common case — still gets punctuated.
+    if (gen !== voice.generation) return;
     if (voice.active || voice.starting) return;
     if (input.value.slice(0, end) !== before) return;
     if (res.ok && data.changed && data.text) {
@@ -2932,7 +3108,10 @@ async function runPolish() {
     // Includes the route being unreachable. The words are already in the box.
     console.warn('could not tidy up the dictation:', err);
   } finally {
-    if (!voice.active && !voice.starting) {
+    // The generation check is what keeps a pass that outlived its dictation from
+    // tidying up after a reset — which would take the reset's own bar, and the
+    // Undo it is offering, off the screen.
+    if (gen === voice.generation && !voice.active && !voice.starting) {
       setMicState('idle');
       if (!announced) hideDictationBar();
     }
@@ -3034,8 +3213,10 @@ function enqueuePhrase(samples) {
 }
 
 async function startStreamingDictation() {
+  const gen = voice.generation;
+  let stream;
   try {
-    voice.stream = await navigator.mediaDevices.getUserMedia({
+    stream = await navigator.mediaDevices.getUserMedia({
       audio: {
         echoCancellation: true,
         noiseSuppression: true,
@@ -3047,6 +3228,13 @@ async function startStreamingDictation() {
     toast(`Microphone blocked: ${err.message}`);
     return;
   }
+  // Reset while the permission prompt was up: the mic belongs to a dictation that
+  // no longer exists, so hand it straight back rather than building a graph on it.
+  if (gen !== voice.generation) {
+    stream.getTracks().forEach((t) => t.stop());
+    return;
+  }
+  voice.stream = stream;
 
   // Ask the context for 16 kHz directly, which is what Whisper wants: the
   // browser resamples on the way in and no conversion is needed per phrase.
@@ -3058,6 +3246,18 @@ async function startStreamingDictation() {
     ctx = new (window.AudioContext || window.webkitAudioContext)();
   }
   if (ctx.state === 'suspended') await ctx.resume().catch(() => {});
+  // Reset while the context was starting. Nothing above is on `voice` yet, so this
+  // is the last point where the teardown has to be done by hand.
+  if (gen !== voice.generation) {
+    stream.getTracks().forEach((t) => t.stop());
+    if (voice.stream === stream) voice.stream = null;
+    try {
+      ctx.close();
+    } catch {
+      /* never opened */
+    }
+    return;
+  }
 
   voice.audioCtx = ctx;
   voice.sampleRate = ctx.sampleRate;
@@ -3177,6 +3377,23 @@ micBtn.addEventListener('click', () => {
     return;
   }
   startVoice();
+});
+
+micResetBtn.addEventListener('click', resetDictation);
+
+// The way back from a reset: the words go back in the box, while everything the
+// reset released stays released — the point was the state, not the text.
+dictationUndo.addEventListener('click', () => {
+  const text = resetUndo;
+  hideDictationBar();
+  if (!text) return;
+  input.value = text;
+  autosize();
+  // Written through: this text arrived without a keystroke, so there may be no
+  // keystroke coming to save it.
+  saveDraft({ now: true });
+  input.focus();
+  toast('Put the text back. Dictation is still reset.');
 });
 
 // Picks up where the interruption left off, appending at the caret, which is
@@ -4577,7 +4794,7 @@ window.__panesForTest = {
 // The silent-dictation failure can't be reproduced from a desktop browser, so
 // the test drives the interruption path directly instead.
 window.__voiceForTest = {
-  voice, stopVoice, startVoice, nextDictationAnchor,
+  voice, stopVoice, startVoice, resetDictation, nextDictationAnchor,
   cleanTranscript, joinPhrases, enqueuePhrase, VAD, createPhraseCutter,
   // The cleanup pass and its switch: what has to be proved here is that it
   // rewrites the dictated span and nothing else, and that it gives up quietly

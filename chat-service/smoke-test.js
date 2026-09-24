@@ -481,6 +481,144 @@ if (typeof handler === 'function' && panesHooks) {
   }
 }
 
+/*
+ * Starting dictation over from nothing.
+ *
+ * The bug this button answers is dictation that remembers: text from an earlier
+ * utterance reappearing under the next one, where emptying the composer by hand
+ * does not help because none of what puts it back is in the composer. So what has
+ * to be proved is not that the fields were assigned — it is the three things that
+ * survive an assignment: a draft on disk, a phrase already uploaded, and a
+ * microphone granted after the user gave up on it.
+ */
+{
+  const hooks = w.__voiceForTest;
+  const drafts = w.__draftForTest;
+  if (typeof hooks?.resetDictation !== 'function') {
+    failures.push('client did not expose the dictation reset for testing');
+  } else {
+    const box = w.document.querySelector('#input');
+    const bar = w.document.querySelector('#dictation-bar');
+    const undoBtn = w.document.querySelector('#btn-dictation-undo');
+    const TEXT = 'the words already dictated';
+
+    // A dictation holding every kind of state at once: a live recognizer, an open
+    // microphone, a phrase queued, an interruption waiting to be resumed, a
+    // transcript in the box and a copy of it on disk.
+    let aborted = 0;
+    let tracksStopped = 0;
+    hooks.voice.recognition = { abort: () => { aborted += 1; } };
+    hooks.voice.stream = { getTracks: () => [{ stop: () => { tracksStopped += 1; } }] };
+    hooks.voice.active = true;
+    hooks.voice.starting = false;
+    hooks.voice.committed = TEXT;
+    hooks.voice.finalText = TEXT;
+    hooks.voice.anchor = 0;
+    hooks.voice.queue = [new Float32Array(16000)];
+    hooks.voice.pumping = true;
+    hooks.voice.resumeFromEnd = true;
+    hooks.voice.dropped = 2;
+    hooks.voice.pendingReason = 'the screen turned off';
+    hooks.voice.polishing = Promise.resolve();
+    box.value = TEXT;
+    drafts.saveDraft({ now: true });
+    const draftKey = drafts.draftKeyFor(w.__panesForTest.activePane());
+    if (!w.localStorage.getItem(draftKey)) {
+      failures.push('reset test could not put a draft on disk to clear');
+    }
+
+    hooks.resetDictation();
+
+    if (box.value !== '') failures.push(`reset left ${JSON.stringify(box.value)} in the composer`);
+    if (w.localStorage.getItem(draftKey)) {
+      failures.push('reset left the saved draft on disk, so the text comes back on reload');
+    }
+    if (aborted !== 1) failures.push('reset did not abort the recognizer');
+    if (tracksStopped !== 1) failures.push('reset did not release the microphone');
+    for (const [field, want] of [
+      ['active', false], ['starting', false], ['recognition', null], ['recorder', null],
+      ['stream', null], ['committed', ''], ['finalText', ''], ['anchor', 0],
+      ['pumping', false], ['resumeFromEnd', false], ['dropped', 0],
+      ['pendingReason', null], ['polishing', null],
+    ]) {
+      if (hooks.voice[field] !== want) {
+        failures.push(`reset left voice.${field} as ${JSON.stringify(hooks.voice[field])}, want ${JSON.stringify(want)}`);
+      }
+    }
+    if (hooks.voice.queue.length) failures.push('reset left phrases queued for transcription');
+    if (bar.classList.contains('hidden') || !/reset/i.test(bar.textContent)) {
+      failures.push(`reset said nothing about what it did: ${JSON.stringify(bar.textContent)}`);
+    }
+    if (undoBtn.classList.contains('hidden')) {
+      failures.push('reset offered no way back for the text it cleared');
+    }
+
+    // Undo is about the text only: the state the reset released stays released.
+    undoBtn.click();
+    if (box.value !== TEXT) {
+      failures.push(`Undo restored ${JSON.stringify(box.value)}, want the text the reset cleared`);
+    }
+    if (hooks.voice.committed !== '' || hooks.voice.resumeFromEnd) {
+      failures.push('Undo put the dictation state back as well as the text');
+    }
+    if (!undoBtn.classList.contains('hidden')) {
+      failures.push('Undo stayed on offer after it was taken');
+    }
+
+    // A phrase already uploaded cannot be recalled, so its answer has to be dropped
+    // on arrival. Before this it landed in the composer a second after the reset,
+    // which is the ghost text the whole button exists for.
+    box.value = '';
+    hooks.voice.active = false;
+    hooks.voice.committed = '';
+    hooks.voice.finalText = '';
+    hooks.voice.anchor = 0;
+    hooks.voice.queue = [];
+    hooks.voice.pumping = false;
+    hooks.voice.sampleRate = 16000;
+    transcripts.length = 0;
+    transcripts.push('a sentence from the dictation that was thrown away');
+    hooks.enqueuePhrase(new Float32Array(Math.ceil(0.6 * 16000)));
+    hooks.resetDictation();
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    if (box.value !== '') {
+      failures.push(`a phrase in flight across a reset still landed in the composer: ${JSON.stringify(box.value)}`);
+    }
+    if (hooks.voice.pumping) failures.push('an orphaned transcription left the pump flagged as running');
+
+    // Reset while the permission prompt is up. The microphone is granted to a
+    // dictation that no longer exists: keeping it leaves the recording indicator
+    // lit, and using it starts the dictation the user just cancelled.
+    let granted = 0;
+    let grant = null;
+    Object.defineProperty(w.navigator, 'mediaDevices', {
+      configurable: true,
+      value: { getUserMedia: () => new Promise((resolve) => { grant = resolve; }) },
+    });
+    hooks.voice.mode = 'record';
+    hooks.voice.active = false;
+    hooks.voice.starting = false;
+    const starting = hooks.startVoice().catch((err) => {
+      failures.push(`a reset during the mic prompt threw: ${err.message}`);
+    });
+    hooks.resetDictation();
+    if (hooks.voice.starting) failures.push('reset left a start pending');
+    grant({ getTracks: () => [{ stop: () => { granted += 1; } }] });
+    await starting;
+    if (granted !== 1) {
+      failures.push('a microphone granted after a reset was not handed back');
+    }
+    if (hooks.voice.recorder || hooks.voice.stream) {
+      failures.push('a microphone granted after a reset still started a recording');
+    }
+
+    // Leave nothing of this behind for the blocks that follow: Undo wrote the text
+    // back to disk on its way through.
+    box.value = '';
+    drafts.writeDraft();
+  }
+}
+
 // Keeping the display awake for as long as the app is open. None of this is
 // observable from a desktop browser — whether a screen sleeps is invisible to the
 // page — so the reconciler is driven against a fake wakeLock. What the fake

@@ -238,6 +238,19 @@ turned off, so there was nothing to notice. Now:
 Where a wake lock is not available the status bar says so outright rather than
 promising a screen that will sleep anyway.
 
+**And there is a reset, next to the mic.** Everything above deliberately *keeps*
+state when dictation stops — the transcript, where it was written, a phrase still
+being transcribed, an interruption waiting to be resumed — because that is nearly
+always text you want back. When a piece of it outlives the dictation it belonged
+to, it turns up under the next one, and emptying the composer by hand does not help:
+none of what puts it back is in the composer. The small ⟳ beside the mic is the way
+out of that. It releases the microphone, dismantles the recognizer, forgets the
+transcript and the saved draft, and discards anything already in flight — a phrase
+mid-upload, a cleanup pass, a microphone granted after you gave up on the prompt —
+so the next dictation starts from nothing. The text it clears is offered back as
+Undo for a few seconds, because the button is one tap from the mic and what is in
+the box is often several minutes of speech.
+
 ## Keeping the screen awake
 
 The phone's display sleeps on its idle timer, and this app is used in long

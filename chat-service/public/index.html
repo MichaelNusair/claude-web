@@ -134,6 +134,7 @@
        comes back is a message that is still there saying dictation stopped. -->
   <div id="dictation-bar" class="dictation-bar hidden" role="status" aria-live="polite">
     <span id="dictation-text"></span>
+    <button type="button" id="btn-dictation-undo" class="dictation-action hidden">Undo</button>
     <button type="button" id="btn-dictation-resume" class="dictation-action hidden">Resume</button>
     <button type="button" id="btn-dictation-dismiss" class="dictation-action hidden"
             aria-label="Dismiss">✕</button>
@@ -142,6 +143,14 @@
   <div id="composer" class="composer">
     <button id="btn-mic" class="mic-btn" aria-label="Dictate">
       <svg viewBox="0 0 24 24"><path d="M12 14a3 3 0 0 0 3-3V5a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3m5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.9V21h2v-3.1A7 7 0 0 0 19 11z"/></svg>
+    </button>
+    <!-- Start dictation over from nothing. Deliberately its own control and not a
+         long-press on the mic: it is reached when dictation is behaving oddly, and
+         the mic is the button that is already not doing what was expected. What it
+         clears is offered back as Undo, so a mis-tap costs nothing. -->
+    <button id="btn-mic-reset" class="mic-reset-btn" aria-label="Reset dictation"
+            title="Reset dictation — release the mic, forget the transcript, clear the box">
+      <svg viewBox="0 0 24 24"><path d="M12 5V2L8 6l4 4V7a5 5 0 1 1-5 5H5a7 7 0 1 0 7-7z"/></svg>
     </button>
     <textarea id="input" rows="1" placeholder="Message Claude…" enterkeyhint="send"></textarea>
     <button id="btn-send" class="send-btn" aria-label="Send">

@@ -394,6 +394,17 @@ html, body {
 .send-btn svg, .mic-btn svg, .stop-btn svg { width: 22px; height: 22px; fill: currentColor; }
 .mic-btn.recording { background: var(--error); color: #fff; animation: pulse 1.4s infinite; }
 .mic-btn.working { opacity: .5; }
+/* Smaller and quieter than the mic it sits beside: the same size would read as a
+   second way to dictate, and it is a control you want to find rather than one you
+   want to notice. Bottom-aligned with the mic, not with a textarea that grows. */
+.mic-reset-btn {
+  width: 30px; height: 30px; flex: 0 0 auto;
+  margin: 0 -2px 7px; border: none; border-radius: 50%;
+  display: grid; place-items: center; cursor: pointer;
+  background: transparent; color: var(--text-dim);
+}
+.mic-reset-btn svg { width: 17px; height: 17px; fill: currentColor; }
+.mic-reset-btn:active { background: var(--bg-input); color: var(--text); }
 /* While dictating, highlight the box so it's obvious where text is landing. */
 .composer.listening #input { border-color: var(--error); }
 .stop-btn { background: var(--error); color: #fff; }
