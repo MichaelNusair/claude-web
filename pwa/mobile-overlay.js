@@ -53,7 +53,7 @@
    *
    * Bump it when this file changes in a way anyone would look for.
    */
-  const OVERLAY_BUILD = '2026-09-21.5';
+  const OVERLAY_BUILD = '2026-09-24.1';
 
   // -------------------------------------------- survive a browser refresh
   /*
