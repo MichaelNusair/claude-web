@@ -44,7 +44,10 @@ import {
   chooseVoice,
   preferredVoice,
   hebrewShare,
+  hasHebrew,
   needsMultilingualVoice,
+  readsHebrew,
+  speaksHebrew,
   codeAloud,
   CODE_LINES,
   FALLBACK_VOICES,
@@ -448,10 +451,24 @@ section('Hebrew, which Polly cannot say:');
   const quoted = `The string in the config is ${heb(4)}, which is why the header renders right to left. ${MESSAGE}`;
   ok(
     !needsMultilingualVoice(quoted),
-    'one Hebrew word quoted in an English reply is read by Polly as before',
+    'one Hebrew word quoted in an English reply is not read in a Hebrew voice',
     `share was ${hebrewShare(quoted).toFixed(3)}`,
   );
   ok(HEBREW_SHARE > 0 && HEBREW_SHARE < 1, 'the threshold is a share, not a count', `got ${HEBREW_SHARE}`);
+
+  /*
+   * The two questions, which this file conflated until 2026-09-24 and which the bug
+   * lived in. "Is this a Hebrew message?" is a share; "is there Hebrew in it at all?"
+   * is not, and it is the second one that decides whether a provider may be given the
+   * message — because Polly does not say a Hebrew word it cannot pronounce, it says
+   * nothing at all, and four letters in a paragraph are nowhere near ten per cent.
+   */
+  ok(hasHebrew(quoted), 'but there is Hebrew in it, which is a different question');
+  ok(!hasHebrew(MESSAGE) && !hasHebrew('') && !hasHebrew(null), 'and an English message has none');
+  ok(
+    hasHebrew(heb(1)) && !needsMultilingualVoice(`${heb(1)}${'a'.repeat(200)}`),
+    'one letter is enough for the first question and not for the second',
+  );
 
   // U+FB1D upwards: the pointed and ligature forms that copied Hebrew carries.
   ok(hebrewShare(String.fromCodePoint(0xfb2a, 0xfb4b, 0xfb1d)) === 1, 'the presentation forms count as Hebrew too');
@@ -529,6 +546,100 @@ section('Which voice ends up reading it:');
   ok(
     OPENAI_VOICES.every((v) => v.id && v.gender && v.language === 'multi' && v.provider === 'openai'),
     'every OpenAI voice is described the way the picker needs',
+  );
+}
+
+// --------------------------------------------------------------------------
+/*
+ * The bilingual reply, which is the shape a real message here has and the one that was
+ * read with a hole in it until 2026-09-24.
+ *
+ * An English paragraph with a Hebrew word or two in it — a filename, a column heading,
+ * `אש"ל` in an expenses answer — is under ten per cent Hebrew, so the share said "not a
+ * Hebrew message" and the message went to whichever voice was asked for. On Polly that
+ * is silence where the word was, with nothing in the response saying so. The fix is a
+ * second, lower question: not *which language* to read it in, but *which providers may
+ * be given it at all*. So the two moves are asserted separately and against each other,
+ * because collapsing them back into one is the edit that reintroduces the bug — in
+ * either direction. One way drops the word; the other reads an English paragraph in a
+ * Hebrew accent because four letters of it were Hebrew.
+ */
+section('A quoted Hebrew word moves the provider, not the language:');
+{
+  const polly = FALLBACK_VOICES.map((v) => ({ ...v, provider: 'polly', engine: 'generative' }));
+  const azure = AZURE_VOICES.map((v) => ({ ...v, engine: v.name }));
+  const openai = OPENAI_VOICES.map((v) => ({ ...v, engine: 'gpt-4o-mini-tts' }));
+  const both = [...polly, ...azure];
+  const heb = (n) => Array.from({ length: n }, (_, i) => String.fromCodePoint(0x05d0 + (i % 27))).join('');
+
+  const ava = azure.find((v) => v.id === 'Ava');
+  const hila = azure.find((v) => v.id === 'Hila');
+  ok(readsHebrew(ava) && readsHebrew(hila), 'every Azure voice will say a Hebrew word');
+  ok(readsHebrew(openai[0]), 'and so will an OpenAI one');
+  ok(
+    !polly.some(readsHebrew),
+    'no Polly voice will, in any engine — which is the reason this rule exists',
+  );
+  ok(
+    readsHebrew(ava) && !speaksHebrew(ava),
+    'Ava will say one without being a Hebrew voice: the distinction the two predicates keep',
+  );
+
+  const quoted = `The field in the config is ${heb(4)}, which is why that header renders right to left. ${MESSAGE}`;
+  const mostly = `${heb(60)} auth.js ${heb(40)}.`;
+
+  const moved = chooseVoice('Ruth', quoted, both);
+  ok(moved.id === 'Ava', 'a Polly voice asked for on a message with a Hebrew word in it moves', moved.id);
+  ok(moved.provider === 'azure', 'to Azure, which reads the Hebrew run in Hila and the rest in Ava');
+  ok(
+    moved.engine === 'en-US-AvaMultilingualNeural',
+    'carrying the full Azure name, which is what the wire and the cache key want',
+    String(moved.engine),
+  );
+  ok(
+    moved.id !== 'Hila',
+    'and not to Hila — the message is English, and four Hebrew letters do not change that',
+  );
+  ok(
+    chooseVoice('Hila', quoted, both).id === 'Hila',
+    'someone who asked for Hila by name is still read in Hila',
+  );
+  ok(
+    chooseVoice('Andrew', quoted, both).id === 'Andrew',
+    'and an Azure English voice is already able to say the word, so it is left alone',
+  );
+  ok(
+    chooseVoice('Ruth', mostly, both).id === 'Hila',
+    'a message that is mostly Hebrew still goes all the way to the native Hebrew voice',
+    chooseVoice('Ruth', mostly, both).id,
+  );
+  ok(
+    chooseVoice('Ruth', MESSAGE, both).id === 'Ruth',
+    'while an English message with no Hebrew in it stays on the voice that was asked for',
+  );
+
+  // The box this repo clones as: Polly and nothing else. A refusal gets the message
+  // read, because every client falls back to the phone's own voice, which does speak
+  // Hebrew. Reading it anyway would not.
+  let refused = null;
+  try {
+    chooseVoice('Ruth', quoted, polly);
+  } catch (err) {
+    refused = err;
+  }
+  ok(refused?.status === 409, 'a Polly-only box refuses the message rather than dropping the word', `got ${refused?.status}`);
+  ok(
+    /Hebrew/.test(refused?.message || '') && /own voice/.test(refused?.message || ''),
+    'saying what is missing and what will read it instead',
+    `got: ${refused?.message}`,
+  );
+  ok(
+    chooseVoice('Ruth', MESSAGE, polly).id === 'Ruth',
+    'and the same box reads an English message exactly as it always did',
+  );
+  ok(
+    chooseVoice('Ruth', quoted, [...polly, ...openai]).provider === 'openai',
+    'a box with an OpenAI key and no Azure moves there instead',
   );
 }
 

@@ -56,7 +56,9 @@ const {
   azureSpeechRefusal,
   azureSpeechStatus,
   hearAzure,
+  hebrewVoiceFor,
   resetAzureSpeech,
+  scriptRuns,
   speakAzure,
   ssmlEscape,
   ssmlFor,
@@ -214,6 +216,127 @@ if (MODE === 'bare') {
   ok(
     ssmlFor('שלום', 'he-IL-AvriNeural').includes('שלום'),
     'Hebrew itself is left exactly as it is — it is text, not markup',
+  );
+
+  /*
+   * The silent drop, and the whole reason `ssmlFor` is more than one interpolation.
+   *
+   * `en-US-AvaMultilingualNeural` lists `he-IL` as a secondary locale and does not
+   * honour it for a short run: measured against the live resource on 2026-09-24, the
+   * sentence below took 8.30s with the Hebrew word in it and 8.33s with the word
+   * deleted, and `הערות` alone came back as a 200 with an empty body. Per-run
+   * `<voice>` elements took the same sentence to 10.27s. None of that is observable
+   * from here without spending quota, so what is asserted is the document: that the
+   * Hebrew leaves in a Hebrew voice, that everything else stays in the voice that was
+   * asked for, and — the one that matters most — that not a character is lost on the
+   * way. A run that goes missing here is silence nobody can hear the absence of.
+   */
+  section('A Hebrew word inside an English sentence, which used to be read as nothing:');
+  const mixed = 'the claim is ₪3,128.47 (₪14,288.47 with the אש"ל). I didn\'t drop a shekel.';
+  const both = scriptRuns(mixed);
+  ok(
+    both.map((run) => run.text).join('') === mixed,
+    'the runs put back together are the text, exactly',
+    JSON.stringify(both),
+  );
+  ok(both.length === 3, 'English, then Hebrew, then English again', JSON.stringify(both));
+  ok(
+    both[1]?.hebrew && both[1]?.text.trim() === 'אש"ל',
+    'the Hebrew run is the Hebrew word, and the gershayim inside it did not split it',
+    JSON.stringify(both[1]),
+  );
+  ok(
+    !both[0]?.hebrew && both[0]?.text.endsWith('with the'),
+    'the space before it went with the Hebrew, so the English run ends at a word',
+    JSON.stringify(both[0]),
+  );
+  ok(
+    !both[2]?.hebrew && both[2]?.text.startsWith(').'),
+    "and the English sentence's own closing bracket stayed English",
+    JSON.stringify(both[2]),
+  );
+  const sentence = scriptRuns('שלום עולם. מה קורה כאן?');
+  ok(
+    sentence.length === 1 && sentence[0]?.hebrew,
+    'a Hebrew sentence is one run, not one run per word — the spaces look ahead',
+    JSON.stringify(sentence),
+  );
+  const insideHebrew = scriptRuns('ראה את auth.js בבקשה');
+  ok(
+    insideHebrew.length === 3 && !insideHebrew[1]?.hebrew,
+    'and a filename inside Hebrew is a run of its own, the same rule from the other side',
+    JSON.stringify(insideHebrew),
+  );
+  ok(scriptRuns('').length === 0, 'no text is no runs');
+  ok(
+    scriptRuns('1,234.56 — ₪ …').length === 1 && !scriptRuns('1,234.56 — ₪ …')[0]?.hebrew,
+    'text with no letter at all is one run and not a Hebrew one',
+  );
+
+  ok(hebrewVoiceFor('en-US-AvaMultilingualNeural') === 'he-IL-HilaNeural', 'Ava pairs with Hila');
+  ok(hebrewVoiceFor('en-US-AndrewMultilingualNeural') === 'he-IL-AvriNeural', 'and Andrew with Avri');
+  ok(
+    hebrewVoiceFor('he-IL-AvriNeural') === 'he-IL-AvriNeural',
+    'a Hebrew voice is its own Hebrew voice, so nothing switches',
+  );
+  ok(hebrewVoiceFor('Nonsense') === 'he-IL-HilaNeural', 'and an unknown voice falls back to Hila');
+
+  const unescape = (s) =>
+    s
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>')
+      .replace(/&quot;/g, '"')
+      .replace(/&apos;/g, "'")
+      .replace(/&amp;/g, '&');
+  const spoken = (document) =>
+    [...document.matchAll(/<voice name="([^"]+)">([\s\S]*?)<\/voice>/g)].map((m) => ({
+      voice: m[1],
+      text: unescape(m[2]),
+    }));
+
+  const switched = ssmlFor(mixed, 'en-US-AvaMultilingualNeural');
+  const parts = spoken(switched);
+  ok(parts.length === 3, 'the document has one voice element per run', switched);
+  ok(
+    parts.map((p) => p.text).join('') === mixed,
+    'and between them they say every character of the message',
+    JSON.stringify(parts),
+  );
+  // Read through `?.` rather than indexed directly: an edit that collapses this back to
+  // one voice element should be reported as a failed check, not as a TypeError that
+  // takes the rest of the file's checks with it.
+  ok(
+    parts[1]?.voice === 'he-IL-HilaNeural' && parts[1]?.text.includes('אש'),
+    'the Hebrew is handed to Hila, which is the fix',
+    JSON.stringify(parts[1]),
+  );
+  ok(
+    parts[0]?.voice === 'en-US-AvaMultilingualNeural' &&
+      parts[2]?.voice === 'en-US-AvaMultilingualNeural',
+    'the rest stays in the voice that was asked for',
+    JSON.stringify(parts),
+  );
+  ok(
+    switched.includes('&quot;'),
+    'the gershayim is still escaped inside the run, because it is still XML',
+    switched,
+  );
+  ok(
+    !parts.some((p) => !p.text.trim()),
+    'and no run is an empty voice element for Azure to think about',
+  );
+  ok(
+    spoken(ssmlFor(mixed, 'en-US-AndrewMultilingualNeural'))[1]?.voice === 'he-IL-AvriNeural',
+    'a male English voice keeps its gender across the switch',
+  );
+  ok(
+    spoken(ssmlFor(mixed, 'he-IL-HilaNeural')).length === 1,
+    'a Hebrew voice reads the whole thing itself — it does say auth.js, accented but aloud',
+  );
+  ok(
+    spoken(ssmlFor('plain English, nothing to switch to', 'en-US-AvaMultilingualNeural'))
+      .length === 1,
+    'and a message with no Hebrew in it is one voice element, as it has always been',
   );
 
   section('Azure wants a locale, the rest of this codebase has two letters:');

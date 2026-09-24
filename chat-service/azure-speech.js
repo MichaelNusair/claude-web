@@ -86,11 +86,17 @@ const secrets = new SecretsManagerClient({ region: REGION });
  * is `preferredVoice` in speak.js.
  *
  * The English pair are the `Multilingual` variants rather than plain `AvaNeural` and
- * `AndrewNeural` — same price, and asked of this resource they carry 92 secondary
- * locales including `he-IL`, so a Hebrew word quoted inside an English sentence is
- * spoken instead of skipped. Their `language` is nonetheless `en-US`, which is what
- * they are: that is what keeps a message that is *mostly* Hebrew routed to Hila,
- * whose Hebrew is native rather than accented (see `speaksHebrew` in speak.js).
+ * `AndrewNeural` — same price, and asked of this resource they list 92 secondary
+ * locales including `he-IL`. Do not read that list as a promise: measured against this
+ * resource on 2026-09-24, a *short* Hebrew run inside an English sentence is dropped
+ * without a word of complaint — `הערות` on its own comes back 200 with an empty body,
+ * and the screenshot sentence with `אש"ל` in it was byte-for-byte the same length as
+ * the sentence with the word deleted. Long Hebrew clauses are spoken, which is how it
+ * went unnoticed. What makes a quoted Hebrew word audible here is `ssmlFor` below,
+ * which hands each Hebrew run to the paired Hebrew voice in its own `<voice>` element.
+ * Their `language` is nonetheless `en-US`, which is what they are: that is what keeps a
+ * message that is *mostly* Hebrew routed to Hila, whose Hebrew is native rather than
+ * accented (see `speaksHebrew` in speak.js).
  *
  * Ids are bare — `Hila`, `Ava` — because the picker and the phone's remembered choice
  * are one flat list of names shared with Polly's. Which is also why these four and
@@ -224,14 +230,148 @@ export function ssmlEscape(text) {
     .replace(/'/g, '&apos;');
 }
 
-/** The SSML document for one segment, in one voice. */
+/**
+ * The Hebrew block and the presentation block, as escapes.
+ *
+ * Written as `\u0590` rather than as the characters themselves for the same reason
+ * `hebrewShare` in speak.js is: a right-to-left literal inside a left-to-right file is
+ * displayed in an order that is not the order it is stored in, so a range written that
+ * way is one nobody can check. U+FB1D–U+FB4F is the presentation block, which holds
+ * the pointed forms and ligatures that copied text carries.
+ *
+ * Letters only. The gershayim in a Hebrew acronym is an ASCII `"` and the geresh an
+ * ASCII `'`; both are inside the word rather than between two of them, and they stay
+ * there by the neutral rule below rather than by a list of marks — which is also what
+ * keeps a hyphen, a comma or a closing bracket with the run it was written in.
+ */
+const HEBREW_LETTER = /[\u0590-\u05FF\uFB1D-\uFB4F]/;
+
+/**
+ * One segment cut into runs of Hebrew and runs of everything else.
+ *
+ * Exported because the rule is the interesting part, not the XML around it, and the
+ * rule is: **a space or a bracket belongs to the word after it, not the word before.**
+ * Every character that is not a letter — spaces, digits, punctuation, a currency sign
+ * — is given to whichever script the next letter is, and only the tail of the text,
+ * which has no next letter, keeps the run it trails.
+ *
+ * That one decision does all the work here:
+ *
+ *   - A Hebrew sentence stays a single run. The spaces inside it look ahead to Hebrew
+ *     words, so nothing splits, and a voice switch per *word* — which would put a
+ *     breath between every two words of it — cannot happen.
+ *   - An acronym written with gershayim stays one word, because the `"` looks ahead to
+ *     the Hebrew letter after it.
+ *   - `…with the אש"ל). I didn't…` hands `). ` to the English voice rather than making
+ *     the Hebrew voice read an English sentence's closing punctuation and its pause.
+ *   - `₪14,288.47 with` reads the figure in English and `שילמתי 200 שקל` reads it in
+ *     Hebrew, without either being a special case.
+ */
+export function scriptRuns(text) {
+  const source = String(text ?? '');
+  if (!source) return [];
+
+  const chars = Array.from(source);
+  // 'he' | 'other' | null, where null is "not a letter — decided by what follows".
+  const script = chars.map((char) => {
+    if (HEBREW_LETTER.test(char)) return 'he';
+    return /\p{L}/u.test(char) ? 'other' : null;
+  });
+
+  // Backwards, so each undecided character can take the answer from its neighbour in
+  // one pass.
+  let next = null;
+  for (let i = script.length - 1; i >= 0; i -= 1) {
+    if (script[i] === null) script[i] = next;
+    else next = script[i];
+  }
+  // Then forwards for the tail, which had no next letter to ask: the full stop at the
+  // end of a Hebrew sentence belongs to that sentence. Left null only when the text
+  // holds no letter at all, and then there is nothing to switch voices for anyway.
+  let previous = null;
+  for (let i = 0; i < script.length; i += 1) {
+    if (script[i] === null) script[i] = previous;
+    else previous = script[i];
+  }
+
+  const runs = [];
+  chars.forEach((char, i) => {
+    const hebrew = script[i] === 'he';
+    const last = runs[runs.length - 1];
+    if (last && last.hebrew === hebrew) last.text += char;
+    else runs.push({ hebrew, text: char });
+  });
+  return runs;
+}
+
+/**
+ * The Hebrew voice to read a Hebrew run with, given the voice reading the rest.
+ *
+ * Gender first, because the alternative is a message that changes speaker mid-
+ * sentence and back: Ava and Hila are both female, Andrew and Avri both male, so the
+ * pairing is exact for the four voices this file offers. Anything else — a voice
+ * added later, or `SPEAK_AZURE_VOICE` naming something unexpected — falls back to
+ * Hila rather than refusing, because a named Hebrew voice is a preference and being
+ * read to in the other gender is not a failure.
+ */
+export function hebrewVoiceFor(voiceName) {
+  const name = String(voiceName || '');
+  if (/^he-/i.test(name)) return name;
+  const male = /Andrew|Brian|Davis|Guy|Jason|Tony/i.test(name);
+  const wanted = male ? 'Male' : 'Female';
+  const pick =
+    AZURE_VOICES.find((v) => v.language === 'he-IL' && v.gender === wanted) ||
+    AZURE_VOICES.find((v) => v.language === 'he-IL');
+  return pick?.name || 'he-IL-HilaNeural';
+}
+
+/**
+ * The SSML document for one segment — one `<voice>` per run of script, not one for
+ * the segment.
+ *
+ * **This is the fix for Hebrew being read as silence.** `en-US-AvaMultilingualNeural`
+ * carries `he-IL` among its secondary locales, which is why this file used to hand it
+ * a mixed sentence whole and say so in a comment. Measured against the resource on
+ * 2026-09-24, that is wrong for exactly the case that turns up in real messages — a
+ * Hebrew word or two inside an English paragraph:
+ *
+ *   - `…claim is 3,128.47 shekels (14,288.47 with the אש"ל).` in Ava alone → 8.30s.
+ *     The same sentence with the Hebrew word deleted → 8.33s. The word is not
+ *     mispronounced, it is *absent*, and nothing in the response says so.
+ *   - `הערות` on its own in Ava → a 200 with zero bytes of audio.
+ *   - A long Hebrew *clause* is spoken, which is why this was not caught earlier:
+ *     the failure is in short runs, and short runs are what a mostly-English message
+ *     has.
+ *   - The same sentence with the Hebrew run in `he-IL-HilaNeural` → 10.27s, which is
+ *     the English 8.33s plus Hila's own 1.61s for that word. Spoken.
+ *
+ * The other direction does not need this and does not get it: Hila reads `auth.js`
+ * and `SPEAK_DAILY_CHARS` — measured at +0.84s and +3.48s over the same sentence
+ * without them — accented, but there. So a Hebrew voice is left to read the whole
+ * segment, and only an English voice has its Hebrew runs handed on.
+ *
+ * `xml:lang` on `<speak>` stays the reading voice's own language. It is the document
+ * default, and each `<voice>` names the locale it wants anyway.
+ */
 export function ssmlFor(text, voiceName) {
   const name = String(voiceName || AZURE_VOICES[0].name);
   const lang = /^([a-z]{2}-[A-Z]{2})/.exec(name)?.[1] || 'he-IL';
-  return (
-    `<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xml:lang="${lang}">` +
-    `<voice name="${name}">${ssmlEscape(text)}</voice></speak>`
-  );
+  const open =
+    `<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xml:lang="${lang}">`;
+  const voice = (voiceFor, body) => `<voice name="${voiceFor}">${ssmlEscape(body)}</voice>`;
+
+  const runs = /^he-/i.test(name) ? [] : scriptRuns(text);
+  // Nothing to switch to, and a single `<voice>` is what every existing expectation —
+  // and every deployment before today — is built on.
+  if (!runs.some((run) => run.hebrew)) return `${open}${voice(name, text)}</speak>`;
+
+  const hebrew = hebrewVoiceFor(name);
+  const body = runs
+    // A run of nothing but whitespace is a pause the neighbours already have.
+    .filter((run) => run.text.trim())
+    .map((run) => voice(run.hebrew ? hebrew : name, run.text))
+    .join('');
+  return `${open}${body}</speak>`;
 }
 
 /**

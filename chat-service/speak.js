@@ -286,7 +286,7 @@ export const OPENAI_VOICES = [
 ];
 
 /**
- * Is there enough Hebrew in this to need the multilingual voice?
+ * How much of this message is Hebrew, and the two different questions asked of it.
  *
  * A share rather than a flag, because the mixed case is the normal one: a reply
  * written in Hebrew still names `auth.js` and `SPEAK_DAILY_CHARS` in Latin letters,
@@ -294,10 +294,13 @@ export const OPENAI_VOICES = [
  * the punctuation and the digits that a code-heavy message is full of do not drag
  * the share down.
  *
- * The threshold is deliberately low. Polly does not read Hebrew badly, it reads it
- * as nothing — the characters are skipped — so a message that is one-fifth Hebrew
- * loses a fifth of its content silently, with no way for a listener to tell. Ten
- * per cent is "there is Hebrew in here that must not vanish".
+ * `HEBREW_SHARE` is **not** the threshold for "may this be read at all" — that is
+ * `hasHebrew`, which is any Hebrew whatsoever. It is the narrower question of whether
+ * the message is Hebrew enough to be *read in a Hebrew voice*, whose English is
+ * accented: at ten per cent and up this is a Hebrew message that quotes some code, and
+ * Hila reading it out is right; below that it is an English message quoting a word or
+ * two, which should be read by an English voice that hands those words to Hila. Both
+ * decisions are made in `chooseVoice`.
  */
 export const HEBREW_SHARE = Number(process.env.SPEAK_HEBREW_SHARE || 0.1);
 
@@ -313,7 +316,32 @@ export function hebrewShare(text) {
   return hebrew / letters.length;
 }
 
-/** Does this text need a voice Polly does not have? */
+/**
+ * Is there any Hebrew in here at all?
+ *
+ * The question that decides whether the voice may be Polly, and the one this file
+ * asked wrongly until 2026-09-24: it asked `needsMultilingualVoice`, which is a
+ * *share*, so a mostly-English message quoting one Hebrew word was left with Polly and
+ * the word was dropped in silence — the exact failure every comment here is about, at
+ * the one share where nobody was looking. A single Hebrew letter is enough to rule out
+ * a synthesiser that has no Hebrew at all.
+ */
+export function hasHebrew(text) {
+  return hebrewShare(text) > 0;
+}
+
+/**
+ * Is this message Hebrew enough to be read *in* a Hebrew voice?
+ *
+ * Still a share, and still ten per cent: at that point this is a Hebrew message that
+ * quotes some code, and Hila reading the whole thing is right. Below it, it is an
+ * English message quoting a word or two, and the right answer is an English voice that
+ * hands those words to Hila — which is what `ssmlFor` in azure-speech.js does.
+ *
+ * `realtime.js` asks this too, for a different reason and with the same threshold: it
+ * decides whether to tell a spoken conversation to be held in Hebrew, and one quoted
+ * word is not a reason to conduct the whole conversation in it.
+ */
 export function needsMultilingualVoice(text) {
   return hebrewShare(text) >= HEBREW_SHARE;
 }
@@ -1007,6 +1035,26 @@ export function speaksHebrew(voice) {
 }
 
 /**
+ * Will this voice get the Hebrew *in* a message said, one way or another?
+ *
+ * A different question from `speaksHebrew`, and the distinction is the whole of the
+ * 2026-09-24 fix. `Ava` is not a Hebrew voice — she reads Hebrew with an American
+ * accent, and asked for a short Hebrew run on her own she returns silence — but a
+ * segment handed to an Azure voice is cut into runs of script by `ssmlFor`, and the
+ * Hebrew runs in it are read by `Hila`. So *any* Azure voice says the Hebrew in a
+ * mixed message, whichever of the four it is; an OpenAI voice says it because it is
+ * multilingual; and no Polly voice says it at all, at any price, in any region.
+ *
+ * This is what decides whether a message with one Hebrew word in it may be read by the
+ * voice that was asked for, so it is deliberately a property of the *provider* rather
+ * than of the locale on the record.
+ */
+export function readsHebrew(voice) {
+  if (!voice) return false;
+  return voice.provider === 'azure' || voice.provider === 'openai';
+}
+
+/**
  * The voice for a caller who asked for nothing, which is most of them.
  *
  * A pure function over the list for the same reason `chooseVoice` is one: this is
@@ -1046,16 +1094,26 @@ export function preferredVoice(known) {
  * no longer offers, or an OpenAI voice on a box whose key has been removed, should
  * still be read to in the default voice and told which one it got.
  *
- * **Hebrew overrides the choice.** Polly has no Hebrew voice, and the failure mode
- * is not a bad accent but silence: the characters are skipped and a listener has no
- * way to tell that half the message never got said. So text that is meaningfully
- * Hebrew is moved to an OpenAI voice whatever the phone asked for, and the answer
- * says which voice actually spoke, the same way an unknown name does.
+ * **Any Hebrew at all overrides the choice, and how far it moves depends on how much.**
+ * Polly has no Hebrew voice and the failure mode is not a bad accent but silence: the
+ * characters are skipped and a listener has no way to tell that a line of the message
+ * never got said. So two separate moves, from two separate questions:
  *
- * **And if there is no key, it refuses** rather than reading the message with the
- * Hebrew missing. A refusal is the useful answer here: every client falls back to
- * `speechSynthesis`, and a phone's own voice *does* speak Hebrew — iOS and Android
- * both ship one — so refusing gets the message read, and pretending would not.
+ *  - **A Hebrew message** — ten per cent of its letters or more — is read *in* a Hebrew
+ *    voice. That is `needsMultilingualVoice`, and it is unchanged.
+ *  - **An English message with Hebrew in it** — one quoted word, a filename, a column
+ *    heading — keeps an English voice, but it has to be one whose provider will say the
+ *    quoted word rather than skip it: any Azure voice (`ssmlFor` reads the Hebrew runs
+ *    of a segment in Hila) or any OpenAI one. This is the case that was silently broken
+ *    until 2026-09-24, because the share decided *everything* and one Hebrew word is
+ *    nowhere near ten per cent of a paragraph. It is also the common case: it is what a
+ *    bilingual reply looks like.
+ *
+ * Either way the answer says which voice actually spoke, the same way an unknown name
+ * does, and **if nothing on the box can say Hebrew it refuses** rather than reading the
+ * message with the Hebrew missing. A refusal is the useful answer here: every client
+ * falls back to `speechSynthesis`, and a phone's own voice *does* speak Hebrew — iOS and
+ * Android both ship one — so refusing gets the message read, and pretending would not.
  */
 export function chooseVoice(requested, text, known) {
   const wanted = String(requested || '').trim();
@@ -1063,7 +1121,16 @@ export function chooseVoice(requested, text, known) {
 
   let chosen = byName(wanted) || preferredVoice(known) || known[0];
 
-  if (needsMultilingualVoice(text) && !speaksHebrew(chosen)) {
+  // Two thresholds, so the two moves stay separate: a Hebrew message needs a voice that
+  // *is* Hebrew, and an English message with Hebrew in it needs one that will not drop
+  // it. Collapsing them would send a Hebrew message to Ava, whose Hebrew is accented
+  // where Hila's is native, and leave the routing this fix is about doing nothing.
+  const inHebrew = needsMultilingualVoice(text);
+  const wrongVoice = inHebrew
+    ? !speaksHebrew(chosen)
+    : hasHebrew(text) && !readsHebrew(chosen);
+
+  if (wrongVoice) {
     // In order: the Hebrew voice this deployment prefers, any Hebrew voice, any
     // multilingual one. `known` is already ordered Azure before OpenAI, so a box with
     // both reads Hebrew on the free tier without being told to.
@@ -1072,7 +1139,16 @@ export function chooseVoice(requested, text, known) {
       known.find((v) => speaksHebrew(v) && v.provider === 'azure') ||
       byName(OPENAI_VOICE) ||
       known.find(speaksHebrew);
-    if (!hebrew) {
+    // For a message that is mostly English, a Hebrew voice is the last resort rather
+    // than the first: it would read the English half accented, and an Azure English
+    // voice says both halves natively — the Hebrew runs in Hila, the rest in its own
+    // voice. `preferredVoice` is asked rather than picking the first Azure record so
+    // that an operator's `SPEAK_VOICE` still decides which English voice that is.
+    const english = inHebrew
+      ? null
+      : [preferredVoice(known.filter(readsHebrew)), known.find(readsHebrew)].find(Boolean);
+    const moved = english || hebrew;
+    if (!moved) {
       throw new SpeakError(
         'there is Hebrew in this message and Polly has no Hebrew voice, so the box ' +
           'cannot read it — this device will use its own voice instead. To read ' +
@@ -1082,7 +1158,7 @@ export function chooseVoice(requested, text, known) {
         409,
       );
     }
-    chosen = hebrew;
+    chosen = moved;
   }
 
   if (!chosen) {
