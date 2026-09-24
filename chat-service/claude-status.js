@@ -304,9 +304,17 @@ let resumeScan = { at: 0, sessions: new Map() };
  * resumed — a fresh one, or one the wrapper started — is not found here, and that is
  * the old answer, not a new wrong one.
  *
- * Deliberately narrow: `--resume` with a session id, in the argv of something called
- * claude. A tool that merely mentions an id (this file's own grep, a text editor
- * holding the transcript open) is not running a conversation.
+ * `--session-id=<id>` counts for the same reason, and it is not a hypothetical: the
+ * sessions a systemd timer starts (`tools/morning.sh` in koinespace, 04:57 daily) name
+ * their conversation that way rather than resuming one, and they are not panel
+ * processes at all, so the broker has never heard of them. Measured 2026-09-24: the
+ * page for one of those was reporting "your turn · not running" while the process was
+ * twenty seconds into a tool call. A conversation that only a cron job has ever driven
+ * is still a conversation someone reads on a phone.
+ *
+ * Deliberately narrow: `--resume` or `--session-id` with a session id, in the argv of
+ * something called claude. A tool that merely mentions an id (this file's own grep, a
+ * text editor holding the transcript open) is not running a conversation.
  */
 async function resumingSessions() {
   if (Date.now() - resumeScan.at < RESUME_SCAN_TTL_MS) return resumeScan.sessions;
@@ -322,15 +330,17 @@ async function resumingSessions() {
       } catch {
         return; // exited mid-sweep, or not ours to read
       }
-      if (!argv.includes('--resume') || !argv.includes('claude')) return;
-      const id = /--resume[=\0]([0-9a-fA-F-]{8,64})(?:\0|$)/.exec(argv)?.[1];
+      if (!argv.includes('claude')) return;
+      const id = /--(?:resume|session-id)[=\0]([0-9a-fA-F-]{8,64})(?:\0|$)/.exec(argv)?.[1];
       if (!id) return;
       const pid = Number(entry);
       // The oldest wins where two processes resume one id, because that is the fork
       // this whole daemon exists to prevent and the older one is the turn in
       // progress. `findings` in admin.js is where the fork itself is reported.
       const seen = sessions.get(id);
-      if (!seen || pid < seen.pid) sessions.set(id, offBrokerSession(id, pid));
+      if (!seen || pid < seen.pid) {
+        sessions.set(id, offBrokerSession(id, pid, printMode(argv.split('\0'))));
+      }
     }));
   } catch {
     /* no /proc: nothing more can be said, and the broker's answer stands alone */
@@ -341,21 +351,38 @@ async function resumingSessions() {
 }
 
 /**
+ * Whether an argv is a print-mode run: `claude -p`, the one-shot form a script or a
+ * timer uses.
+ *
+ * It matters because it settles the question this file otherwise cannot answer from
+ * outside a process. An interactive `claude` spends most of its life idle, waiting for
+ * somebody to type, so a live pid says nothing about whether a turn is in flight. A
+ * `-p` run has no prompt to return to: it is handed one instruction, works until the
+ * answer is out, and exits. So while it exists it is working, and when it stops
+ * working it is gone — there is no third state to be wrong about.
+ */
+function printMode(args) {
+  return args.includes('-p') || args.includes('--print');
+}
+
+/**
  * An unbrokered process, in the shape the rest of this file reads.
  *
- * `working: false` is not a claim that it is idle — it is the only honest thing to
- * say, because in-flight is exactly what the broker was for and nobody is reading
- * this process's stdout. It is also the input the transcript overrides are built for:
- * `unseen` takes a live pid and a mid-turn file the pid is old enough to have
- * written, which is the whole of what is knowable from out here. Everything the
- * broker alone can count is null rather than 0, so no client reports a number that
- * came from nowhere.
+ * `working` is false for an interactive one — not a claim that it is idle, but the only
+ * honest thing to say, because in-flight is exactly what the broker was for and nobody
+ * is reading this process's stdout. It is also the input the transcript overrides are
+ * built for: `unseen` takes a live pid and a mid-turn file the pid is old enough to
+ * have written, which is the whole of what is knowable from out here. A print-mode pid
+ * needs none of that machinery and is reported working outright — see `printMode`.
+ *
+ * Everything the broker alone can count is null rather than 0, so no client reports a
+ * number that came from nowhere.
  */
-function offBrokerSession(sessionId, pid) {
+function offBrokerSession(sessionId, pid, printing = false) {
   return {
     cwd: null,
     sessionId,
-    working: false,
+    working: printing,
     clients: null,
     idleMs: null,
     spokeMs: null,

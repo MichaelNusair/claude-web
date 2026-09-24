@@ -698,10 +698,10 @@ writeConvo(TRANSCRIPT, title('The one on screen', SESSION), assistant('let me lo
  * — the check above took one, and this is not a test of the clock. It resolves inside
  * that window or it has failed.
  */
-const settle = async (want, ms = 6000) => {
+const settle = async (want, ms = 6000, id = SESSION) => {
   const until = Date.now() + ms;
   for (;;) {
-    status = await claudeStatus(CWD, { sessionId: SESSION });
+    status = await claudeStatus(CWD, { sessionId: id });
     if (want(status) || Date.now() > until) return status;
     await new Promise((resolve) => setTimeout(resolve, 200));
   }
@@ -734,6 +734,39 @@ writeConvo(TRANSCRIPT, title('The one on screen', SESSION), assistant('let me lo
 await settle((s) => s.live === false);
 ok(status.live === false && status.state === 'idle',
   'and once nothing is resuming it, a mid-turn conversation is your turn again');
+
+section('A session a timer started is working while it exists:');
+/*
+ * The same report a day later, from the phone: a conversation a systemd timer had
+ * started at 04:57 was shown as "your turn · just now · not running" while the process
+ * was twenty seconds into a tool call. Two reasons, both fixed here.
+ *
+ * It names its conversation with `--session-id` rather than resuming one, so the /proc
+ * sweep did not match it at all. And it is `claude -p`, which has no prompt to return
+ * to: one instruction, then it exits. So unlike an interactive process, its mere
+ * existence settles the question — which is why this fixture leaves the transcript
+ * looking *finished*. Between a message and the next tool call that is exactly how a
+ * live `-p` run looks on disk, and it must still read as working.
+ */
+const TIMED = 'c3d4e5f6-0000-4000-8000-000000000000';
+const TIMED_TRANSCRIPT = path.join(PROJECT_DIR, `${TIMED}.jsonl`);
+writeConvo(TIMED_TRANSCRIPT, title('What the timer is doing', TIMED), assistant('here is the answer'));
+const timed = spawn(FAKE_CLAUDE, [SLEEPER, '-p', '--session-id', TIMED], { stdio: 'ignore' });
+timed.unref();
+brokerReply = { ok: true, v: 1, sessions: [] };
+
+status = await settle((s) => s.live === true, 6000, TIMED);
+ok(status.live === true && status.state === 'working',
+  'a one-shot run nobody can type into is working for as long as it exists');
+ok(status.brokered === false,
+  'and is reported as a process the broker never heard of, because it is one');
+ok(status.conversations?.find((c) => c.sessionId === TIMED)?.state === 'working',
+  'the list says so too, so the phone does not offer you a turn that is not yours');
+
+timed.kill();
+status = await settle((s) => s.live === false, 6000, TIMED);
+ok(status.live === false && status.state === 'idle',
+  'and once it has exited the answer it left behind is your turn, in the ordinary way');
 
 section('One project is never answered with another project’s conversation:');
 /*

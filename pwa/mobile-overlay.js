@@ -2787,9 +2787,19 @@
     );
     panel.querySelector('#cmo-status-detail').textContent = [
       ago === null ? null : ago === 0 ? 'just now' : `${ago} min ago`,
-      // Where the verdict came from, because the two are not equally certain: the
-      // broker knows, the transcript only shows the state it was left in.
-      s.source === 'broker' ? 'live from the broker' : 'read from the transcript',
+      /*
+       * Where the verdict came from, because the three are not equally certain: the
+       * broker knows, a pid found in /proc says only that something is holding the
+       * conversation, and the transcript shows the state it was left in.
+       *
+       * `brokered === false` is worth its own words rather than being folded into the
+       * first: it had been claiming "live from the broker" about processes the broker
+       * had never heard of, which is the one phrase in this line that is supposed to
+       * mean somebody is certain. Null means no process, or no broker to ask.
+       */
+      s.source !== 'broker'
+        ? 'read from the transcript'
+        : s.brokered === false ? 'a process outside the broker' : 'live from the broker',
       // Not the same statement as "idle": no process means nothing can be working,
       // where no device merely means nobody is watching one that is.
       s.live === false ? 'nothing running it' : s.clients === 0 ? 'no device attached' : null,
