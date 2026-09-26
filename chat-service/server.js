@@ -600,7 +600,15 @@ const server = http.createServer(async (req, res) => {
      * refuses Hebrew with a 409 instead; see speak.js.
      */
     if (pathname === '/api/speak/prepare' && req.method === 'POST') {
-      const body = JSON.parse((await readBody(req, 64 * 1024)).toString() || '{}');
+      /*
+       * Generous on purpose, and it has to be: `SPEAK_MAX_CHARS` is 40,000
+       * characters, Hebrew is two bytes of UTF-8 each and an emoji four, so the body
+       * carrying a message this will happily read can be several times its length in
+       * characters. The refusal for text that is too long belongs to speak.js, which
+       * answers 413 with a sentence the sheet can show — a limit here would throw
+       * before that and outside the catch below, which is a 500 and no explanation.
+       */
+      const body = JSON.parse((await readBody(req, 512 * 1024)).toString() || '{}');
       try {
         // Awaited: choosing the voice depends on whether this box has an OpenAI
         // key, because a message with Hebrew in it cannot be given to Polly. The

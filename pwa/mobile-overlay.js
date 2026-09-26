@@ -3717,10 +3717,6 @@
    *   this never starts while dictation is running.
    */
 
-  // Long enough for the summary a turn ends with; short enough that the wrong
-  // message, or a wall of prose, is over in about a minute rather than five. What
-  // is left is on screen, and the speech says so rather than just stopping.
-  const SPEECH_CAP = 2400;
   /*
    * Utterances are queued one at a time, not all at once.
    *
@@ -4121,14 +4117,24 @@
     // that ended in an abbreviation, and " . " from a line that was only markup.
     text = text.replace(/\.{2,}/g, '.').replace(/(?:\s\.)+/g, '.').trim();
 
-    if (text.length <= SPEECH_CAP) return text;
-    // Cut at the last sentence that fits, so it stops on a full stop rather than
-    // in the middle of a word — and say that there is more, because a summary
-    // that just stops sounds like the answer ended there.
-    const head = text.slice(0, SPEECH_CAP);
-    const lastStop = Math.max(head.lastIndexOf('. '), head.lastIndexOf('! '), head.lastIndexOf('? '));
-    const kept = lastStop > SPEECH_CAP / 3 ? head.slice(0, lastStop + 1) : head;
-    return `${kept.trim()} That is as far as I will read; the rest is on screen.`;
+    /*
+     * The whole message, however long it is.
+     *
+     * This used to stop at 2400 characters and say "that is as far as I will
+     * read; the rest is on screen", on the theory that a long read is usually the
+     * wrong message and a minute is enough to find out. In practice the person
+     * listening is listening *because* they are not looking at the screen — often
+     * with the phone in a pocket — so "the rest is on screen" is an instruction to
+     * go and do the thing they asked the voice to do for them, and it arrived
+     * exactly on the messages worth hearing in full. Stop is one tap away on the
+     * bar and it stops immediately, which is the answer to the wrong message.
+     *
+     * Nothing else needs a limit for this to be safe: the server refuses text past
+     * `SPEAK_MAX_CHARS` (see chat-service/speak.js) with a sentence, the overlay's
+     * answer to a refusal is to read the whole thing with the browser's own voice,
+     * and that voice is free and unmetered. Long is slow, never silent.
+     */
+    return text;
   }
 
   /**

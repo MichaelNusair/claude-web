@@ -1523,9 +1523,14 @@ Things that have burned people, in this codebase specifically:
   out, and a fenced diff pronounced one bracket at a time. So `speakable()` in
   `pwa/mobile-overlay.js` strips the markup, says " Code block. " where a fence was,
   says "link" where a URL was, reduces a path to its file name and `auth.js:42-51`
-  to "auth.js, line 42 to 51", and cuts at the last full stop inside 2400
-  characters — saying that it has, because a summary that just stops sounds like the
-  answer ending there. Two decisions in it are not obvious and both have a test:
+  to "auth.js, line 42 to 51". It does **not** cut the message short. It used to, at
+  2400 characters, announcing "the rest is on screen" — which is the one instruction a
+  listener cannot act on, because the reason to listen is that the phone is in a pocket,
+  and it landed on exactly the messages worth hearing in full. Stop is one tap away for
+  the wrong message; the only limit left is `SPEAK_MAX_CHARS` on the server, which
+  refuses a pasted file rather than a long answer, and a refusal is read by the
+  browser's own voice instead of not at all. Two decisions in it are not obvious and
+  both have a test:
   **a blank line ends a sentence and a single newline does not**, which is what those
   two mean in markdown and also how they sound — a full stop dropped into
   hard-wrapped prose is heard as a real one and changes what the sentence says, so

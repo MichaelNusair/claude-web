@@ -252,6 +252,30 @@ section('Refusing, with a reason and a status:');
 
   await refuses('nothing to read is a 400', 400, () => cache.prepare('   ', 'Ruth', 'generative'));
   await refuses('a message too long to read aloud is a 413', 413, () => cache.prepare('x. '.repeat(400), 'Ruth', 'generative'));
+
+  /*
+   * The default cap, which is the one a deployment actually runs with, and which is
+   * a guard against a pasted file rather than against a long answer. It used to be
+   * 4000 — "the 2400 the overlay cut at, with room to spare" — so when the overlay
+   * stopped cutting, this was the limit that would have refused every long message
+   * with a 413 the chat app reports as "nothing was read". A full-length final
+   * message is 10-15k characters; it has to prepare.
+   */
+  {
+    const wide = fakeVoice();
+    const long = 'Every sentence here is a real sentence with a full stop at the end. '.repeat(200);
+    let refused = null;
+    try {
+      new VoiceCache({ synthesize: wide.synthesize }).prepare(long, 'Ruth', 'generative');
+    } catch (err) {
+      refused = err;
+    }
+    ok(
+      refused === null,
+      'the default cap reads a full-length message rather than refusing it',
+      `${long.length} characters: ${refused ? `${refused.status} ${refused.message}` : 'prepared'}`,
+    );
+  }
   await refuses('an id nobody prepared is a 404', 404, () => cache.audio('deadbeef', 0));
 
   const { id, segments } = cache.prepare(MESSAGE.slice(0, 300), 'Ruth', 'generative');

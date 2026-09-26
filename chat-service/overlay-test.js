@@ -1426,9 +1426,13 @@ delete statusReply.conversations;
 
 // --------------------------------------------------------------- the long one
 /*
- * A message that is minutes of speech gets cut, and says that it was: a summary
- * that just stops sounds like the answer ended there. The rest is on screen, which
- * is the whole reason this is allowed to be lossy.
+ * A message that is minutes of speech is read to the end.
+ *
+ * It used to be cut at 2400 characters with "that is as far as I will read; the rest
+ * is on screen" — and that sentence is the bug: someone listening is listening
+ * because they are *not* looking at the screen, so being told to go and look is
+ * being told to do the thing they asked the voice for. It fired on the long
+ * summaries, which are the ones worth hearing. Stop answers the wrong message.
  */
 const essay = `${'Every sentence here is a real sentence with a full stop at the end of it. '.repeat(60)}`;
 statusReply = {
@@ -1442,18 +1446,17 @@ tapSpeak();
 await drain();
 const essayHeard = utterances.join(' ');
 ok(
-  'a very long message was read out in full — this is a phone, and the rest of it is ' +
-    'on screen',
-  essayHeard.length < 2600 && essayHeard.length > 1200,
+  `a very long message was cut short: ${essayHeard.length} characters of ${essay.length} ` +
+    'were spoken — the listener is not looking at the screen, which is why they are listening',
+  essayHeard.length > essay.length - 20,
 );
 ok(
-  'the reading of a truncated message just stopped, which sounds like the answer ' +
-    'ending there',
-  /as far as I will read/.test(essayHeard),
+  'the read announced that it was stopping early, on a message it read all of',
+  !/as far as I will read/.test(essayHeard) && !/rest is on screen/.test(essayHeard),
 );
 ok(
-  'the cut landed mid-sentence instead of on a full stop',
-  /end of it\. That is as far as I will read/.test(essayHeard),
+  'the last sentence of a long message was not the last thing spoken',
+  /full stop at the end of it\.$/.test(essayHeard.trim()),
 );
 
 // --------------------------------------------- following the sheet while it is open

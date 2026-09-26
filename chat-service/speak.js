@@ -46,12 +46,13 @@
  * What this refuses, and why each refusal exists:
  *
  *  - **A daily character budget** (`SPEAK_DAILY_CHARS`). Generative Polly is $30
- *    per million characters, so a full 2400-character read is about 7 cents and a
+ *    per million characters, so a full 3000-character read is about 9 cents and a
  *    loop that re-reads a message every few seconds is real money. A caller that
  *    reaches the budget gets 429 with a sentence saying so, and the client falls
  *    back to the browser voice rather than going quiet.
- *  - **A cap on the text** (`SPEAK_MAX_CHARS`). This is a spoken summary, not an
- *    audiobook; the client already cuts at 2400 characters.
+ *  - **A cap on the text** (`SPEAK_MAX_CHARS`). A guard against a pasted file or a
+ *    whole transcript, not against a long answer — nothing the client sends
+ *    approaches it. See the constant for why the number is what it is.
  *  - **An allowlist of voices.** A caller-supplied string is never passed through
  *    to the API: an unknown voice falls back to the default and the answer says
  *    which voice was actually used, so a stale phone with an old name in
@@ -190,9 +191,26 @@ export const FIRST_SEGMENT_CHARS = Number(process.env.SPEAK_FIRST_CHARS || 160);
 // ~7.7s to build, ~40s of audio. The margin is what keeps the message continuous.
 export const SEGMENT_CHARS = Number(process.env.SPEAK_SEGMENT_CHARS || 700);
 
-// The client cuts at 2400 characters (SPEECH_CAP in pwa/mobile-overlay.js) and
-// may put a short lead-in in front of that. This is that, with room to spare.
-const MAX_CHARS = Number(process.env.SPEAK_MAX_CHARS || 4000);
+/*
+ * The longest message this will read, and no longer a mirror of a client cap.
+ *
+ * It used to be 4000, which was "the 2400 characters the overlay cut at, with room
+ * for a lead-in". The overlay no longer cuts — a listener with the phone in a pocket
+ * cannot act on "the rest is on screen" — so this is the only limit left, and it has
+ * to stand on its own reasons rather than on someone else's number:
+ *
+ *   40,000 characters is about three quarters of an hour of speech, and longer than
+ *   anything this app writes: a very long final message is 10-15k. So it is a guard
+ *   against a mistake — a pasted file, a whole transcript — and not against a long
+ *   answer, which is the thing it was accidentally refusing before.
+ *   It also bounds the audio one message can hold: mp3 runs ~0.35KB per character,
+ *   so a fully played 40k read is ~13MB and `MAX_MESSAGES` of them ~80MB, which is
+ *   the real reason not to make this number much larger.
+ *
+ * Past it the answer is a 413 with a sentence, and the overlay reads the whole
+ * message with the browser's own voice instead — slower and worse, never silent.
+ */
+const MAX_CHARS = Number(process.env.SPEAK_MAX_CHARS || 40_000);
 // A 700-character segment takes ~7.7s. This is for a bad day, not a normal one.
 const SYNTH_TIMEOUT_MS = Number(process.env.SPEAK_TIMEOUT_MS || 30_000);
 // ~$9/day at generative rates: enough for about 125 full reads, low enough that a
@@ -211,8 +229,10 @@ const OPENAI_DAILY_CHARS = Number(process.env.SPEAK_OPENAI_DAILY_CHARS || 300_00
  * from one; it is rationing a free thing so it lasts.
  *
  * It matters more now than when only Hebrew came through here, because English is the
- * default and English is most of what gets read: about a dozen full-length messages a
- * day fit inside it. What happens at the limit is a 429 and the client's usual answer
+ * default and English is most of what gets read — and more again since the client
+ * stopped cutting at 2400 characters, because a full-length message is now read to the
+ * end: call it five or six long ones a day rather than a dozen part-ones. What happens
+ * at the limit is a 429 and the client's usual answer
  * to one — the overlay reads with the browser's voice, the chat app says it cannot —
  * and *not* a silent move onto Polly, which would turn a rationed free thing into an
  * unasked-for bill. Anyone who would rather pay than wait for midnight can pick a
