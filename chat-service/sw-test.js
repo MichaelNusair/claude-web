@@ -45,7 +45,7 @@ const ORIGIN = 'https://claude.example.com';
  * and it means a syntax error or a reference to something a worker does not have
  * fails here rather than on a phone.
  */
-function boot({ windows = [], receiptFails = false, showRefused = null } = {}) {
+function boot({ windows = [], receiptFails = false, showRefused = null, onScreen = [{ tag: 'x' }] } = {}) {
   const log = {
     shown: [],      // registration.showNotification(...)
     opened: [],     // clients.openWindow(...)
@@ -72,6 +72,9 @@ function boot({ windows = [], receiptFails = false, showRefused = null } = {}) {
         log.shown.push({ title, ...options });
         return Promise.resolve();
       },
+      // What the browser says is on screen. A platform that accepted the call and
+      // surfaced nothing is the case this exists to tell apart, so it is settable.
+      getNotifications: () => Promise.resolve(onScreen),
       pushManager: { subscribe: () => Promise.reject(new Error('not exercised here')) },
     },
     clients: {
@@ -207,6 +210,11 @@ async function tap(data, { windows = [] } = {}) {
     JSON.parse(receipt?.options?.body || '{}').shown === true,
   );
   ok(
+    'the receipt does not say how many the browser is holding, which is the difference ' +
+      'between a notification the phone is hiding and one it discarded',
+    JSON.parse(receipt?.options?.body || '{}').held === 1,
+  );
+  ok(
     'the receipt was sent without credentials, and the route that records it is behind ' +
       'authentication — it would be a redirect to a login page',
     receipt?.options?.credentials === 'include',
@@ -244,6 +252,30 @@ async function tap(data, { windows = [] } = {}) {
     threw === null,
   );
   ok('the notification was not shown when the receipt could not be sent', log.shown.length === 1);
+}
+
+// --------------------------------------- shown, and then not on screen at all
+/*
+ * The case that cannot be seen from anywhere else: `showNotification` resolves, so
+ * every side of the delivery reports success, and the platform has surfaced nothing.
+ * Android does this when notifications are off for the installed app rather than for
+ * the browser — the page is never told. The count is the only evidence, so it travels
+ * even when it is zero, which JSON.stringify would drop if it were undefined.
+ */
+{
+  const { listeners, log } = boot({ onScreen: [] });
+  const waits = [];
+  listeners.get('push')({
+    data: { json: () => ({ title: 'Claude finished', body: 'Done.', tag: 'turn-vanished' }) },
+    waitUntil: (p) => waits.push(p),
+  });
+  await Promise.all(waits);
+  const body = JSON.parse(log.fetched[0]?.options?.body || '{}');
+  ok(
+    `a notification that was accepted and then vanished is reported as an ordinary ` +
+      `success: ${JSON.stringify(body)}`,
+    body.shown === true && body.held === 0,
+  );
 }
 
 // ------------------------------------------- a platform that will not display

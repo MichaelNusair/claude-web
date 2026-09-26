@@ -923,7 +923,19 @@ const server = http.createServer(async (req, res) => {
           + ' allowed for the browser itself in the phone\'s own settings',
         );
       } else {
-        console.log(`push: ${who} showed a notification${which}`);
+        /*
+         * `held` is what the browser believes is on screen. Zero is the interesting
+         * answer: the browser accepted the notification and the platform then declined
+         * to keep it, which is the phone's own settings rather than anything here.
+         */
+        const holding = Number.isInteger(body.held)
+          ? ` — the browser is holding ${body.held}`
+            + (body.held === 0
+              ? ', so the phone accepted it and displayed nothing: check notifications for the'
+                + ' installed app as well as for the browser'
+              : '')
+          : '';
+        console.log(`push: ${who} showed a notification${which}${holding}`);
       }
       json(res, 200, { ok: true });
       return;

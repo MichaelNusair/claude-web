@@ -61,6 +61,15 @@ self.addEventListener('push', (event) => {
         // answer buzz rather than silently replacing the previous one in place.
         tag,
         renotify: true,
+        /*
+         * Buzz. A notification whose channel has been quietened by Android is shown
+         * silently at the bottom of the shade, which is indistinguishable from never
+         * arriving if the phone is in a pocket — and that is the state this was in
+         * while every side of the delivery reported success. The pattern is a request,
+         * not a guarantee: the platform still decides, and ignores it when the site's
+         * channel importance is low or Do Not Disturb is on.
+         */
+        vibrate: [180, 90, 180],
         // When the turn actually ended, not when the phone happened to wake up: a
         // notification delivered late otherwise claims to be current.
         timestamp: Date.parse(data.at || '') || Date.now(),
@@ -96,6 +105,25 @@ self.addEventListener('push', (event) => {
       }
 
       /*
+       * What the browser believes is on screen, which is the last fact available from
+       * inside the phone.
+       *
+       * `showNotification` resolving only means Chrome accepted the call. Android can
+       * then decline to surface anything — notifications turned off for the installed
+       * app rather than for the browser, a channel demoted to silent, Do Not Disturb —
+       * and nothing reports that back here. So the count is sent too: a notification
+       * the browser is still holding is one the phone has and is not showing you, which
+       * is a different problem from one that never arrived, and they had until now
+       * produced exactly the same evidence.
+       */
+      let held = null;
+      try {
+        held = (await self.registration.getNotifications({ tag })).length;
+      } catch {
+        /* Old browser, or a worker with no permission to look. Not worth failing for. */
+      }
+
+      /*
        * Tell the server it arrived.
        *
        * Without this the server's knowledge stops at the push service: FCM answers
@@ -119,6 +147,7 @@ self.addEventListener('push', (event) => {
           body: JSON.stringify({
             tag,
             shown: !refused,
+            held,
             error: refused ? String(refused.message || refused).slice(0, 200) : undefined,
           }),
         });
