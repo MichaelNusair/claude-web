@@ -93,6 +93,14 @@ const MAX_PLAINTEXT = RECORD_SIZE - 86 - 1 - 16;
  */
 const MAX_SUBSCRIPTIONS = 20;
 
+/*
+ * How many refused endpoints to remember.
+ *
+ * Small on purpose. This exists to catch a device re-posting the endpoint that was
+ * just refused, which it does on its next page load — not next week.
+ */
+const MAX_GONE = 50;
+
 const b64u = (buf) => Buffer.from(buf).toString('base64url');
 const unb64u = (text) => Buffer.from(String(text || ''), 'base64url');
 const hmac = (key, data) => createHmac('sha256', key).update(data).digest();
@@ -248,6 +256,53 @@ export function encryptPayload(plaintext, { p256dh, auth }, { salt, asPrivate } 
 }
 
 // ---------------------------------------------------------------- the devices
+/**
+ * Enough of a stored user agent to tell two of the operator's devices apart.
+ *
+ * A log line carrying 120 octets of `Mozilla/5.0 (…) AppleWebKit/…` boilerplate is
+ * one nobody reads to the end, and the only question being asked of it is "which
+ * device stopped getting notifications" — which the platform answers on its own.
+ */
+export function describeDevice(ua) {
+  const platform = /\(([^)]*)\)/.exec(String(ua || ''))?.[1] || '';
+  return platform.split(';').slice(0, 2).join(';').trim() || 'an unrecognised device';
+}
+
+/*
+ * Endpoints the push service has told us are gone, since this process started.
+ *
+ * This breaks a loop that is otherwise both silent and permanent. When a phone's
+ * registration expires at the push service, the browser goes on handing the app the
+ * same PushSubscription — it still looks healthy, and its application server key
+ * still matches ours, so neither side can tell it is dead. The app therefore
+ * re-posts that endpoint on every load, the next notification is refused, it is
+ * pruned, and round it goes: the switch reads "on" and the phone never buzzes.
+ *
+ * Remembering the refusal lets /api/push/subscribe say so, which is the one piece
+ * of information the device is missing and cannot obtain for itself. In memory
+ * rather than on disk because it is a hint, not a fact worth surviving a restart —
+ * and bounded, because the keys are strings a browser chooses.
+ */
+const goneEndpoints = new Set();
+
+function markGone(endpoint) {
+  goneEndpoints.add(String(endpoint));
+  // Insertion-ordered, so the first key is the oldest.
+  while (goneEndpoints.size > MAX_GONE) goneEndpoints.delete(goneEndpoints.values().next().value);
+}
+
+/**
+ * Has the push service already refused this endpoint?
+ *
+ * Answering true *consumes* the record. The caller's job is to tell one device once
+ * — it then makes a genuinely new subscription with a different endpoint — and a
+ * flag that stayed set would refuse to store the replacement if the browser ever
+ * handed back the same string again.
+ */
+export function wasGone(endpoint) {
+  return goneEndpoints.delete(String(endpoint));
+}
+
 let subsPromise = null;
 
 async function readSubscriptions() {
@@ -339,6 +394,7 @@ export function removeSubscription(endpoint) {
 export async function resetForTest({ keepFiles = false } = {}) {
   keysPromise = null;
   subsPromise = null;
+  goneEndpoints.clear();
   if (keepFiles) return;
   await unlink(KEY_FILE()).catch(() => {});
   await unlink(SUBS_FILE()).catch(() => {});
@@ -413,10 +469,16 @@ export async function sendPush(subscription, payload, { topic, ttl = TTL_S, urge
  * so there is nothing to reuse between them — and every failure is swallowed and
  * counted. The caller is a filesystem watcher on a timer; nothing up there can do
  * anything useful with a rejection.
+ *
+ * `results` carries the outcome per endpoint, because the totals cannot answer the
+ * question the caller of /api/push/test is actually asking. That caller is one
+ * device asking about *itself*, and a sum over every device says "sent" as long as
+ * some other phone is healthy — which is exactly how a phone comes to be told its
+ * test notification was sent one second after the push service refused it.
  */
 export async function notifyAll(payload, { topic } = {}) {
   const devices = await listSubscriptions();
-  if (!devices.length) return { sent: 0, failed: 0, pruned: 0, devices: 0 };
+  if (!devices.length) return { sent: 0, failed: 0, pruned: 0, devices: 0, results: [] };
 
   const results = await Promise.all(
     devices.map(async (device) => {
@@ -431,15 +493,42 @@ export async function notifyAll(payload, { topic } = {}) {
     }),
   );
   const gone = results.filter((r) => r.result.gone).map((r) => r.device.endpoint);
-  for (const endpoint of gone) await removeSubscription(endpoint);
+  for (const endpoint of gone) {
+    markGone(endpoint);
+    await removeSubscription(endpoint);
+  }
 
   const sent = results.filter((r) => r.result.ok).length;
   const failed = results.length - sent;
+  /*
+   * Every failure says so, including the prunes.
+   *
+   * A prune used to be the one outcome that logged nothing, on the reasoning that it
+   * is routine housekeeping rather than an error. It is not: "the push service has
+   * forgotten this device" is precisely the event behind a phone that has silently
+   * stopped buzzing, and skipping it meant the failure everyone was looking for was
+   * the only one that left no trace anywhere — not here, not in the device list, and
+   * not on the phone, whose switch still read "on".
+   */
   for (const { device, result } of results) {
-    if (result.ok || result.gone) continue;
-    console.error(
-      `push: ${new URL(device.endpoint).host} answered ${result.status}${result.error ? ` (${result.error})` : ''}`,
-    );
+    if (result.ok) continue;
+    const who = `${new URL(device.endpoint).host} (${describeDevice(device.ua)})`;
+    if (result.gone) {
+      console.error(`push: ${who} answered ${result.status} — forgotten by the push service, dropping it`);
+    } else {
+      console.error(`push: ${who} answered ${result.status}${result.error ? ` (${result.error})` : ''}`);
+    }
   }
-  return { sent, failed, pruned: gone.length, devices: results.length };
+  return {
+    sent,
+    failed,
+    pruned: gone.length,
+    devices: results.length,
+    results: results.map(({ device, result }) => ({
+      endpoint: device.endpoint,
+      ok: result.ok,
+      status: result.status,
+      gone: result.gone,
+    })),
+  };
 }

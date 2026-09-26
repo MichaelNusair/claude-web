@@ -3463,7 +3463,7 @@
    * which /chat/sw.js will never control — awaiting it here would hang forever.
    * `register()` hands back the registration, and its pushManager works from it.
    */
-  async function pushSubscribeHere() {
+  async function pushSubscribeHere({ fresh = false } = {}) {
     const reg = await navigator.serviceWorker.register(PUSH_SW);
     const { key } = await pushApi('/api/push/key').then((r) => r.json());
 
@@ -3471,7 +3471,12 @@
     // A subscription is bound to the key it was made with. If the server's keypair
     // has changed — a lost volume, a rebuilt box — the old subscription still looks
     // healthy here while every notification sent to it fails at the push service.
-    if (subscription && pushKeyOf(subscription) !== key) {
+    //
+    // `fresh` is the other reason to throw one away, and it cannot be detected here
+    // at all: the push service has forgotten the endpoint while the browser goes on
+    // handing out a subscription that still carries the right key. Only the server
+    // hears about that, which is why it is passed in rather than worked out.
+    if (subscription && (fresh || pushKeyOf(subscription) !== key)) {
       await subscription.unsubscribe().catch(() => {});
       subscription = null;
     }
@@ -3482,12 +3487,52 @@
         applicationServerKey: pushKeyBytes(key),
       });
     }
-    await pushApi('/api/push/subscribe', {
+    const answer = await pushApi('/api/push/subscribe', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(subscription),
-    });
+    }).then((r) => r.json());
+    /*
+     * The server has heard from the push service that this endpoint is dead, so the
+     * subscription in hand is worthless however healthy it looks. Replace it now,
+     * while a load is already happening and nobody has to be asked for anything —
+     * this is the loop that made notifications stop for a day without a single error
+     * on either side. Once only, so a server that kept saying `gone` cannot spin.
+     */
+    if (answer?.gone && !fresh) return pushSubscribeHere({ fresh: true });
     return subscription;
+  }
+
+  /** Ask the server to send one to *this* device, and name which one that is. */
+  const pushTestHere = (subscription) =>
+    pushApi('/api/push/test', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ endpoint: subscription.endpoint }),
+    }).then((r) => r.json());
+
+  /**
+   * What to say about a test notification, from this device's own result.
+   *
+   * `sent` is a total over every subscribed device, and reading success out of it is
+   * how this switch came to report "a test notification has just been sent to this
+   * device" one second after the push service refused that very device — the phone
+   * looked configured, stayed silent, and nothing anywhere disagreed for a day.
+   * `mine` is the answer to the question actually being asked.
+   */
+  function pushTestNote(result) {
+    if (!result.mine) {
+      return result.sent
+        ? 'On. A test notification was sent, but the server could not tell which device asked — so it may have gone to another one.'
+        : 'Subscribed, but the test notification could not be sent to any device.';
+    }
+    if (result.mine.gone) {
+      return 'Subscribed, but the push service has forgotten this device twice over. Clearing the app usually fixes it: open /chat/reset.html here, then turn this back on.';
+    }
+    if (!result.mine.ok) {
+      return `Subscribed, but the push service refused the test for this device (${result.mine.status}). Nothing will arrive here until that clears.`;
+    }
+    return 'On, and a test notification has just been sent to this device. If it does not appear within a few seconds, Android is holding it: check Settings › Apps › Chrome › Notifications.';
   }
 
   /** Stop this device, at both ends. */
@@ -3507,11 +3552,13 @@
   /**
    * Keep an existing subscription honest, at every load. Never prompts.
    *
-   * Two silent failures this repairs, both of which read as "notifications just
+   * Three silent failures this repairs, all of which read as "notifications just
    * stopped" from the phone: the server losing its device list, which lives on
-   * disk, and a rotated keypair leaving a subscription that can no longer be sent
-   * to. The chat app does this at boot; on a phone that only opens the editor, this
-   * is the only place it can happen.
+   * disk; a rotated keypair leaving a subscription that can no longer be sent to;
+   * and — the one that actually happened — an endpoint the push service has
+   * forgotten, which pushSubscribeHere replaces when the server says so. The chat
+   * app does this at boot; on a phone that only opens the editor, this is the only
+   * place it can happen.
    */
   async function pushRepair() {
     if (!pushSupported() || Notification.permission !== 'granted') return;
@@ -3587,7 +3634,7 @@
     const line = panel.querySelector('#cmo-notify-status');
     if (line) line.textContent = 'Turning them on…';
     try {
-      await pushSubscribeHere();
+      let subscription = await pushSubscribeHere();
       /*
        * A test notification, sent by the server to this device.
        *
@@ -3596,12 +3643,16 @@
        * battery optimiser holding the worker down — and the alternative to finding
        * that out now is finding it out by missing the notification that mattered.
        */
-      const result = await pushApi('/api/push/test', { method: 'POST' }).then((r) => r.json());
-      await paintNotify(
-        result.sent
-          ? 'On, and a test notification has just been sent to this device. If it does not appear within a few seconds, Android is holding it: check Settings › Apps › Chrome › Notifications.'
-          : 'Subscribed, but the test notification could not be sent. The server has the device; something between here and the push service refused it.',
-      );
+      let result = await pushTestHere(subscription);
+      if (result.mine?.gone) {
+        // The push service has just refused the endpoint this phone is holding, and
+        // that refusal is the only evidence anywhere that it is dead — the browser
+        // hands it over, its key matches, nothing else disagrees. So the test is
+        // also the discovery: replace it and try once more before saying anything.
+        subscription = await pushSubscribeHere({ fresh: true });
+        result = await pushTestHere(subscription);
+      }
+      await paintNotify(pushTestNote(result));
     } catch (err) {
       await paintNotify(`Could not turn them on: ${err.message}`);
     }

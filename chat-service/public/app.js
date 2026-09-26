@@ -3488,7 +3488,7 @@ async function pushSubscription() {
  * thing that happened, and one `await` of a network round trip is enough to lose
  * that on mobile Chrome.
  */
-async function pushSubscribe() {
+async function pushSubscribe({ fresh = false } = {}) {
   const reg = await pushWorker();
   const { key } = await api('/api/push/key').then((r) => r.json());
 
@@ -3497,7 +3497,12 @@ async function pushSubscribe() {
   // has changed — a lost volume, a rebuilt box — the old subscription still looks
   // healthy here and every notification sent to it fails at the push service, so
   // the mismatch has to be repaired rather than reported.
-  if (subscription && pushKeyOf(subscription) !== key) {
+  //
+  // `fresh` is the same repair for the failure this side cannot see at all: the push
+  // service has forgotten the endpoint, while the browser goes on handing out a
+  // subscription carrying the right key. Only the server hears that, so it is passed
+  // in rather than worked out here.
+  if (subscription && (fresh || pushKeyOf(subscription) !== key)) {
     await subscription.unsubscribe().catch(() => {});
     subscription = null;
   }
@@ -3510,11 +3515,19 @@ async function pushSubscribe() {
     });
   }
 
-  await api('/api/push/subscribe', {
+  const answer = await api('/api/push/subscribe', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(subscription),
-  });
+  }).then((r) => r.json());
+  /*
+   * The server has been told by the push service that this endpoint is dead, so what
+   * is in hand is worthless however healthy it looks. Replace it here, during a load
+   * nobody had to ask for — this exact loop, a phone re-offering an endpoint the push
+   * service had forgotten, is how notifications stopped for a day with no error on
+   * either side. Once only, so a server that kept answering `gone` cannot spin.
+   */
+  if (answer?.gone && !fresh) return pushSubscribe({ fresh: true });
   return subscription;
 }
 
@@ -3535,16 +3548,45 @@ async function pushUnsubscribe() {
 /**
  * Keep an existing subscription honest, at every load. Never prompts.
  *
- * Two silent failures this repairs, both of which look like "notifications just
+ * Three silent failures this repairs, all of which look like "notifications just
  * stopped working" from the phone: the server losing its device list (it lives on
- * disk, and a restore or a fresh volume drops it), and a rotated VAPID keypair
- * leaving a subscription that can no longer be sent to.
+ * disk, and a restore or a fresh volume drops it), a rotated VAPID keypair leaving a
+ * subscription that can no longer be sent to, and — the one that actually happened —
+ * an endpoint the push service has forgotten, which pushSubscribe replaces as soon as
+ * the server says so.
  */
 async function pushSync() {
   if (!pushSupported() || Notification.permission !== 'granted') return;
   const existing = await pushSubscription();
   if (!existing) return;
   await pushSubscribe().catch(() => {});
+}
+
+/** Ask the server to send one to *this* device, and say which one that is. */
+const pushTest = (subscription) =>
+  api('/api/push/test', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ endpoint: subscription.endpoint }),
+  }).then((r) => r.json());
+
+/**
+ * What to say about a test notification, from this device's own result.
+ *
+ * `sent` counts every subscribed device, so a desktop that received the test made
+ * this toast say "sent a test one" on a phone whose own message had just been refused
+ * — the switch looked right, nothing arrived, and no log disagreed for a day. `mine`
+ * is the answer to the question the tap was asking.
+ */
+function pushTestToast(result) {
+  if (!result.mine) {
+    return result.sent
+      ? 'Notifications on — a test was sent, but maybe not to this device'
+      : 'Subscribed, but the test notification could not be sent';
+  }
+  if (result.mine.gone) return 'Subscribed, but the push service keeps forgetting this device';
+  if (!result.mine.ok) return `Subscribed, but the push service refused the test (${result.mine.status})`;
+  return 'Notifications on — sent a test one to this device';
 }
 
 // --- reading aloud ----------------------------------------------------------
@@ -4679,9 +4721,16 @@ if (pushToggle) {
 
     pushToggle.disabled = true;
     try {
-      await pushSubscribe();
-      const result = await api('/api/push/test', { method: 'POST' }).then((r) => r.json());
-      toast(result.sent ? 'Notifications on — sent a test one' : 'Subscribed, but the test notification failed');
+      let subscription = await pushSubscribe();
+      let result = await pushTest(subscription);
+      if (result.mine?.gone) {
+        // The refusal is the discovery: nothing on this side can tell that the push
+        // service has dropped an endpoint it still hands out. Replace it and retry
+        // once, so the switch fixes this instead of reporting it.
+        subscription = await pushSubscribe({ fresh: true });
+        result = await pushTest(subscription);
+      }
+      toast(pushTestToast(result));
     } catch (err) {
       toast(`Could not turn on notifications: ${err.message}`);
     } finally {
@@ -4823,6 +4872,7 @@ window.__screenForTest = {
 // browser, so the test stubs the three browser pieces and drives these.
 window.__pushForTest = {
   paintPushToggle, pushSync, pushSubscription, pushSubscribe, pushUnsubscribe, pushKeyOf,
+  pushTest, pushTestToast,
 };
 // Reading aloud is server-side synthesis played through one unlocked element, and
 // every interesting part of it — what a block button sends, what a refusal does, the

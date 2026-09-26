@@ -45,12 +45,14 @@ const ORIGIN = 'https://claude.example.com';
  * and it means a syntax error or a reference to something a worker does not have
  * fails here rather than on a phone.
  */
-function boot({ windows = [] } = {}) {
+function boot({ windows = [], receiptFails = false } = {}) {
   const log = {
     shown: [],      // registration.showNotification(...)
     opened: [],     // clients.openWindow(...)
     focused: [],    // client.focus()
     posted: [],     // client.postMessage(...)
+    fetched: [],    // fetch(...)
+    order: [],      // what happened, in the order it happened
     closed: 0,      // notification.close()
     pending: [],    // whatever was handed to event.waitUntil
   };
@@ -63,6 +65,7 @@ function boot({ windows = [] } = {}) {
     registration: {
       showNotification: (title, options) => {
         log.shown.push({ title, ...options });
+        log.order.push('shown');
         return Promise.resolve();
       },
       pushManager: { subscribe: () => Promise.reject(new Error('not exercised here')) },
@@ -78,7 +81,23 @@ function boot({ windows = [] } = {}) {
   };
 
   const caches = { keys: () => Promise.resolve([]), delete: () => Promise.resolve(true) };
-  const fetchStub = () => Promise.reject(new Error('the worker fetched something unasked'));
+  /*
+   * The worker is allowed exactly one request: the receipt that says a notification was
+   * actually shown. Everything else is still a failure — a worker that fetches on the
+   * app's behalf is what wedged this app once, and why it has no `fetch` handler.
+   *
+   * `receiptFails` is the normal case rather than an edge one: the phone that is woken
+   * by a push is frequently the phone with no usable network, and the notification must
+   * not be lost to a failed piece of diagnostics.
+   */
+  const fetchStub = (url, options = {}) => {
+    log.fetched.push({ url: String(url), options });
+    log.order.push('receipt');
+    if (!String(url).includes('/api/push/received')) {
+      return Promise.reject(new Error('the worker fetched something unasked'));
+    }
+    return receiptFails ? Promise.reject(new Error('offline')) : Promise.resolve({ ok: true });
+  };
 
   // eslint-disable-next-line no-new-func
   new Function('self', 'caches', 'atob', 'fetch', workerJs)(
@@ -160,6 +179,94 @@ async function tap(data, { windows = [] } = {}) {
     shown?.data?.url === payload.url,
   );
   ok('the notification lost which conversation it was about', shown?.data?.sessionId === 'S1');
+
+  /*
+   * The receipt. Without it the server's knowledge of a notification stops at the push
+   * service's 201, and everything after that — whether Chrome woke this worker at all,
+   * whether Android then chose to show anything — happens where no log on the box can
+   * see it. "It said it sent one and nothing appeared" was unanswerable for a day
+   * because of exactly that gap, so a notification that is shown says so.
+   */
+  const receipt = log.fetched[0];
+  ok(
+    `the worker told nobody the notification arrived: ${JSON.stringify(log.fetched)} — the ` +
+      'server can then only report what the push service accepted, not what was shown',
+    receipt?.url === '/api/push/received',
+  );
+  ok(
+    'the receipt does not say which notification it is for, so two in a row are indistinguishable',
+    JSON.parse(receipt?.options?.body || '{}').tag === 'turn-abc',
+  );
+  ok(
+    'the receipt was sent without credentials, and the route that records it is behind ' +
+      'authentication — it would be a redirect to a login page',
+    receipt?.options?.credentials === 'include',
+  );
+  ok(
+    `the receipt was sent before the notification: ${log.order.join(' → ')} — Chrome revokes ` +
+      'a userVisibleOnly subscription that shows nothing, so nothing may run in front of it',
+    log.order[0] === 'shown',
+  );
+}
+
+// ------------------------------------------------------- a receipt that fails
+/*
+ * The phone woken by a push is often the phone with no usable network, and the receipt
+ * is diagnostics: losing one costs a log line. Losing the notification costs the
+ * feature, and Chrome charges for it — a `userVisibleOnly` subscription that receives a
+ * push and shows nothing is revoked after one warning.
+ */
+{
+  const { listeners, log } = boot({ receiptFails: true });
+  const waits = [];
+  listeners.get('push')({
+    data: { json: () => ({ title: 'Claude finished', body: 'Done.', tag: 'turn-xyz' }) },
+    waitUntil: (p) => waits.push(p),
+  });
+  let threw = null;
+  try {
+    await Promise.all(waits);
+  } catch (err) {
+    threw = err;
+  }
+  ok(
+    `a failed receipt propagated out of the push handler (${threw?.message}) — the browser ` +
+      'counts that as a push that showed nothing',
+    threw === null,
+  );
+  ok('the notification was not shown when the receipt could not be sent', log.shown.length === 1);
+}
+
+// ----------------------------------------------- a payload that is not ours
+/*
+ * Something else's push, or a truncated one. `event.data.json()` throws, and the one
+ * unacceptable outcome is showing nothing: the subscription is spent either way, so it
+ * may as well be spent on something the operator can see.
+ */
+{
+  const { listeners, log } = boot();
+  const waits = [];
+  listeners.get('push')({
+    data: {
+      json: () => { throw new Error('not json'); },
+      text: () => 'something else entirely',
+    },
+    waitUntil: (p) => waits.push(p),
+  });
+  await Promise.all(waits);
+  ok(
+    'a payload that is not ours showed no notification, which costs the subscription itself',
+    log.shown.length === 1,
+  );
+  ok(
+    `an unreadable payload lost the text it did have: ${JSON.stringify(log.shown[0]?.body)}`,
+    log.shown[0]?.body === 'something else entirely',
+  );
+  ok(
+    'an untagged notification has no tag, so a second one appears alongside the first ' +
+      'instead of replacing it',
+    log.shown[0]?.tag === 'cw-turn',
+  );
 }
 
 // ------------------------------------------------------------- nothing open

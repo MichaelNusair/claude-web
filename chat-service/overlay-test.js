@@ -2397,12 +2397,12 @@ let subscribeOpts = null;
 let unsubscribeCalls = 0;
 let subscription = null;
 
-const makeSubscription = (key) => ({
-  endpoint: ENDPOINT,
+const makeSubscription = (key, endpoint) => ({
+  endpoint,
   options: { applicationServerKey: key },
   // What the browser sends the server: the real thing has a toJSON, and posting
   // the object without it would send `{}`.
-  toJSON: () => ({ endpoint: ENDPOINT, keys: { p256dh: 'p256dh-bytes', auth: 'auth-bytes' } }),
+  toJSON: () => ({ endpoint, keys: { p256dh: 'p256dh-bytes', auth: 'auth-bytes' } }),
   unsubscribe: () => {
     acts.push('browser-unsubscribe');
     unsubscribeCalls += 1;
@@ -2411,6 +2411,7 @@ const makeSubscription = (key) => ({
   },
 });
 
+let subscribeCount = 0;
 const registration = {
   scope: 'https://claude.example.com/chat/',
   pushManager: {
@@ -2418,7 +2419,15 @@ const registration = {
     subscribe: (opts) => {
       acts.push('browser-subscribe');
       subscribeOpts = opts;
-      subscription = makeSubscription(opts.applicationServerKey);
+      subscribeCount += 1;
+      // Each one gets its own endpoint, because a replacement subscription having a
+      // different endpoint is the entire point of making one — with a single fixed
+      // string, "the server was told about the new subscription" would be true of
+      // code that never made one.
+      subscription = makeSubscription(
+        opts.applicationServerKey,
+        subscribeCount === 1 ? ENDPOINT : `${ENDPOINT}-${subscribeCount}`,
+      );
       return Promise.resolve(subscription);
     },
   },
@@ -2460,6 +2469,19 @@ const jsonReply = (body, status = 200) =>
   Promise.resolve({ ok: status < 400, status, json: () => Promise.resolve(body) });
 
 /*
+ * What the two POSTs answer, one entry per call, the last one reused.
+ *
+ * Both of them carry news this side cannot work out for itself: whether the push
+ * service has forgotten the endpoint the browser keeps handing over. `mine` is this
+ * device's own result rather than a fleet total — the total is what let a phone
+ * report a test notification as sent one second after its own was refused.
+ */
+const answers = {
+  subscribe: [{ ok: true, devices: 1 }],
+  test: [{ sent: 1, devices: 1, mine: { ok: true, status: 201, gone: false } }],
+};
+
+/*
  * What the server says this project's manifest is. Mutable because the install check
  * has to be asked the same question twice: once about a page inside the app's scope
  * and once about a page outside it, which are the two answers it exists to tell
@@ -2477,7 +2499,7 @@ w.fetch = (url, options = {}) => {
   if (target.includes('/api/push/subscribe')) {
     acts.push('server-subscribe');
     posted.subscribe = JSON.parse(options.body || '{}');
-    return jsonReply({ ok: true });
+    return jsonReply(answers.subscribe.length > 1 ? answers.subscribe.shift() : answers.subscribe[0]);
   }
   if (target.includes('/api/push/unsubscribe')) {
     acts.push('server-unsubscribe');
@@ -2486,7 +2508,8 @@ w.fetch = (url, options = {}) => {
   }
   if (target.includes('/api/push/test')) {
     acts.push('test');
-    return jsonReply({ sent: 1 });
+    posted.test = JSON.parse(options.body || '{}');
+    return jsonReply(answers.test.length > 1 ? answers.test.shift() : answers.test[0]);
   }
   if (target.includes('manifest.webmanifest')) {
     return jsonReply(fakeManifest);
@@ -2570,6 +2593,11 @@ ok(
   'the switch still offers to turn notifications on after turning them on',
   /Turn off/.test(notifyBtn()?.textContent ?? ''),
 );
+ok(
+  'the test did not say which device asked, so the server can only answer with a total ' +
+    'across every device — and a desktop that received it makes this phone say "sent"',
+  posted.test?.endpoint === ENDPOINT,
+);
 ok('nothing said that a test notification had been sent', /test notification/.test(notifyLine()));
 
 /*
@@ -2606,6 +2634,93 @@ ok(
   'the switch does not offer to turn notifications back on',
   /Notify me/.test(notifyBtn()?.textContent ?? ''),
 );
+
+/*
+ * The failure all of this was built for, and the reason it went a day unnoticed:
+ * the push service forgets a device while the browser goes on handing out the same
+ * subscription, still carrying the right key. Nothing on this side can tell — the
+ * only evidence anywhere is the refusal the server hears — so the recovery has to be
+ * driven by what the server says back, and it has to happen on the tap rather than
+ * being reported as a problem for someone to solve.
+ */
+acts.length = 0;
+const subscribesBefore = subscribeCount;
+answers.test = [
+  { sent: 0, devices: 1, failed: 1, pruned: 1, mine: { ok: false, status: 410, gone: true } },
+  { sent: 1, devices: 1, mine: { ok: true, status: 201, gone: false } },
+];
+await tapNotify();
+ok(
+  `a device told its own endpoint was refused kept it: ${acts.join(' → ')} — it will ` +
+    're-offer the dead endpoint on every load, be pruned again, and never buzz',
+  subscribeCount - subscribesBefore === 2,
+);
+ok(
+  'the refused subscription was not dropped at the browser first, so the replacement is ' +
+    'the same endpoint again',
+  acts.filter((a) => a === 'browser-unsubscribe').length === 1,
+);
+ok(
+  `the server was not given the replacement: ${JSON.stringify(posted.subscribe?.endpoint)}`,
+  posted.subscribe?.endpoint === `${ENDPOINT}-${subscribeCount}`,
+);
+ok(
+  `the replacement was never tested: ${acts.join(' → ')} — the recovery is only worth ` +
+    'anything if it is checked before the switch claims to be on',
+  acts.filter((a) => a === 'test').length === 2 && posted.test?.endpoint === `${ENDPOINT}-${subscribeCount}`,
+);
+ok(
+  `after recovering, the switch does not say a notification was sent: ${notifyLine()}`,
+  /test notification has just been sent/.test(notifyLine()),
+);
+
+/*
+ * The same news, arriving at the other end: the server already knew this endpoint was
+ * refused, so it says so when it is offered again. That is the silent case — no tap,
+ * no test, just a page load — and answering it here is what stops the loop.
+ */
+await tapNotify();
+acts.length = 0;
+const beforeGoneSubscribe = subscribeCount;
+answers.subscribe = [{ gone: true }, { ok: true, devices: 1 }];
+answers.test = [{ sent: 1, devices: 1, mine: { ok: true, status: 201, gone: false } }];
+await tapNotify();
+ok(
+  `the server said the endpoint it was offered is gone and the device kept it anyway: ${acts.join(' → ')}`,
+  subscribeCount - beforeGoneSubscribe === 2,
+);
+ok(
+  'the endpoint the server refused is the one it ended up holding',
+  posted.subscribe?.endpoint === `${ENDPOINT}-${subscribeCount}`,
+);
+ok(
+  `a server that answers "gone" twice loops: ${acts.filter((a) => a === 'server-subscribe').length} ` +
+    'subscribe posts for one tap',
+  acts.filter((a) => a === 'server-subscribe').length === 2,
+);
+
+/*
+ * A refusal that is not "gone" — a rate limit, a push service having a bad day —
+ * cannot be recovered from here, and the only wrong answer is to claim it worked.
+ */
+await tapNotify();
+acts.length = 0;
+answers.subscribe = [{ ok: true, devices: 1 }];
+answers.test = [{ sent: 0, devices: 1, failed: 1, mine: { ok: false, status: 429, gone: false } }];
+await tapNotify();
+ok(
+  `the push service refused this device and the switch said it worked: ${notifyLine()}`,
+  /refused/.test(notifyLine()) && /429/.test(notifyLine()),
+);
+ok(
+  'a refusal that is not "gone" resubscribed anyway, which loses a working subscription ' +
+    'to a temporary error',
+  acts.filter((a) => a === 'browser-subscribe').length === 1,
+);
+
+// Back to a server that works, for whatever runs after this.
+await tapNotify();
+answers.test = [{ sent: 1, devices: 1, mine: { ok: true, status: 201, gone: false } }];
 
 /*
  * A site that has been refused permission cannot ask again — the browser answers

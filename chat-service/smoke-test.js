@@ -848,8 +848,25 @@ if (typeof handler === 'function' && panesHooks) {
   const subscribeOpts = [];
   const posted = {};
 
+  const ENDPOINT = 'https://push.example.test/send/abc123';
+  /*
+   * What the two POSTs answer, one entry per call, the last one reused.
+   *
+   * Both carry the one fact this side cannot work out: whether the push service still
+   * knows the endpoint the browser keeps handing over. `mine` is this device's own
+   * result, not a total over every device — reading success out of the total is how a
+   * phone came to report a test notification as sent one second after its own was
+   * refused, and the desktop's success covered for it for a day.
+   */
+  const answers = {
+    subscribe: [{ devices: 1 }],
+    test: [{ sent: 1, failed: 0, devices: 1, mine: { ok: true, status: 201, gone: false } }],
+  };
+  const nextAnswer = (which) => (answers[which].length > 1 ? answers[which].shift() : answers[which][0]);
+
+  let endpointSeq = 0;
   const makeSubscription = (key) => ({
-    endpoint: 'https://push.example.test/send/abc123',
+    endpoint: endpointSeq <= 1 ? ENDPOINT : `${ENDPOINT}-${endpointSeq}`,
     // The browser reports back the key it was created with; the client compares
     // it to the server's, and that comparison is the only thing standing between
     // a rotated keypair and a phone that goes quiet with nothing in any log.
@@ -872,6 +889,10 @@ if (typeof handler === 'function' && panesHooks) {
       subscribe: (opts) => {
         acts.push('subscribe');
         subscribeOpts.push(opts);
+        // Each replacement gets its own endpoint, because that is what a replacement
+        // is — with one fixed string, "the server was told about the new subscription"
+        // would also be true of code that never made one.
+        endpointSeq += 1;
         subscription = makeSubscription(opts.applicationServerKey);
         return Promise.resolve(subscription);
       },
@@ -909,11 +930,14 @@ if (typeof handler === 'function' && panesHooks) {
     if (path.includes('/api/push/key')) {
       return Promise.resolve({ ok: true, json: () => Promise.resolve({ key: KEY, devices: 0 }) });
     }
-    if (path.includes('/api/push/subscribe') || path.includes('/api/push/unsubscribe')) {
+    if (path.includes('/api/push/subscribe')) {
+      return Promise.resolve({ ok: true, json: () => Promise.resolve(nextAnswer('subscribe')) });
+    }
+    if (path.includes('/api/push/unsubscribe')) {
       return Promise.resolve({ ok: true, json: () => Promise.resolve({ devices: 1 }) });
     }
     if (path.includes('/api/push/test')) {
-      return Promise.resolve({ ok: true, json: () => Promise.resolve({ sent: 1, failed: 0, devices: 1 }) });
+      return Promise.resolve({ ok: true, json: () => Promise.resolve(nextAnswer('test')) });
     }
     if (path.includes('/api/live')) {
       return Promise.resolve({ ok: true, json: () => Promise.resolve({ sessions: [] }) });
@@ -1001,6 +1025,31 @@ if (typeof handler === 'function' && panesHooks) {
     }
     const toastText = w2.document.querySelector('#toast')?.textContent ?? '';
     if (!/test/i.test(toastText)) failures.push(`no confirmation that a test was sent: ${JSON.stringify(toastText)}`);
+    if (posted['/api/push/test']?.endpoint !== ENDPOINT) {
+      // Without this the server can only answer with a fleet total, and a desktop that
+      // received the test makes the phone next to it claim success.
+      failures.push(`the test did not say which device asked: ${JSON.stringify(posted['/api/push/test'])}`);
+    }
+
+    /*
+     * What the toast says has to come from this device's own result. Each of these was
+     * reported as "Notifications on — sent a test one" before, including the one where
+     * the push service had just refused this very device.
+     */
+    const toastFor = (result) => hooks.pushTestToast(result);
+    if (!/this device/.test(toastFor({ sent: 1, mine: { ok: true, status: 201 } }))) {
+      failures.push('a successful test is not reported as having reached this device');
+    }
+    if (/^Notifications on/.test(toastFor({ sent: 1, mine: { ok: false, status: 410, gone: true } }))) {
+      failures.push('a device the push service has forgotten is told notifications are on');
+    }
+    if (!/429/.test(toastFor({ sent: 1, mine: { ok: false, status: 429, gone: false } }))) {
+      failures.push('a refused test does not say what the push service answered');
+    }
+    if (!/not to this device/.test(toastFor({ sent: 1, devices: 2 }))) {
+      failures.push('a total with no per-device result is reported as success for this device');
+    }
+
 
     // A rotated keypair on the server: the subscription still looks healthy to the
     // browser, and every notification sent to it fails somewhere the phone cannot
@@ -1014,17 +1063,22 @@ if (typeof handler === 'function' && panesHooks) {
       failures.push('re-subscribed without telling the server');
     }
     if (acts.includes('permission')) failures.push('the silent repair prompted the user');
+    if (posted['/api/push/subscribe']?.endpoint !== subscription.endpoint) {
+      failures.push(`the repair did not tell the server the new endpoint: ${JSON.stringify(posted['/api/push/subscribe'])}`);
+    }
 
     // Turning it off. The endpoint identifies the device on the server, and the
     // browser forgets it the moment it unsubscribes — so the server has to hear
-    // about it first, and it has to hear the endpoint.
+    // about it first, and it has to hear the endpoint. Whichever endpoint it is
+    // holding now: the repair above replaced the one it started with.
     acts.length = 0;
+    const endpointBeforeOff = subscription.endpoint;
     delete posted['/api/push/unsubscribe'];
     toggle.checked = false;
     toggle.dispatchEvent(new w2.Event('change'));
     await settle(150);
 
-    if (posted['/api/push/unsubscribe']?.endpoint !== 'https://push.example.test/send/abc123') {
+    if (posted['/api/push/unsubscribe']?.endpoint !== endpointBeforeOff) {
       failures.push(`unsubscribe did not name the device: ${JSON.stringify(posted['/api/push/unsubscribe'])}`);
     }
     const offAt = acts.indexOf('fetch:/api/push/unsubscribe');
@@ -1046,6 +1100,31 @@ if (typeof handler === 'function' && panesHooks) {
     if (!/Site settings/i.test(hint.textContent)) {
       failures.push(`blocked hint does not say where the setting now lives: ${JSON.stringify(hint.textContent)}`);
     }
+
+    /*
+     * The failure this was all built for: the push service has forgotten the endpoint
+     * while the browser goes on handing out the same subscription, key and all. Only
+     * the server hears the refusal, so `{ gone: true }` from subscribe is the signal,
+     * and the client has to replace the subscription rather than re-offer it forever.
+     */
+    acts.length = 0;
+    const subscribesBefore = subscribeOpts.length;
+    const unsubscribesBefore = unsubscribeCalls;
+    answers.subscribe = [{ gone: true }, { devices: 1 }];
+    const replaced = await hooks.pushSubscribe();
+    if (subscribeOpts.length - subscribesBefore !== 2) {
+      failures.push(`the server said the endpoint is gone and the client kept it: ${JSON.stringify(acts)}`);
+    }
+    if (unsubscribeCalls - unsubscribesBefore !== 1) {
+      failures.push('the dead subscription was not dropped at the browser, so the replacement is the same endpoint');
+    }
+    if (replaced?.endpoint !== `${ENDPOINT}-${endpointSeq}` || posted['/api/push/subscribe']?.endpoint !== replaced.endpoint) {
+      failures.push(`the server was not given the replacement: ${JSON.stringify(posted['/api/push/subscribe'])}`);
+    }
+    if (acts.filter((a) => a === 'fetch:/api/push/subscribe').length !== 2) {
+      failures.push(`a server answering "gone" twice loops: ${JSON.stringify(acts)}`);
+    }
+    if (acts.includes('permission')) failures.push('replacing a dead subscription prompted the user');
   } catch (err) {
     failures.push(`push section threw — ${err.constructor.name}: ${err.message}`);
   } finally {

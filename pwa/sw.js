@@ -53,12 +53,13 @@ self.addEventListener('push', (event) => {
         data = { body: (() => { try { return event.data.text(); } catch { return ''; } })() };
       }
 
+      const tag = data.tag || 'cw-turn';
       await self.registration.showNotification(data.title || 'Claude Code', {
         body: data.body || '',
         icon: ICON,
         // One notification per conversation. `renotify` is what makes a *new*
         // answer buzz rather than silently replacing the previous one in place.
-        tag: data.tag || 'cw-turn',
+        tag,
         renotify: true,
         // When the turn actually ended, not when the phone happened to wake up: a
         // notification delivered late otherwise claims to be current.
@@ -73,6 +74,32 @@ self.addEventListener('push', (event) => {
           url: typeof data.url === 'string' ? data.url : null,
         },
       });
+
+      /*
+       * Tell the server it arrived.
+       *
+       * Without this the server's knowledge stops at the push service: FCM answers
+       * 201 and everything after that — whether Chrome woke this worker at all,
+       * whether Android then chose to show anything — happens where no log on the box
+       * can see it. So "it said it sent one and nothing appeared" was unanswerable,
+       * and the honest answer to it is this line: a receipt means the message got
+       * here and something was displayed, and no receipt means it never arrived.
+       *
+       * After `showNotification`, and never in front of it: the notification is the
+       * point and a failing network must not cost one. Chrome also revokes a
+       * subscription that receives a push and shows nothing, so nothing may be
+       * allowed to throw before it.
+       */
+      try {
+        await fetch('/api/push/received', {
+          method: 'POST',
+          credentials: 'include',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ tag }),
+        });
+      } catch {
+        /* A receipt is diagnostics. Losing one costs nothing that matters here. */
+      }
     })(),
   );
 });

@@ -170,6 +170,10 @@ const guarded = [
   ['POST', '/api/push/subscribe'],
   ['POST', '/api/push/unsubscribe'],
   ['POST', '/api/push/test'],
+  // The receipt a service worker posts when it has shown a notification. It only
+  // writes a log line, but an open one is a stranger writing into this box's log
+  // with a tag of their choosing, and a way to learn whether anyone is subscribed.
+  ['POST', '/api/push/received'],
   ['GET', '/api/transcript?cwd=/tmp&sessionId=x'],
   // Reads the tail of a transcript and asks claude-broker what it is running, so
   // an unauthenticated hit would be both a read of private conversations and an

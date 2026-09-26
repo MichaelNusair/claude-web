@@ -35,7 +35,7 @@ import {
   applyDeploymentName,
   deploymentName,
 } from './manifest.js';
-import { vapidPublicKey, addSubscription, removeSubscription, listSubscriptions, notifyAll, topicFor } from './push.js';
+import { vapidPublicKey, addSubscription, removeSubscription, listSubscriptions, notifyAll, topicFor, wasGone, describeDevice } from './push.js';
 import { startTurnWatcher } from './turn-watcher.js';
 import { createAdmin } from './admin.js';
 import {
@@ -814,8 +814,21 @@ const server = http.createServer(async (req, res) => {
       // A subscription is what `pushManager.subscribe()` hands back, passed
       // through unchanged. push.js validates it rather than trusting it.
       const body = JSON.parse((await readBody(req, 8 * 1024)).toString() || '{}');
+      const ua = req.headers['user-agent'] || '';
       try {
-        const devices = await addSubscription(body, { ua: req.headers['user-agent'] || '' });
+        /*
+         * An endpoint the push service has already refused is not worth storing: the
+         * next notification would be refused too and it would be pruned again, which
+         * is the loop that kept this quietly broken. Say so instead — the device
+         * cannot work this out for itself, because the dead subscription still looks
+         * healthy in the browser and its key still matches ours.
+         */
+        if (wasGone(body.endpoint)) {
+          console.log(`push: ${describeDevice(ua)} re-offered an endpoint the push service has forgotten; asking it for a new one`);
+          json(res, 200, { devices: (await listSubscriptions()).length, gone: true });
+          return;
+        }
+        const devices = await addSubscription(body, { ua });
         console.log(`push: subscribed a device (${devices.length} now)`);
         json(res, 200, { devices: devices.length });
       } catch (err) {
@@ -840,6 +853,9 @@ const server = http.createServer(async (req, res) => {
      * only way to find out is to send one on purpose, so the settings switch does.
      */
     if (pathname === '/api/push/test' && req.method === 'POST') {
+      // Which device is asking. Optional, because an older page that does not send it
+      // still deserves the totals rather than an error.
+      const asking = JSON.parse((await readBody(req, 8 * 1024)).toString() || '{}').endpoint || '';
       const result = await notifyAll(
         {
           title: 'Notifications are on',
@@ -849,7 +865,49 @@ const server = http.createServer(async (req, res) => {
         { topic: topicFor('push-test') },
       );
       console.log(`push: test sent to ${result.sent}/${result.devices} device(s)`);
-      json(res, 200, result);
+      /*
+       * The caller is one device asking about *itself*, and the totals cannot answer
+       * that: a sum over every device reports success as long as some other phone is
+       * healthy. That is not a hypothetical — it is how this phone came to be told
+       * "a test notification has just been sent to this device" one second after the
+       * push service refused the message, which is the whole reason the failure went
+       * unnoticed for a day.
+       *
+       * `results` itself is deliberately not returned. An endpoint is a capability to
+       * put a notification on someone's lock screen, so the list of them does not
+       * travel to one device just because it asked about its own.
+       */
+      const mine = result.results.find((r) => r.endpoint === asking) || null;
+      json(res, 200, {
+        sent: result.sent,
+        failed: result.failed,
+        pruned: result.pruned,
+        devices: result.devices,
+        mine: mine && { ok: mine.ok, status: mine.status, gone: mine.gone },
+      });
+      return;
+    }
+
+    /*
+     * The phone saying it showed one.
+     *
+     * Everything else here can only see as far as the push service: FCM answers 201,
+     * and whether Chrome ever woke the worker, and whether Android then chose to
+     * display anything, is invisible from this box. That gap is exactly where "it
+     * says it sent one and I didn't get it" lives, and no amount of logging on this
+     * side can close it — only the worker can, by saying it got there. See the push
+     * handler in pwa/sw.js.
+     *
+     * Best-effort by design: it is a log line, not state. A receipt that never
+     * arrives is itself the useful signal.
+     */
+    if (pathname === '/api/push/received' && req.method === 'POST') {
+      const body = JSON.parse((await readBody(req, 2 * 1024)).toString() || '{}');
+      console.log(
+        `push: ${describeDevice(req.headers['user-agent'] || '')} showed a notification`
+        + `${body.tag ? ` (${String(body.tag).slice(0, 40)})` : ''}`,
+      );
+      json(res, 200, { ok: true });
       return;
     }
 

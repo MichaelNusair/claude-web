@@ -414,12 +414,46 @@ section('Notifying every device, and forgetting the ones that are gone:');
   await push.resetForTest({ keepFiles: true });
 
   const before = seen.length;
-  const summary = await push.notifyAll({ title: 'Claude finished', body: 'done' }, { topic: push.topicFor('x') });
+  /*
+   * The log is captured, because its silence is what made a real outage unreadable: a
+   * device dropped for a 410 was the one outcome that wrote nothing, so the list
+   * emptied itself over a day and every log on the box agreed that all was well.
+   */
+  const logged = [];
+  const realError = console.error;
+  console.error = (...args) => logged.push(args.join(' '));
+  let summary;
+  try {
+    summary = await push.notifyAll({ title: 'Claude finished', body: 'done' }, { topic: push.topicFor('x') });
+  } finally {
+    console.error = realError;
+  }
   ok(summary.devices === 3, `notifyAll reported ${summary.devices} devices, not 3`);
   ok(summary.sent === 2, `${summary.sent} of 3 were sent`);
   ok(summary.failed === 1, `${summary.failed} failures reported for one dead subscription`);
   ok(summary.pruned === 1, 'the dead subscription was not pruned, so it is retried forever');
   ok(seen.length - before === 3, 'not every device was sent to');
+  ok(logged.length === 1, `${logged.length} lines logged for one refusal among three sends`);
+  ok(/forgotten by the push service/.test(logged[0] || ''), `dropping a device said nothing legible: ${JSON.stringify(logged)}`);
+  ok(/410/.test(logged[0] || ''), 'the log does not say what the push service answered');
+
+  /*
+   * Per-device results. Without these the only answer the API can give is a total,
+   * and a total is how the switch on a phone came to report a test notification as
+   * sent one second after that very phone's endpoint had been refused: the desktop
+   * received it, so `sent` was 1.
+   */
+  ok(summary.results.length === 3, `results described ${summary.results.length} devices, not 3`);
+  const live = summary.results.find((r) => r.endpoint === at('/ok/live').endpoint);
+  const dead = summary.results.find((r) => r.endpoint === at('/gone/dead').endpoint);
+  ok(live && live.ok && live.status === 201, `a device that received the push cannot tell from its own result: ${JSON.stringify(live)}`);
+  ok(dead && dead.gone && !dead.ok, `a refused device is not told that it was refused: ${JSON.stringify(dead)}`);
+
+  // Remembered, so /api/push/subscribe can tell that phone the one thing it has no
+  // way to find out — and remembered once, because it then has a new endpoint.
+  ok(push.wasGone(at('/gone/dead').endpoint), 'the refusal was not remembered, so the device re-offers the dead endpoint forever');
+  ok(!push.wasGone(at('/gone/dead').endpoint), 'the record outlived being read, so the replacement subscription is refused too');
+  ok(!push.wasGone(at('/ok/live').endpoint), 'a device that is working was told to resubscribe');
 
   const left = await push.listSubscriptions();
   ok(left.length === 2 && !left.some((s) => s.endpoint.includes('/gone/')), 'the pruned device is still in the list');
@@ -439,6 +473,23 @@ section('Notifying every device, and forgetting the ones that are gone:');
   await push.resetForTest({ keepFiles: true });
   const none = await push.notifyAll({ title: 'x', body: 'y' });
   ok(none.devices === 0, 'a corrupt subscriptions file was not survived');
+  // Shaped the same with nothing to send to, so the caller can read `results` without
+  // asking whether there were any devices.
+  ok(Array.isArray(none.results) && none.results.length === 0, 'the no-devices answer has no results array, so every caller needs a special case');
+}
+
+section('Naming a device in one line, for a log nobody wants to read twice:');
+{
+  const android = 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Mobile Safari/537.36';
+  const mac = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36';
+  ok(push.describeDevice(android) === 'Linux; Android 10', `the phone is described as "${push.describeDevice(android)}"`);
+  ok(push.describeDevice(mac) === 'Macintosh; Intel Mac OS X 10_15_7', `the desktop is described as "${push.describeDevice(mac)}"`);
+  // The question these lines answer is "which of my two devices stopped", so the two
+  // must not describe themselves the same way.
+  ok(push.describeDevice(android) !== push.describeDevice(mac), 'the phone and the desktop are described identically, which is the one thing the line is for');
+  ok(push.describeDevice('') === 'an unrecognised device', 'a device that sent no user agent is described as nothing at all');
+  ok(push.describeDevice(undefined) === 'an unrecognised device', 'a missing user agent throws rather than describing anything');
+  ok(push.describeDevice('curl/8.4.0') === 'an unrecognised device', 'a user agent with no platform is described as nothing at all');
 }
 
 for (const res of held) res.destroy();
