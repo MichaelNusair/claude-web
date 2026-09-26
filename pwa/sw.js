@@ -54,7 +54,7 @@ self.addEventListener('push', (event) => {
       }
 
       const tag = data.tag || 'cw-turn';
-      await self.registration.showNotification(data.title || 'Claude Code', {
+      const options = {
         body: data.body || '',
         icon: ICON,
         // One notification per conversation. `renotify` is what makes a *new*
@@ -73,7 +73,27 @@ self.addEventListener('push', (event) => {
           // chat-service/manifest.js and the payload in turn-watcher.js.
           url: typeof data.url === 'string' ? data.url : null,
         },
-      });
+      };
+
+      /*
+       * A notification that is refused rather than shown, which is the most
+       * consequential thing that can happen in this file.
+       *
+       * Android can refuse to display for reasons that live entirely outside the
+       * browser — notifications turned off for Chrome as an app, or its "Sites"
+       * channel disabled — and the browser's answer to a `userVisibleOnly` push that
+       * showed nothing is to revoke the subscription. The phone then mints a new one,
+       * receives one more push, is refused again, and is revoked again: a device that
+       * looks freshly subscribed whenever anyone checks and has never displayed
+       * anything. There is nothing to retry, so this is caught only so that the
+       * receipt below can say which of the two happened.
+       */
+      let refused = null;
+      try {
+        await self.registration.showNotification(data.title || 'Claude Code', options);
+      } catch (err) {
+        refused = err;
+      }
 
       /*
        * Tell the server it arrived.
@@ -82,10 +102,11 @@ self.addEventListener('push', (event) => {
        * 201 and everything after that — whether Chrome woke this worker at all,
        * whether Android then chose to show anything — happens where no log on the box
        * can see it. So "it said it sent one and nothing appeared" was unanswerable,
-       * and the honest answer to it is this line: a receipt means the message got
-       * here and something was displayed, and no receipt means it never arrived.
+       * and this line is the answer: a receipt saying `shown` means Android is holding
+       * a notification it was given, a receipt saying otherwise names the refusal, and
+       * no receipt at all means the message never reached this worker.
        *
-       * After `showNotification`, and never in front of it: the notification is the
+       * After the notification, and never in front of it: the notification is the
        * point and a failing network must not cost one. Chrome also revokes a
        * subscription that receives a push and shows nothing, so nothing may be
        * allowed to throw before it.
@@ -95,7 +116,11 @@ self.addEventListener('push', (event) => {
           method: 'POST',
           credentials: 'include',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ tag }),
+          body: JSON.stringify({
+            tag,
+            shown: !refused,
+            error: refused ? String(refused.message || refused).slice(0, 200) : undefined,
+          }),
         });
       } catch {
         /* A receipt is diagnostics. Losing one costs nothing that matters here. */

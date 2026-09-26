@@ -45,7 +45,7 @@ const ORIGIN = 'https://claude.example.com';
  * and it means a syntax error or a reference to something a worker does not have
  * fails here rather than on a phone.
  */
-function boot({ windows = [], receiptFails = false } = {}) {
+function boot({ windows = [], receiptFails = false, showRefused = null } = {}) {
   const log = {
     shown: [],      // registration.showNotification(...)
     opened: [],     // clients.openWindow(...)
@@ -64,8 +64,12 @@ function boot({ windows = [], receiptFails = false } = {}) {
     skipWaiting: () => {},
     registration: {
       showNotification: (title, options) => {
+        log.order.push('show');
+        // A platform that refuses to display. Android does this for reasons outside the
+        // browser — notifications off for the browser as an app, its "Sites" channel
+        // disabled — and it is the case that cost this app a phone for a day.
+        if (showRefused) return Promise.reject(new Error(showRefused));
         log.shown.push({ title, ...options });
-        log.order.push('shown');
         return Promise.resolve();
       },
       pushManager: { subscribe: () => Promise.reject(new Error('not exercised here')) },
@@ -198,6 +202,11 @@ async function tap(data, { windows = [] } = {}) {
     JSON.parse(receipt?.options?.body || '{}').tag === 'turn-abc',
   );
   ok(
+    'a receipt for a notification that was shown does not say so, which is the half of the ' +
+      'question that means the phone is holding it rather than never receiving it',
+    JSON.parse(receipt?.options?.body || '{}').shown === true,
+  );
+  ok(
     'the receipt was sent without credentials, and the route that records it is behind ' +
       'authentication — it would be a redirect to a login page',
     receipt?.options?.credentials === 'include',
@@ -205,7 +214,7 @@ async function tap(data, { windows = [] } = {}) {
   ok(
     `the receipt was sent before the notification: ${log.order.join(' → ')} — Chrome revokes ` +
       'a userVisibleOnly subscription that shows nothing, so nothing may run in front of it',
-    log.order[0] === 'shown',
+    log.order[0] === 'show',
   );
 }
 
@@ -235,6 +244,49 @@ async function tap(data, { windows = [] } = {}) {
     threw === null,
   );
   ok('the notification was not shown when the receipt could not be sent', log.shown.length === 1);
+}
+
+// ------------------------------------------- a platform that will not display
+/*
+ * The failure that looks like a delivery problem and is not.
+ *
+ * `showNotification` rejects when the phone has decided the browser may not show
+ * anything, and the browser's answer to a `userVisibleOnly` push that displayed
+ * nothing is to revoke the subscription. The device then subscribes again, receives
+ * one push, is refused again, and reads as freshly subscribed the entire time — which
+ * is exactly what a day of this looked like from the box. The push handler is the only
+ * place that can tell, so it says so instead of failing silently.
+ */
+{
+  const { listeners, log } = boot({ showRefused: 'Notifications are blocked' });
+  const waits = [];
+  listeners.get('push')({
+    data: { json: () => ({ title: 'Claude finished', body: 'Done.', tag: 'turn-refused' }) },
+    waitUntil: (p) => waits.push(p),
+  });
+  let threw = null;
+  try {
+    await Promise.all(waits);
+  } catch (err) {
+    threw = err;
+  }
+  ok(
+    `a refused notification propagated out of the handler (${threw?.message}), so the only ` +
+      'record of it is an unhandled rejection in a worker nobody can see',
+    threw === null,
+  );
+  const body = JSON.parse(log.fetched[0]?.options?.body || '{}');
+  ok(
+    `the server was not told the notification could not be shown: ${JSON.stringify(body)} — ` +
+      'without this, "nothing appeared" and "nothing arrived" are the same evidence',
+    log.fetched[0]?.url === '/api/push/received' && body.shown === false,
+  );
+  ok(
+    'the receipt does not say why the platform refused, which is the one detail that ' +
+      'points at the phone rather than at this box',
+    /blocked/i.test(body.error || ''),
+  );
+  ok('a refused notification was recorded as shown', log.shown.length === 0);
 }
 
 // ----------------------------------------------- a payload that is not ours

@@ -903,10 +903,28 @@ const server = http.createServer(async (req, res) => {
      */
     if (pathname === '/api/push/received' && req.method === 'POST') {
       const body = JSON.parse((await readBody(req, 2 * 1024)).toString() || '{}');
-      console.log(
-        `push: ${describeDevice(req.headers['user-agent'] || '')} showed a notification`
-        + `${body.tag ? ` (${String(body.tag).slice(0, 40)})` : ''}`,
-      );
+      const who = describeDevice(req.headers['user-agent'] || '');
+      const which = body.tag ? ` (${String(body.tag).slice(0, 40)})` : '';
+      /*
+       * Two different pieces of news, and they are worth telling apart.
+       *
+       * `shown` is the good one and closes the gap this endpoint exists for. The other
+       * is the interesting one: the worker ran and the platform refused to display,
+       * which the browser answers by revoking the subscription — so the device comes
+       * back with a new endpoint, receives one push, is refused again, and looks
+       * freshly subscribed the whole time. Reading that as a delivery problem is how a
+       * phone gets debugged from the wrong end.
+       */
+      if (body.shown === false) {
+        console.error(
+          `push: ${who} received a notification and could not show it${which}`
+          + `${body.error ? `: ${String(body.error).slice(0, 200)}` : ''}`
+          + ' — the browser will revoke this subscription; check that notifications are'
+          + ' allowed for the browser itself in the phone\'s own settings',
+        );
+      } else {
+        console.log(`push: ${who} showed a notification${which}`);
+      }
       json(res, 200, { ok: true });
       return;
     }
