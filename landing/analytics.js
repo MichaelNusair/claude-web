@@ -43,8 +43,13 @@
 
   /** Scroll milestones, reported once each. */
   var DEPTHS = [25, 50, 75, 100];
-  /** How long a section must hold half the viewport before it counts as read. */
+  /** How long a section must hold the middle of the screen before it counts as read. */
   var DWELL_MS = 1000;
+  /**
+   * The observer root: the middle 30% of the viewport, as a margin either side.
+   * Deliberately not a fractional `threshold` — see the observer below.
+   */
+  var READING_BAND = '-35% 0px -35% 0px';
 
   var state = {
     openedAt: Date.now(),
@@ -220,8 +225,17 @@
     );
 
     // --- Which parts they actually read ---------------------------------------
-    // Half the section in view for a second, rather than a pixel of it in view for
-    // an instant: scrolling past something is not reading it.
+    // The section holding the middle of the screen for a second, rather than a pixel
+    // of it in view for an instant: scrolling past something is not reading it.
+    //
+    // The band is a `rootMargin`, not `threshold: 0.5`, because a threshold is a
+    // fraction *of the section*: a section taller than twice the viewport can never
+    // reach 0.5, so it silently never reports. That is not hypothetical — on a 390px
+    // phone `pricing` and `security` are ~1740px tall and peaked at 48%, so between
+    // launch and 2026-09-26 every phone visitor who read them counted as skipping
+    // them, including one who scrolled the page end to end and clicked a link inside
+    // `security`. A band asks "is this section in front of your eyes", which is the
+    // actual question and is independent of how tall the section is.
     if (window.IntersectionObserver) {
       var timers = {};
       var observer = new window.IntersectionObserver(
@@ -240,7 +254,7 @@
             }, DWELL_MS);
           });
         },
-        { threshold: 0.5 },
+        { rootMargin: READING_BAND, threshold: 0 },
       );
       Array.prototype.forEach.call(document.querySelectorAll('[data-section]'), function (section) {
         observer.observe(section);

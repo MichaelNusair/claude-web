@@ -172,6 +172,42 @@ const stamped = renderAnalytics(analytics, {
 }
 
 // ---------------------------------------------------------------------------
+section('A section taller than the screen is still reported as read:');
+// ---------------------------------------------------------------------------
+// This is a regression test with a bill attached. The observer used to ask for
+// `threshold: 0.5`, and a threshold is a fraction *of the section*, so a section
+// taller than twice the viewport can never reach it. On a 390px phone the real
+// page's `pricing` and `security` bands are ~1740px tall and peak at 48% — so
+// between launch and 2026-09-26 no phone visitor ever reported reading either of
+// the two bands the business cares most about, including one who scrolled the page
+// end to end and clicked a link inside `security`. The funnel said nobody looked.
+{
+  const env = run(stamped);
+  env.window.posthog = env.sdk;
+  env.appended[0].onload();
+  const { observers } = env;
+  ok(observers.length === 1, 'one observer watches the bands');
+  const options = (observers[0] && observers[0].options) || {};
+
+  ok(!options.threshold, `it asks for no fraction of the section (threshold: ${options.threshold})`);
+  ok(
+    typeof options.rootMargin === 'string' && /^-\d+% 0px -\d+% 0px$/.test(options.rootMargin),
+    `it narrows the viewport to a band instead (${options.rootMargin})`,
+  );
+
+  // The point of the band, stated as the thing that used to be false: height cannot
+  // decide whether a section is reportable.
+  const viewport = 844;
+  for (const height of [200, viewport, viewport * 2 + 1, viewport * 10]) {
+    ok(
+      reportable(options, height, viewport),
+      `a ${height}px section can be reported on an ${viewport}px screen`,
+    );
+  }
+  ok(!reportable({ threshold: 0.5 }, viewport * 2 + 1, viewport), 'where the old threshold could not');
+}
+
+// ---------------------------------------------------------------------------
 section('The copy button and the listener are two files with no shared code:');
 // ---------------------------------------------------------------------------
 ok(copy.includes("'triplec:copy'"), 'copy.js announces a copy');
@@ -294,6 +330,7 @@ process.exit(fail ? 1 : 0);
 function run(source) {
   const appended = [];
   const observed = [];
+  const observers = [];
   const warnings = [];
   const documentListeners = {};
   const windowListeners = {};
@@ -334,7 +371,8 @@ function run(source) {
     addEventListener: recordInto(windowListeners),
     console: { warn: (message) => warnings.push(message) },
     CustomEvent: function CustomEvent() {},
-    IntersectionObserver: function IntersectionObserver() {
+    IntersectionObserver: function IntersectionObserver(callback, options) {
+      observers.push({ callback, options });
       return { observe: (node) => observed.push(node), unobserve: () => {} };
     },
     posthog: undefined,
@@ -343,7 +381,35 @@ function run(source) {
   // eslint-disable-next-line no-new-func
   new Function('window', 'document', source)(window, document);
 
-  return { window, document, sdk, appended, observed, warnings, documentListeners, windowListeners };
+  return {
+    window,
+    document,
+    sdk,
+    appended,
+    observed,
+    observers,
+    warnings,
+    documentListeners,
+    windowListeners,
+  };
+}
+
+/**
+ * Could a section of this height ever satisfy these observer options?
+ *
+ * The browser intersects the section with the root, shrunk or grown by `rootMargin`,
+ * and compares the overlap against `threshold` as a fraction of the *section*. So the
+ * best a section can do is cover the whole root: `root / height`, capped at 1. A
+ * threshold above that is unreachable at any scroll position; a threshold of 0 needs
+ * only a touch, which any section on the page will manage.
+ */
+function reportable(options, height, viewport) {
+  const margins = String(options.rootMargin || '0px 0px 0px 0px').split(/\s+/);
+  const edge = (value) => (/%$/.test(value) ? (parseFloat(value) / 100) * viewport : parseFloat(value) || 0);
+  const root = viewport + edge(margins[0]) + edge(margins[2] === undefined ? margins[0] : margins[2]);
+  if (root <= 0) return false;
+  const threshold = options.threshold || 0;
+  return threshold === 0 ? true : Math.min(1, root / height) >= threshold;
 }
 
 function fakeSection(name) {
